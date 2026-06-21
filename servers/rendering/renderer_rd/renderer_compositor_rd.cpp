@@ -177,6 +177,10 @@ void RendererCompositorRD::finalize() {
 	memdelete(fog);
 	memdelete(particles_storage);
 	memdelete(light_storage);
+	memdelete(hiz_builder);
+	memdelete(meshlet_renderer);
+	memdelete(meshlet_culler);
+	memdelete(meshlet_storage);
 	memdelete(mesh_storage);
 	memdelete(material_storage);
 	memdelete(texture_storage);
@@ -364,6 +368,10 @@ RendererCompositorRD::RendererCompositorRD() {
 	texture_storage = memnew(RendererRD::TextureStorage);
 	material_storage = memnew(RendererRD::MaterialStorage);
 	mesh_storage = memnew(RendererRD::MeshStorage);
+	meshlet_storage = memnew(RendererRD::MeshletStorage);
+	meshlet_culler = memnew(RendererRD::MeshletCuller);
+	meshlet_renderer = memnew(RendererRD::MeshletRenderer);
+	hiz_builder = memnew(RendererRD::HiZBuilder);
 	light_storage = memnew(RendererRD::LightStorage);
 	particles_storage = memnew(RendererRD::ParticlesStorage);
 	fog = memnew(RendererRD::Fog);

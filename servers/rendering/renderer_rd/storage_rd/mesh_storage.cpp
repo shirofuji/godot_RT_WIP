@@ -434,6 +434,23 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 				s->lods[i].index_count = indices;
 			}
 		}
+
+		// Upload meshlets for the base surface and every LOD into the global meshlet buffers,
+		// sharing one uploaded vertex range across all of them (they all index into the same
+		// source vertex array - see RenderingServer::mesh_create_surface_data_from_arrays()).
+		RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
+		if (meshlet_storage && new_surface.meshlets.size() > 0) {
+			MeshletStorage::Range vertex_range = meshlet_storage->upload_vertices(new_surface.meshlet_positions, new_surface.meshlet_normals, new_surface.meshlet_uvs);
+			if (vertex_range.is_valid()) {
+				s->meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.meshlets, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlet_bounds);
+
+				for (int i = 0; i < new_surface.lods.size(); i++) {
+					if (new_surface.lods[i].meshlets.size() > 0) {
+						s->lods[i].meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.lods[i].meshlets, new_surface.lods[i].meshlet_vertices, new_surface.lods[i].meshlet_triangles, new_surface.lods[i].meshlet_bounds);
+					}
+				}
+			}
+		}
 	}
 
 	ERR_FAIL_COND_MSG(!new_surface.index_count && !new_surface.vertex_count, "Meshes must contain a vertex array, an index array, or both");
@@ -539,8 +556,16 @@ void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 	if (s.lod_count) {
 		for (uint32_t j = 0; j < s.lod_count; j++) {
 			RD::get_singleton()->free_rid(s.lods[j].index_buffer);
+			if (MeshletStorage::get_singleton()) {
+				MeshletStorage::get_singleton()->free_meshlets(s.lods[j].meshlet_upload);
+			}
 		}
 		memdelete_arr(s.lods);
+	}
+
+	if (MeshletStorage::get_singleton()) {
+		MeshletStorage::get_singleton()->free_meshlets(s.meshlet_upload);
+		MeshletStorage::get_singleton()->free_vertices(s.meshlet_upload.vertex_range);
 	}
 
 	if (s.blend_shape_buffer.is_valid()) {
@@ -627,6 +652,17 @@ RID MeshStorage::mesh_surface_get_vertex_buffer_rd_rid(RID p_mesh, int p_surface
 	ERR_FAIL_NULL_V(mesh, RID());
 	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_surface, mesh->surface_count, RID());
 	return mesh->surfaces[p_surface]->vertex_buffer;
+}
+
+MeshletStorage::Range MeshStorage::mesh_surface_get_meshlet_range(RID p_mesh, int p_surface, int p_lod) const {
+	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
+	ERR_FAIL_NULL_V(mesh, MeshletStorage::Range());
+	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_surface, mesh->surface_count, MeshletStorage::Range());
+	if (p_lod < 0) {
+		return mesh->surfaces[p_surface]->meshlet_upload.meshlet_range;
+	}
+	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_lod, mesh->surfaces[p_surface]->lod_count, MeshletStorage::Range());
+	return mesh->surfaces[p_surface]->lods[p_lod].meshlet_upload.meshlet_range;
 }
 
 RID MeshStorage::mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const {

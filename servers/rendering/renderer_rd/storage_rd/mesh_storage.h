@@ -35,6 +35,7 @@
 #include "core/templates/self_list.h"
 #include "servers/rendering/renderer_compositor.h"
 #include "servers/rendering/renderer_rd/shaders/skeleton.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/storage/mesh_storage.h"
 #include "servers/rendering/storage/utilities.h"
@@ -121,10 +122,17 @@ private:
 				RID index_buffer;
 				uint32_t index_buffer_size = 0;
 				RID index_array;
+
+				MeshletStorage::UploadResult meshlet_upload;
 			};
 
 			LOD *lods = nullptr;
 			uint32_t lod_count = 0;
+
+			// Meshlets for this surface's own full-resolution geometry. meshlet_upload.vertex_range
+			// is the one all of this surface's LODs' meshlet_upload also point at (see LOD::meshlet_upload
+			// above) - it must only be freed once, when the base surface itself is freed.
+			MeshletStorage::UploadResult meshlet_upload;
 
 			AABB aabb;
 
@@ -396,6 +404,11 @@ public:
 	virtual RID mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const override;
 	virtual RID mesh_surface_get_skin_buffer_rd_rid(RID p_mesh, int p_surface) const override;
 	virtual RID mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface) const override;
+
+	// Not part of RendererMeshStorage's abstract interface - RD/meshlet-specific. Returns an
+	// invalid (count == 0) range if this surface has no baked meshlets (e.g. build_meshlets_func
+	// was unavailable at import/creation time) or p_lod is out of range.
+	MeshletStorage::Range mesh_surface_get_meshlet_range(RID p_mesh, int p_surface, int p_lod = -1) const;
 
 	virtual int mesh_get_surface_count(RID p_mesh) const override;
 

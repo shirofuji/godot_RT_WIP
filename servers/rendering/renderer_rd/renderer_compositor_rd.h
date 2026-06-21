@@ -39,7 +39,11 @@
 #include "servers/rendering/renderer_rd/shaders/blit.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+#include "servers/rendering/renderer_rd/hiz_builder.h"
+#include "servers/rendering/renderer_rd/meshlet_culler.h"
+#include "servers/rendering/renderer_rd/meshlet_renderer.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/utilities.h"
@@ -57,6 +61,10 @@ protected:
 	RendererRD::LightStorage *light_storage = nullptr;
 	RendererRD::MaterialStorage *material_storage = nullptr;
 	RendererRD::MeshStorage *mesh_storage = nullptr;
+	RendererRD::MeshletStorage *meshlet_storage = nullptr;
+	RendererRD::MeshletCuller *meshlet_culler = nullptr;
+	RendererRD::MeshletRenderer *meshlet_renderer = nullptr;
+	RendererRD::HiZBuilder *hiz_builder = nullptr;
 	RendererRD::ParticlesStorage *particles_storage = nullptr;
 	RendererRD::TextureStorage *texture_storage = nullptr;
 	RendererRD::Utilities *utilities = nullptr;

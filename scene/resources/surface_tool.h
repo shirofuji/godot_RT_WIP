@@ -82,6 +82,26 @@ public:
 		SKIN_8_WEIGHTS
 	};
 
+	// Layout-compatible with meshopt_Meshlet (thirdparty/meshoptimizer/meshoptimizer.h);
+	// kept as a plain local type so this header doesn't need to include the thirdparty one.
+	struct Meshlet {
+		uint32_t vertex_offset = 0;
+		uint32_t triangle_offset = 0;
+		uint32_t vertex_count = 0;
+		uint32_t triangle_count = 0;
+	};
+
+	// Layout-compatible with meshopt_Bounds.
+	struct MeshletBounds {
+		float center[3] = { 0, 0, 0 };
+		float radius = 0;
+		float cone_apex[3] = { 0, 0, 0 };
+		float cone_axis[3] = { 0, 0, 0 };
+		float cone_cutoff = 0;
+		int8_t cone_axis_s8[3] = { 0, 0, 0 };
+		int8_t cone_cutoff_s8 = 0;
+	};
+
 	enum {
 		/* Do not move vertices that are located on the topological border (vertices on triangle edges that don't have a paired triangle). Useful for simplifying portions of the larger mesh. */
 		SIMPLIFY_LOCK_BORDER = 1 << 0, // From meshopt_SimplifyLockBorder
@@ -113,7 +133,19 @@ public:
 	static RemapVertexFunc remap_vertex_func;
 	typedef void (*RemapIndexFunc)(unsigned int *destination, const unsigned int *indices, size_t index_count, const unsigned int *remap);
 	static RemapIndexFunc remap_index_func;
+	typedef size_t (*BuildMeshletsFunc)(Meshlet *meshlets, unsigned int *meshlet_vertices, unsigned char *meshlet_triangles, const unsigned int *indices, size_t index_count, const float *vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t max_triangles, float cone_weight);
+	static BuildMeshletsFunc build_meshlets_func;
+	typedef size_t (*BuildMeshletsBoundFunc)(size_t index_count, size_t max_vertices, size_t max_triangles);
+	static BuildMeshletsBoundFunc build_meshlets_bound_func;
+	typedef MeshletBounds (*ComputeMeshletBoundsFunc)(const unsigned int *meshlet_vertices, const unsigned char *meshlet_triangles, size_t triangle_count, const float *vertex_positions, size_t vertex_count, size_t vertex_positions_stride);
+	static ComputeMeshletBoundsFunc compute_meshlet_bounds_func;
 	static void strip_mesh_arrays(PackedVector3Array &r_vertices, PackedInt32Array &r_indices);
+
+	// Splits (p_vertices, p_indices) into meshlets using meshoptimizer's clusterizer. Returns the
+	// per-meshlet descriptors; r_meshlet_vertices/r_meshlet_triangles/r_bounds are filled in parallel
+	// (one MeshletBounds entry per returned Meshlet). Vertex/triangle limits follow meshoptimizer's
+	// implementation limits (max_vertices <= 256, max_triangles <= 512).
+	static Vector<Meshlet> build_meshlets(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices, uint32_t p_max_vertices, uint32_t p_max_triangles, float p_cone_weight, PackedInt32Array &r_meshlet_vertices, PackedByteArray &r_meshlet_triangles, Vector<MeshletBounds> &r_bounds);
 
 private:
 	struct VertexHasher {

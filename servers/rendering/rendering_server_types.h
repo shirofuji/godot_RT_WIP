@@ -40,6 +40,7 @@
 #include "core/string/ustring.h"
 #include "core/templates/rid.h"
 #include "core/templates/vector.h"
+#include "core/variant/variant.h"
 #include "servers/rendering/rendering_server_enums.h"
 
 #include <cstdint>
@@ -80,6 +81,28 @@ struct ShaderNativeSourceCode {
 
 /* MESH API */
 
+// Plain mirrors of meshoptimizer's meshopt_Meshlet/meshopt_Bounds (also mirrored independently as
+// SurfaceTool::Meshlet/MeshletBounds in scene/resources/surface_tool.h). Kept as a separate,
+// scene-independent copy here so SurfaceData/MeshletStorage - both servers-layer - don't need to
+// include a scene/ header; conversion between the two mirrors is a plain memcpy since their
+// layouts are identical.
+struct MeshletInfo {
+	uint32_t vertex_offset = 0;
+	uint32_t triangle_offset = 0;
+	uint32_t vertex_count = 0;
+	uint32_t triangle_count = 0;
+};
+
+struct MeshletBoundsInfo {
+	float center[3] = { 0, 0, 0 };
+	float radius = 0;
+	float cone_apex[3] = { 0, 0, 0 };
+	float cone_axis[3] = { 0, 0, 0 };
+	float cone_cutoff = 0;
+	int8_t cone_axis_s8[3] = { 0, 0, 0 };
+	int8_t cone_cutoff_s8 = 0;
+};
+
 struct SurfaceData {
 	RSE::PrimitiveType primitive = RSE::PRIMITIVE_MAX;
 
@@ -95,9 +118,30 @@ struct SurfaceData {
 	struct LOD {
 		float edge_length = 0.0f;
 		Vector<uint8_t> index_data;
+
+		Vector<MeshletInfo> meshlets;
+		PackedInt32Array meshlet_vertices;
+		PackedByteArray meshlet_triangles;
+		Vector<MeshletBoundsInfo> meshlet_bounds;
 	};
 	Vector<LOD> lods;
 	Vector<AABB> bone_aabbs;
+
+	// Meshlets for the surface's own (full resolution) geometry; built once by
+	// RenderingServer::mesh_create_surface_data_from_arrays() so every mesh creation path
+	// (primitives, procedural SurfaceTool/ArrayMesh meshes, and imported meshes) gets meshlets
+	// uniformly, without each caller needing to bake them separately.
+	Vector<MeshletInfo> meshlets;
+	PackedInt32Array meshlet_vertices;
+	PackedByteArray meshlet_triangles;
+	Vector<MeshletBoundsInfo> meshlet_bounds;
+
+	// Raw (uncompressed) per-vertex source data the meshlets above are indexed against; kept
+	// separately from vertex_data because that one may already be quantized/compressed by the
+	// time it reaches the renderer, while MeshletStorage's global buffers want full precision.
+	PackedVector3Array meshlet_positions;
+	PackedVector3Array meshlet_normals;
+	PackedVector2Array meshlet_uvs;
 
 	// Transforms used in runtime bone AABBs compute.
 	// Since bone AABBs is saved in Mesh space, but bones is in Skeleton space.

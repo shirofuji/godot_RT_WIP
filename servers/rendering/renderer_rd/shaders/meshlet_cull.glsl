@@ -1,0 +1,117 @@
+#[compute]
+
+#version 450
+
+#VERSION_DEFINES
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, std430) uniform Params {
+	uint work_item_count;
+	uint max_visible;
+	uint pad0;
+	uint pad1;
+	vec4 planes[6]; // xyz = normal, w = d; matches core/math/Plane: distance_to(p) = dot(normal,p) - d.
+	vec3 camera_position;
+	float pad2;
+}
+params;
+
+struct WorkItem {
+	uint instance_index;
+	uint meshlet_index;
+};
+
+layout(set = 0, binding = 0, std430) restrict readonly buffer WorkItems {
+	uint count;
+	WorkItem data[];
+}
+work_items;
+
+layout(set = 0, binding = 1, std430) restrict readonly buffer Transforms {
+	mat4 data[];
+}
+transforms;
+
+struct MeshletDescriptor {
+	vec3 bounds_center;
+	float bounds_radius;
+	vec3 cone_axis;
+	float cone_cutoff;
+	uint vertex_remap_offset;
+	uint triangle_offset;
+	uint vertex_count;
+	uint triangle_count;
+};
+
+layout(set = 0, binding = 2, std430) restrict readonly buffer MeshletDescriptors {
+	MeshletDescriptor data[];
+}
+meshlet_descriptors;
+
+struct VisibleMeshlet {
+	uint instance_index;
+	uint meshlet_index;
+};
+
+layout(set = 0, binding = 3, std430) restrict buffer VisibleMeshlets {
+	uint count;
+	VisibleMeshlet data[];
+}
+visible_meshlets;
+
+void main() {
+	uint idx = gl_GlobalInvocationID.x;
+	// Read the real survivor count from Pass A's own output buffer rather than a CPU-supplied
+	// push constant - lets the caller dispatch a fixed upper-bound thread count (cheap, no GPU
+	// readback stall) instead of having to read Pass A's atomic counter back to the CPU first.
+	// work_items.count is an atomic counter that can overflow past the buffer's actual capacity
+	// (Pass A's bounds check only gates the write, not the increment) - clamp against
+	// params.work_item_count (repurposed here as the buffer's allocated capacity, still a fixed
+	// CPU-known constant) to avoid reading out of bounds.
+	if (idx >= min(work_items.count, params.work_item_count)) {
+		return;
+	}
+
+	WorkItem item = work_items.data[idx];
+	mat4 transform = transforms.data[item.instance_index];
+	MeshletDescriptor d = meshlet_descriptors.data[item.meshlet_index];
+
+	vec3 world_center = (transform * vec4(d.bounds_center, 1.0)).xyz;
+
+	// Conservative radius scale: largest axis scale of the transform's basis (exact for uniform
+	// scale, conservative - never under-estimates - for non-uniform scale).
+	float scale_x = length(transform[0].xyz);
+	float scale_y = length(transform[1].xyz);
+	float scale_z = length(transform[2].xyz);
+	float max_scale = max(max(scale_x, scale_y), scale_z);
+	float world_radius = d.bounds_radius * max_scale;
+
+	// Normal-cone backface rejection (meshoptimizer's apex-free formula - see
+	// meshopt_computeMeshletBounds's docs): cull if facing away from the camera everywhere on
+	// the meshlet's bounding sphere. mat3(transform) is an approximation for non-uniform scale
+	// (a true normal transform needs the inverse-transpose); acceptable since cone_axis is an
+	// aggregate direction, not a precise surface normal.
+	vec3 world_cone_axis = normalize(mat3(transform) * d.cone_axis);
+	vec3 to_meshlet = world_center - params.camera_position;
+	float dist = length(to_meshlet);
+	if (dist > 0.0001) {
+		if (dot(to_meshlet, world_cone_axis) >= d.cone_cutoff * dist + world_radius) {
+			return; // Backfacing - culled.
+		}
+	}
+
+	for (int i = 0; i < 6; i++) {
+		vec4 plane = params.planes[i];
+		float dist_to_plane = dot(plane.xyz, world_center) - plane.w;
+		if (dist_to_plane >= world_radius) {
+			return; // Fully outside this frustum plane - culled.
+		}
+	}
+
+	uint slot = atomicAdd(visible_meshlets.count, 1);
+	if (slot < params.max_visible) {
+		visible_meshlets.data[slot].instance_index = item.instance_index;
+		visible_meshlets.data[slot].meshlet_index = item.meshlet_index;
+	}
+}

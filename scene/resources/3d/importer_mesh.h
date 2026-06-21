@@ -34,6 +34,7 @@
 #include "core/variant/typed_array.h"
 #include "scene/resources/mesh.h"
 #include "scene/resources/navigation_mesh.h"
+#include "scene/resources/surface_tool.h"
 
 #ifndef PHYSICS_3D_DISABLED
 #include "scene/resources/3d/concave_polygon_shape_3d.h"
@@ -57,11 +58,22 @@ class ImporterMesh : public Resource {
 		struct LOD {
 			Vector<int> indices;
 			float distance = 0.0f;
+
+			Vector<SurfaceTool::Meshlet> meshlets;
+			PackedInt32Array meshlet_vertices;
+			PackedByteArray meshlet_triangles;
+			Vector<SurfaceTool::MeshletBounds> meshlet_bounds;
 		};
 		Vector<LOD> lods;
 		Ref<Material> material;
 		String name;
 		uint64_t flags = 0;
+
+		// Meshlets for the surface's own (full resolution) geometry, built alongside the LODs.
+		Vector<SurfaceTool::Meshlet> meshlets;
+		PackedInt32Array meshlet_vertices;
+		PackedByteArray meshlet_triangles;
+		Vector<SurfaceTool::MeshletBounds> meshlet_bounds;
 
 		struct LODComparator {
 			_FORCE_INLINE_ bool operator()(const LOD &l, const LOD &r) const {
@@ -112,6 +124,15 @@ public:
 	float get_surface_lod_size(int p_surface, int p_lod) const;
 	Ref<Material> get_surface_material(int p_surface) const;
 	uint64_t get_surface_format(int p_surface) const;
+
+	// Meshlets baked by generate_lods(); p_lod < 0 refers to the surface's own full-resolution
+	// geometry, p_lod >= 0 indexes into the surface's generated LOD levels. Not exposed to
+	// GDScript: this is internal plumbing consumed by the renderer-side meshlet upload.
+	int get_surface_meshlet_count(int p_surface, int p_lod = -1) const;
+	const Vector<SurfaceTool::Meshlet> &get_surface_meshlets(int p_surface, int p_lod = -1) const;
+	const PackedInt32Array &get_surface_meshlet_vertices(int p_surface, int p_lod = -1) const;
+	const PackedByteArray &get_surface_meshlet_triangles(int p_surface, int p_lod = -1) const;
+	const Vector<SurfaceTool::MeshletBounds> &get_surface_meshlet_bounds(int p_surface, int p_lod = -1) const;
 
 	void set_surface_material(int p_surface, const Ref<Material> &p_material);
 

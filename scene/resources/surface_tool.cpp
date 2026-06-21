@@ -43,6 +43,9 @@ SurfaceTool::SimplifyScaleFunc SurfaceTool::simplify_scale_func = nullptr;
 SurfaceTool::GenerateRemapFunc SurfaceTool::generate_remap_func = nullptr;
 SurfaceTool::RemapVertexFunc SurfaceTool::remap_vertex_func = nullptr;
 SurfaceTool::RemapIndexFunc SurfaceTool::remap_index_func = nullptr;
+SurfaceTool::BuildMeshletsFunc SurfaceTool::build_meshlets_func = nullptr;
+SurfaceTool::BuildMeshletsBoundFunc SurfaceTool::build_meshlets_bound_func = nullptr;
+SurfaceTool::ComputeMeshletBoundsFunc SurfaceTool::compute_meshlet_bounds_func = nullptr;
 
 void SurfaceTool::strip_mesh_arrays(PackedVector3Array &r_vertices, PackedInt32Array &r_indices) {
 	ERR_FAIL_COND_MSG(!generate_remap_func || !remap_vertex_func || !remap_index_func, "Meshoptimizer library is not initialized.");
@@ -1326,6 +1329,52 @@ Vector<int> SurfaceTool::generate_lod(float p_threshold, int p_target_index_coun
 	lod.resize(index_count);
 
 	return lod;
+}
+
+Vector<SurfaceTool::Meshlet> SurfaceTool::build_meshlets(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices, uint32_t p_max_vertices, uint32_t p_max_triangles, float p_cone_weight, PackedInt32Array &r_meshlet_vertices, PackedByteArray &r_meshlet_triangles, Vector<MeshletBounds> &r_bounds) {
+	Vector<Meshlet> meshlets;
+
+	ERR_FAIL_NULL_V(build_meshlets_func, meshlets);
+	ERR_FAIL_NULL_V(build_meshlets_bound_func, meshlets);
+	ERR_FAIL_NULL_V(compute_meshlet_bounds_func, meshlets);
+	ERR_FAIL_COND_V(p_vertices.is_empty(), meshlets);
+	ERR_FAIL_COND_V(p_indices.is_empty(), meshlets);
+	ERR_FAIL_COND_V(p_indices.size() % 3 != 0, meshlets);
+	ERR_FAIL_COND_V(p_max_vertices == 0 || p_max_vertices > 256, meshlets);
+	ERR_FAIL_COND_V(p_max_triangles == 0 || p_max_triangles > 512, meshlets);
+
+	LocalVector<float> vertex_positions;
+	vertex_positions.resize(p_vertices.size() * 3);
+	for (int i = 0; i < p_vertices.size(); i++) {
+		vertex_positions[i * 3 + 0] = p_vertices[i].x;
+		vertex_positions[i * 3 + 1] = p_vertices[i].y;
+		vertex_positions[i * 3 + 2] = p_vertices[i].z;
+	}
+
+	LocalVector<unsigned int> indices;
+	indices.resize(p_indices.size());
+	for (int i = 0; i < p_indices.size(); i++) {
+		indices[i] = (unsigned int)p_indices[i];
+	}
+
+	size_t max_meshlets = build_meshlets_bound_func(indices.size(), p_max_vertices, p_max_triangles);
+	meshlets.resize(max_meshlets);
+	r_meshlet_vertices.resize(max_meshlets * p_max_vertices);
+	r_meshlet_triangles.resize(max_meshlets * p_max_triangles * 3);
+
+	size_t meshlet_count = build_meshlets_func(meshlets.ptrw(), (unsigned int *)r_meshlet_vertices.ptrw(), (unsigned char *)r_meshlet_triangles.ptrw(), indices.ptr(), indices.size(), vertex_positions.ptr(), p_vertices.size(), sizeof(float) * 3, p_max_vertices, p_max_triangles, p_cone_weight);
+
+	r_bounds.resize(meshlet_count);
+	for (size_t i = 0; i < meshlet_count; i++) {
+		const Meshlet &m = meshlets[i];
+		r_bounds.write[i] = compute_meshlet_bounds_func((const unsigned int *)r_meshlet_vertices.ptr() + m.vertex_offset, (const unsigned char *)r_meshlet_triangles.ptr() + m.triangle_offset, m.triangle_count, vertex_positions.ptr(), p_vertices.size(), sizeof(float) * 3);
+	}
+
+	meshlets.resize(meshlet_count);
+	r_meshlet_vertices.resize(max_meshlets > 0 ? (meshlet_count > 0 ? (meshlets[meshlet_count - 1].vertex_offset + meshlets[meshlet_count - 1].vertex_count) : 0) : 0);
+	r_meshlet_triangles.resize(meshlet_count > 0 ? (meshlets[meshlet_count - 1].triangle_offset + meshlets[meshlet_count - 1].triangle_count * 3) : 0);
+
+	return meshlets;
 }
 
 void SurfaceTool::_bind_methods() {

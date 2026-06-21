@@ -432,6 +432,55 @@ uint64_t ImporterMesh::get_surface_format(int p_surface) const {
 	return surfaces[p_surface].flags;
 }
 
+int ImporterMesh::get_surface_meshlet_count(int p_surface, int p_lod) const {
+	ERR_FAIL_INDEX_V(p_surface, surfaces.size(), 0);
+	if (p_lod < 0) {
+		return surfaces[p_surface].meshlets.size();
+	}
+	ERR_FAIL_INDEX_V(p_lod, surfaces[p_surface].lods.size(), 0);
+	return surfaces[p_surface].lods[p_lod].meshlets.size();
+}
+
+const Vector<SurfaceTool::Meshlet> &ImporterMesh::get_surface_meshlets(int p_surface, int p_lod) const {
+	static const Vector<SurfaceTool::Meshlet> empty;
+	ERR_FAIL_INDEX_V(p_surface, surfaces.size(), empty);
+	if (p_lod < 0) {
+		return surfaces[p_surface].meshlets;
+	}
+	ERR_FAIL_INDEX_V(p_lod, surfaces[p_surface].lods.size(), empty);
+	return surfaces[p_surface].lods[p_lod].meshlets;
+}
+
+const PackedInt32Array &ImporterMesh::get_surface_meshlet_vertices(int p_surface, int p_lod) const {
+	static const PackedInt32Array empty;
+	ERR_FAIL_INDEX_V(p_surface, surfaces.size(), empty);
+	if (p_lod < 0) {
+		return surfaces[p_surface].meshlet_vertices;
+	}
+	ERR_FAIL_INDEX_V(p_lod, surfaces[p_surface].lods.size(), empty);
+	return surfaces[p_surface].lods[p_lod].meshlet_vertices;
+}
+
+const PackedByteArray &ImporterMesh::get_surface_meshlet_triangles(int p_surface, int p_lod) const {
+	static const PackedByteArray empty;
+	ERR_FAIL_INDEX_V(p_surface, surfaces.size(), empty);
+	if (p_lod < 0) {
+		return surfaces[p_surface].meshlet_triangles;
+	}
+	ERR_FAIL_INDEX_V(p_lod, surfaces[p_surface].lods.size(), empty);
+	return surfaces[p_surface].lods[p_lod].meshlet_triangles;
+}
+
+const Vector<SurfaceTool::MeshletBounds> &ImporterMesh::get_surface_meshlet_bounds(int p_surface, int p_lod) const {
+	static const Vector<SurfaceTool::MeshletBounds> empty;
+	ERR_FAIL_INDEX_V(p_surface, surfaces.size(), empty);
+	if (p_lod < 0) {
+		return surfaces[p_surface].meshlet_bounds;
+	}
+	ERR_FAIL_INDEX_V(p_lod, surfaces[p_surface].lods.size(), empty);
+	return surfaces[p_surface].lods[p_lod].meshlet_bounds;
+}
+
 Ref<Material> ImporterMesh::get_surface_material(int p_surface) const {
 	ERR_FAIL_INDEX_V(p_surface, surfaces.size(), Ref<Material>());
 	return surfaces[p_surface].material;
@@ -604,6 +653,11 @@ void ImporterMesh::generate_lods(float p_normal_merge_angle, Array p_bone_transf
 			continue; //no lods if no indices
 		}
 		ERR_FAIL_COND_MSG(index_count % 3 != 0, "ImporterMesh::generate_lods: Indexed triangle meshes MUST have an index array with a size that is a multiple of 3, but got " + itos(index_count) + " indices. Cannot generate LODs for this invalid mesh.");
+
+		surfaces.write[i].meshlets.clear();
+		if (SurfaceTool::build_meshlets_func) {
+			surfaces.write[i].meshlets = SurfaceTool::build_meshlets(vertices, indices, 64, 124, 0.5f, surfaces.write[i].meshlet_vertices, surfaces.write[i].meshlet_triangles, surfaces.write[i].meshlet_bounds);
+		}
 
 		const Vector3 *vertices_ptr = vertices.ptr();
 		const int *indices_ptr = indices.ptr();
@@ -838,6 +892,9 @@ void ImporterMesh::generate_lods(float p_normal_merge_angle, Array p_bone_transf
 			Surface::LOD lod;
 			lod.distance = MAX(current_error * scale, CMP_EPSILON2);
 			lod.indices = new_indices;
+			if (SurfaceTool::build_meshlets_func) {
+				lod.meshlets = SurfaceTool::build_meshlets(vertices, lod.indices, 64, 124, 0.5f, lod.meshlet_vertices, lod.meshlet_triangles, lod.meshlet_bounds);
+			}
 			surfaces.write[i].lods.push_back(lod);
 
 			print_verbose("  LOD " + itos(surfaces.write[i].lods.size()) + ": " + itos(new_index_count / 3) + " triangles, error " + rtos(current_error) + " (step error " + rtos(step_error) + ")");

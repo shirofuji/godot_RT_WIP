@@ -36,6 +36,7 @@
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 #include "core/variant/typed_array.h"
+#include "scene/resources/surface_tool.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/shader_language.h"
@@ -1176,6 +1177,31 @@ void RenderingServer::mesh_surface_make_offsets_from_format(uint64_t p_format, i
 	}
 }
 
+// SurfaceTool::Meshlet/MeshletBounds (scene/resources/surface_tool.h) and
+// RenderingServerTypes::MeshletInfo/MeshletBoundsInfo (servers/rendering/rendering_server_types.h)
+// are independent, layout-identical mirrors of the same meshoptimizer structs - kept separate so
+// the servers layer doesn't need to include a scene/ header. These convert between them.
+static_assert(sizeof(RenderingServerTypes::MeshletInfo) == sizeof(SurfaceTool::Meshlet), "RenderingServerTypes::MeshletInfo must mirror SurfaceTool::Meshlet's layout.");
+static_assert(sizeof(RenderingServerTypes::MeshletBoundsInfo) == sizeof(SurfaceTool::MeshletBounds), "RenderingServerTypes::MeshletBoundsInfo must mirror SurfaceTool::MeshletBounds's layout.");
+
+static Vector<RenderingServerTypes::MeshletInfo> _meshlet_info_convert(const Vector<SurfaceTool::Meshlet> &p_src) {
+	Vector<RenderingServerTypes::MeshletInfo> dst;
+	dst.resize(p_src.size());
+	if (!p_src.is_empty()) {
+		memcpy(dst.ptrw(), p_src.ptr(), sizeof(SurfaceTool::Meshlet) * p_src.size());
+	}
+	return dst;
+}
+
+static Vector<RenderingServerTypes::MeshletBoundsInfo> _meshlet_bounds_convert(const Vector<SurfaceTool::MeshletBounds> &p_src) {
+	Vector<RenderingServerTypes::MeshletBoundsInfo> dst;
+	dst.resize(p_src.size());
+	if (!p_src.is_empty()) {
+		memcpy(dst.ptrw(), p_src.ptr(), sizeof(SurfaceTool::MeshletBounds) * p_src.size());
+	}
+	return dst;
+}
+
 Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes, const Dictionary &p_lods, uint64_t p_compress_format) {
 	ERR_FAIL_INDEX_V(p_primitive, RSE::PRIMITIVE_MAX, ERR_INVALID_PARAMETER);
 	ERR_FAIL_COND_V(p_arrays.size() != RSE::ARRAY_MAX, ERR_INVALID_PARAMETER);
@@ -1374,6 +1400,54 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 		}
 	}
 
+	// Build meshlets for the base (full resolution) surface and every LOD, covering every mesh
+	// creation path uniformly: primitives (PrimitiveMesh::_update), procedural meshes
+	// (ArrayMesh::add_surface_from_arrays / SurfaceTool::commit), and imported meshes
+	// (ImporterMesh::get_mesh -> ArrayMesh::add_surface_from_arrays). SurfaceTool::build_meshlets()
+	// returns its own scene-layer Meshlet/MeshletBounds types; convert them into the
+	// layout-identical RenderingServerTypes mirrors so SurfaceData stays scene-independent.
+	Vector<RenderingServerTypes::MeshletInfo> base_meshlets;
+	PackedInt32Array base_meshlet_vertices;
+	PackedByteArray base_meshlet_triangles;
+	Vector<RenderingServerTypes::MeshletBoundsInfo> base_meshlet_bounds;
+	PackedVector3Array base_vertices;
+	PackedVector3Array base_normals;
+	PackedVector2Array base_uvs;
+	if (SurfaceTool::build_meshlets_func && p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && !(format & RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
+		base_vertices = p_arrays[RSE::ARRAY_VERTEX];
+		base_normals = p_arrays[RSE::ARRAY_NORMAL];
+		base_uvs = p_arrays[RSE::ARRAY_TEX_UV];
+		PackedInt32Array base_indices = p_arrays[RSE::ARRAY_INDEX];
+		if (base_indices.size() % 3 == 0) {
+			Vector<SurfaceTool::MeshletBounds> base_bounds_st;
+			Vector<SurfaceTool::Meshlet> base_meshlets_st = SurfaceTool::build_meshlets(base_vertices, base_indices, 64, 124, 0.5f, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st);
+			base_meshlets = _meshlet_info_convert(base_meshlets_st);
+			base_meshlet_bounds = _meshlet_bounds_convert(base_bounds_st);
+
+			for (int i = 0; i < lods.size(); i++) {
+				PackedInt32Array lod_indices;
+				lod_indices.resize(lods[i].index_data.size() / (array_len <= 65536 ? 2 : 4));
+				if (array_len <= 65536) {
+					const uint16_t *index_ptr = (const uint16_t *)lods[i].index_data.ptr();
+					for (int j = 0; j < lod_indices.size(); j++) {
+						lod_indices.write[j] = index_ptr[j];
+					}
+				} else {
+					const uint32_t *index_ptr = (const uint32_t *)lods[i].index_data.ptr();
+					for (int j = 0; j < lod_indices.size(); j++) {
+						lod_indices.write[j] = index_ptr[j];
+					}
+				}
+				if (lod_indices.size() % 3 == 0 && lod_indices.size() > 0) {
+					Vector<SurfaceTool::MeshletBounds> lod_bounds_st;
+					Vector<SurfaceTool::Meshlet> lod_meshlets_st = SurfaceTool::build_meshlets(base_vertices, lod_indices, 64, 124, 0.5f, lods.write[i].meshlet_vertices, lods.write[i].meshlet_triangles, lod_bounds_st);
+					lods.write[i].meshlets = _meshlet_info_convert(lod_meshlets_st);
+					lods.write[i].meshlet_bounds = _meshlet_bounds_convert(lod_bounds_st);
+				}
+			}
+		}
+	}
+
 	RenderingServerTypes::SurfaceData &surface_data = *r_surface_data;
 	surface_data.format = format;
 	surface_data.primitive = p_primitive;
@@ -1388,6 +1462,13 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	surface_data.bone_aabbs = bone_aabb;
 	surface_data.lods = lods;
 	surface_data.uv_scale = uv_scale;
+	surface_data.meshlets = base_meshlets;
+	surface_data.meshlet_vertices = base_meshlet_vertices;
+	surface_data.meshlet_triangles = base_meshlet_triangles;
+	surface_data.meshlet_bounds = base_meshlet_bounds;
+	surface_data.meshlet_positions = base_vertices;
+	surface_data.meshlet_normals = base_normals;
+	surface_data.meshlet_uvs = base_uvs;
 
 	return OK;
 }

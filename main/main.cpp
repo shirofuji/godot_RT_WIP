@@ -77,6 +77,7 @@
 #include "servers/display/display_server.h"
 #include "servers/movie_writer/movie_writer.h"
 #include "servers/register_server_types.h"
+#include "servers/rendering/renderer_rd/meshlet_selftest.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_default.h"
@@ -4881,6 +4882,8 @@ int Main::start() {
 
 	OS::get_singleton()->benchmark_end_measure("Startup", "Main::Start");
 	OS::get_singleton()->benchmark_dump();
+
+	run_meshlet_selftest_if_requested();
 
 	return EXIT_SUCCESS;
 }
