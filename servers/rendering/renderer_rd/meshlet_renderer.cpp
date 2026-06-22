@@ -137,7 +137,7 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	cached_format = p_framebuffer_format;
 }
 
-void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, bool p_clear, bool p_depth_only) {
+void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, const Color &p_light_color, bool p_clear, bool p_depth_only) {
 	ERR_FAIL_NULL(MeshletStorage::get_singleton());
 
 	_ensure_pipeline(p_framebuffer_format, p_depth_only);
@@ -239,6 +239,10 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			float view_projection[16];
 			float light_direction[3];
 			float pad0;
+			float light_color[3]; // Energy-premultiplied (see _meshlet_get_directional_light()).
+			float pad1;
+			float camera_position[3];
+			float pad2;
 		};
 		RenderPushConstant push_constant;
 		Projection vp = p_projection * Projection(p_camera_transform.affine_inverse());
@@ -252,6 +256,14 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		push_constant.light_direction[1] = light_dir.y;
 		push_constant.light_direction[2] = light_dir.z;
 		push_constant.pad0 = 0;
+		push_constant.light_color[0] = p_light_color.r;
+		push_constant.light_color[1] = p_light_color.g;
+		push_constant.light_color[2] = p_light_color.b;
+		push_constant.pad1 = 0;
+		push_constant.camera_position[0] = p_camera_transform.origin.x;
+		push_constant.camera_position[1] = p_camera_transform.origin.y;
+		push_constant.camera_position[2] = p_camera_transform.origin.z;
+		push_constant.pad2 = 0;
 
 		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : cached_pipeline);
 		RD::get_singleton()->draw_list_bind_vertex_array(draw_list, empty_vertex_array);

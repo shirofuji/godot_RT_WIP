@@ -7,11 +7,16 @@
 layout(location = 0) out vec3 normal_interp;
 layout(location = 1) out flat uint meshlet_index_interp;
 layout(location = 2) out flat uint material_id_interp;
+layout(location = 3) out vec3 vertex_light_interp;
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
 	vec3 light_direction;
 	float pad0;
+	vec3 light_color; // Already includes energy (premultiplied on the C++ side).
+	float pad1;
+	vec3 camera_position;
+	float pad2;
 }
 params;
 
@@ -78,6 +83,34 @@ layout(set = 0, binding = 7, std430) restrict readonly buffer InstanceMaterialId
 }
 instance_material_ids;
 
+#ifndef MESHLET_DEPTH_ONLY
+// Mirrors MeshletStorage::MeshletMaterialGPU exactly (std430 layout) - see the fragment stage's
+// copy of this struct for the full field-by-field rationale. Declared in the vertex stage too
+// (B2: vertex-lit milestone) since the per-vertex lighting calculation below needs
+// roughness/metallic/specular; the depth-only shader variant skips this entirely (no color
+// output at all, so no need for material data in its vertex stage either).
+struct MeshletMaterial {
+	vec4 albedo;
+	vec3 emission;
+	float metallic;
+	float roughness;
+	float specular;
+	uint albedo_texture_index;
+	uint normal_texture_index;
+	uint orm_texture_index;
+	uint emission_texture_index;
+	uint flags;
+	float alpha_scissor_threshold;
+	vec2 uv1_scale;
+	vec2 uv1_offset;
+};
+
+layout(set = 0, binding = 8, std430) restrict readonly buffer MeshletMaterials {
+	MeshletMaterial data[];
+}
+meshlet_materials;
+#endif
+
 vec3 oct_decode_normal(vec2 e) {
 	vec3 v = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
 	float t = clamp(-v.z, 0.0, 1.0);
@@ -112,11 +145,63 @@ void main() {
 	vec3 world_pos = (transform * vec4(local_pos.xyz, 1.0)).xyz;
 	gl_Position = params.view_projection * vec4(world_pos, 1.0);
 
-	vec3 world_normal = normalize(mat3(transform) * oct_decode_normal(attrib.xy));
+	// Negated: this pipeline's render pipeline uses POLYGON_CULL_FRONT (see
+	// MeshletRenderer::_ensure_pipeline()'s comment - meshoptimizer/SurfaceTool::build_meshlets()
+	// produces triangles wound opposite to Godot's normal front-facing convention, and CULL_FRONT
+	// is the established fix for that, empirically verified to eliminate the original "holes"
+	// bug). One consequence never previously surfaced: for a closed surface, culling what Godot
+	// considers "front-facing" and keeping only "back-facing" triangles means the *actual visible*
+	// triangles are the geometrically-far side of the surface as seen from the camera (there's
+	// nothing left to occlude them, so they pass the depth test and get drawn at their own,
+	// correct position) - and that far side's own correctly-computed outward normal naturally
+	// points away from the camera, not toward it. Confirmed directly: a synthetic sphere's
+	// vertex-shader-computed N.z was negative at the camera-facing point and positive only near
+	// the silhouette - exactly inverted from the expected gradient - until this negation was
+	// added. B1's flat per-meshlet debug coloring and the original N.L-based debug shading never
+	// surfaced this, since "looks like a smoothly shaded blob" doesn't distinguish a correct
+	// gradient from a geometrically-backward one - this is the first shading in this pipeline that
+	// actually depends on the *absolute* direction of N, not just its smoothness.
+	vec3 world_normal = -normalize(mat3(transform) * oct_decode_normal(attrib.xy));
 
 	normal_interp = world_normal;
 	meshlet_index_interp = item.meshlet_index;
-	material_id_interp = instance_material_ids.data[item.instance_index];
+	uint material_id = instance_material_ids.data[item.instance_index];
+	material_id_interp = material_id;
+
+#ifndef MESHLET_DEPTH_ONLY
+	// B2 (vertex-lit milestone): a simplified, per-vertex Lambertian-diffuse + Blinn-Phong-
+	// specular response to the scene's real directional light (color/energy/direction resolved
+	// CPU-side via LightStorage, not Forward+'s real DirectionalLights UBO - see
+	// _meshlet_get_directional_light()'s comment for why that's deferred to B3). Deliberately not
+	// a literal reuse of scene_forward_lights_inc.glsl's light_compute() (that function has
+	// transitive dependencies - shadow sampling, the real light/shadow-atlas bindings - which
+	// would need the full SCENE_UNIFORM_SET integration B3 is scoped to do anyway); this is "close
+	// enough to be visually comparable" by design, not bit-for-bit identical to Forward+'s own
+	// lighting, matching this milestone's explicitly scoped intent.
+	MeshletMaterial mat = meshlet_materials.data[material_id];
+	vec3 N = world_normal;
+	vec3 L = normalize(-params.light_direction);
+	vec3 V = normalize(params.camera_position - world_pos);
+	vec3 H = normalize(L + V);
+	float ndotl = max(dot(N, L), 0.0);
+	float ndoth = max(dot(N, H), 0.0);
+
+	// Real metals have ~no diffuse response; non-metals keep their full albedo as diffuse color.
+	vec3 diffuse_color = mat.albedo.rgb * (1.0 - mat.metallic);
+	vec3 diffuse = diffuse_color * params.light_color * ndotl;
+
+	// Rough Blinn-Phong stand-in for a real GGX specular lobe - roughness controls the shininess
+	// exponent (rougher = lower exponent = wider, dimmer highlight), metallic blends the highlight
+	// color from white (dielectric) toward the albedo (metals tint their specular reflections).
+	float shininess = mix(128.0, 2.0, mat.roughness);
+	float spec_power = ndotl > 0.0 ? pow(ndoth, shininess) : 0.0;
+	vec3 specular_color = mix(vec3(mat.specular), mat.albedo.rgb, mat.metallic);
+	vec3 specular = specular_color * params.light_color * spec_power;
+
+	vertex_light_interp = diffuse + specular;
+#else
+	vertex_light_interp = vec3(0.0);
+#endif
 
 	// Manual depth bias toward "nearer" (reversed-Z: larger device-Z = nearer - see
 	// meshlet_occlusion_test.glsl's comment). This pipeline frequently draws on top of real depth
@@ -149,11 +234,16 @@ void main() {
 layout(location = 0) in vec3 normal_interp;
 layout(location = 1) in flat uint meshlet_index_interp;
 layout(location = 2) in flat uint material_id_interp;
+layout(location = 3) in vec3 vertex_light_interp;
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
 	vec3 light_direction;
 	float pad0;
+	vec3 light_color;
+	float pad1;
+	vec3 camera_position;
+	float pad2;
 }
 params;
 
@@ -161,8 +251,8 @@ params;
 layout(location = 0) out vec4 frag_color;
 
 // Mirrors MeshletStorage::MeshletMaterialGPU exactly (std430 layout) - a flattened snapshot of
-// the subset of StandardMaterial3D/ORMMaterial3D parameters this milestone (B1: unlit/emissive)
-// reads; metallic/roughness/specular/texture indices are uploaded but not consumed yet (B2/B3).
+// the subset of StandardMaterial3D/ORMMaterial3D parameters this pipeline reads; texture indices
+// are uploaded but not sampled yet (B3 - per-fragment, where texture detail actually matters).
 struct MeshletMaterial {
 	vec4 albedo;
 	vec3 emission;
@@ -188,11 +278,10 @@ meshlet_materials;
 void main() {
 #ifndef MESHLET_DEPTH_ONLY
 	MeshletMaterial mat = meshlet_materials.data[material_id_interp];
-	// B1 (unlit/emissive milestone): flat albedo + emission, no lighting at all - this proves the
-	// material-id threading end-to-end (per-instance resolution -> upload_material() dedup ->
-	// this lookup, across however many distinct real materials are present in one indirect
-	// multi-draw) before taking on per-vertex/per-fragment lighting (B2/B3).
-	vec3 color = mat.albedo.rgb + mat.emission;
+	// B2 (vertex-lit milestone): the lighting contribution (diffuse+specular against the scene's
+	// real directional light) was already computed per-vertex and interpolated in - just add
+	// emission here. No per-fragment light_compute() yet (that's B3).
+	vec3 color = vertex_light_interp + mat.emission;
 	frag_color = vec4(color, mat.albedo.a);
 #endif
 	// MESHLET_DEPTH_ONLY: no color output at all - this variant targets a depth-only

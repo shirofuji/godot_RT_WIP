@@ -1750,6 +1750,25 @@ uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_mater
 	return meshlet_storage->upload_material(material_rid, data);
 }
 
+bool RenderForwardClustered::_meshlet_get_directional_light(RenderDataRD *p_render_data, Color &r_color, float &r_energy, Vector3 &r_direction) {
+	if (!p_render_data->lights || p_render_data->directional_light_count == 0) {
+		return false;
+	}
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+	if (!light_storage) {
+		return false;
+	}
+	// directional_light_count describes how many of the *first* entries in p_render_data->lights
+	// are directional - the same ordering convention Forward+'s own _setup_lights() relies on.
+	RID light_instance = (*p_render_data->lights)[0];
+	RID base_light = light_storage->light_instance_get_base_light(light_instance);
+	r_color = light_storage->light_get_color(base_light);
+	r_energy = light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_ENERGY);
+	Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
+	r_direction = light_transform.basis.xform(Vector3(0, 0, -1)).normalized();
+	return true;
+}
+
 void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_data) {
 	meshlet_scan_instance_transforms.clear();
 	meshlet_scan_material_ids.clear();
@@ -1938,7 +1957,7 @@ void RenderForwardClustered::_render_meshlet_early_depth_pass(RenderDataRD *p_re
 	// before Forward+'s own real depth pre-pass).
 	RID material_ids_buffer = meshlet_scan_material_ids_buffer();
 	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_depth_framebuffer);
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_depth_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, Vector3(), true, true);
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_depth_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, Vector3(), Color(), true, true);
 }
 
 void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer) {
@@ -1996,10 +2015,25 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 
 	RID material_ids_buffer = meshlet_scan_material_ids_buffer();
 	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_color_only_framebuffer);
+
+	// B2 (vertex-lit milestone): real scene directional light, falling back to no lighting
+	// contribution (black, plus whatever emission a material has) if the scene has none - this
+	// milestone deliberately only handles directional light (see
+	// _meshlet_get_directional_light()'s comment), not omni/spot/area, so there's nothing to light
+	// by in that fallback case.
+	Color light_color = Color(0, 0, 0);
+	Vector3 light_direction = Vector3(-0.5f, -1.0f, -0.5f).normalized();
+	float light_energy = 0.0f;
+	if (_meshlet_get_directional_light(p_render_data, light_color, light_energy, light_direction)) {
+		light_color *= light_energy;
+	} else {
+		light_color = Color(0, 0, 0);
+	}
+
 	// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
 	// color (and, if the early pass ran, its partial depth contribution too) - never true here,
 	// matching this pass's existing pre-restructuring behavior.
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, Vector3(-0.5f, -1.0f, -0.5f), false);
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, light_direction, light_color, false);
 
 	// Rebuild Hi-Z once more, now from the fully-resolved depth (everything drawn this frame,
 	// including what this late pass itself just drew) - this becomes *next* frame's "last frame's

@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/math/color.h"
 #include "core/math/projection.h"
 #include "core/math/transform_3d.h"
 #include "servers/rendering/renderer_rd/meshlet_culler.h"
@@ -91,9 +92,11 @@ public:
 	// p_depth_only: targets a framebuffer with zero color attachments (e.g. Forward+'s real depth
 	// pre-pass framebuffer) using a fragment shader variant that writes no color at all - used by
 	// the temporal early pass (see project plan); when false, p_framebuffer must have a depth
-	// attachment plus exactly one color attachment, and p_light_direction is used for the
-	// debug N.L shading.
-	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, bool p_clear = true, bool p_depth_only = false);
+	// attachment plus exactly one color attachment, and p_light_direction/p_light_color are used
+	// for the per-vertex lighting (B2 milestone) - p_light_color should already be energy-
+	// premultiplied (see RenderForwardClustered::_meshlet_get_directional_light()). Both are
+	// ignored when p_depth_only is true.
+	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, const Color &p_light_color, bool p_clear = true, bool p_depth_only = false);
 
 	MeshletRenderer();
 	~MeshletRenderer();

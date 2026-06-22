@@ -803,6 +803,13 @@ private:
 	// re-uploads every call (no per-frame change-detection yet) - acceptable for now since this
 	// mirrors the existing per-frame transform re-upload's level of (lack of) optimization.
 	uint32_t _meshlet_resolve_material_id(const RID &p_material_rid);
+	// B2 (vertex-lit milestone): real scene directional light, extracted directly via
+	// LightStorage's public getters rather than binding Forward+'s real DirectionalLights UBO -
+	// deliberately simpler than full SCENE_UNIFORM_SET integration (deferred to B3, where the
+	// per-fragment clustered-light/shadow/GI binding work happens anyway and the investment pays
+	// for itself). Returns false (light_color/energy/direction left untouched) if the scene has no
+	// directional light - caller should fall back to no lighting contribution in that case.
+	bool _meshlet_get_directional_light(RenderDataRD *p_render_data, Color &r_color, float &r_energy, Vector3 &r_direction);
 	Vector<uint32_t> meshlet_scan_material_ids; // Parallel to meshlet_scan_instance_transforms.
 	RID meshlet_scan_material_ids_buffer(); // Builds/reuses a per-instance material-id SSBO from
 			// meshlet_scan_material_ids, the same way meshlet_scan_transforms_buffer() does for

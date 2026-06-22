@@ -784,7 +784,13 @@ void test_meshlet_render_visual_proof() {
 	RID framebuffer = RD::get_singleton()->framebuffer_create(attachments);
 	RD::FramebufferFormatID framebuffer_format = RD::get_singleton()->framebuffer_get_format(framebuffer);
 
-	renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, framebuffer, framebuffer_format, Rect2i(0, 0, render_size, render_size), projection, camera_xform, Vector3(-0.5f, -1.0f, -0.5f));
+	// Light pointed straight at the camera-facing side (not the old debug-shading
+	// Vector3(-0.5,-1,-0.5)) - since B2 (vertex-lit milestone) introduced real light/dark sides,
+	// the center-pixel-brightness assertion below needs the front-facing point to be guaranteed
+	// brightly lit (N.L == 1.0 exactly) regardless of any minor pixel-center-vs-sphere-center
+	// alignment nuance, rather than relying on a specific angled direction that happened to light
+	// the whole shape uniformly back when shading was flat per-meshlet debug color.
+	renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, framebuffer, framebuffer_format, Rect2i(0, 0, render_size, render_size), projection, camera_xform, Vector3(0.0f, 0.0f, -1.0f), Color(1, 1, 1));
 
 	Vector<uint8_t> pixels = RD::get_singleton()->texture_get_data(color_texture, 0);
 	check((int)pixels.size() == render_size * render_size * 4, "Color texture readback has the expected byte size");
