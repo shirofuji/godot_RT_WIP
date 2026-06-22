@@ -61,6 +61,13 @@ layout(set = 0, binding = 2, std430) restrict writeonly buffer IndirectCommands 
 }
 commands;
 
+// Single uint32 buffer for vkCmdDrawIndexedIndirectCount: the GPU reads the actual draw count
+// from here at draw time, so only the real number of visible meshlets is processed.
+layout(set = 0, binding = 3, std430) restrict writeonly buffer DrawCount {
+	uint count;
+}
+draw_count;
+
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
 	if (idx >= params.max_draws) {
@@ -68,6 +75,12 @@ void main() {
 	}
 
 	uint real_visible_count = min(visible_meshlets.count, params.max_visible_capacity);
+
+	// Thread 0 writes the actual draw count for vkCmdDrawIndexedIndirectCount.
+	if (idx == 0) {
+		draw_count.count = real_visible_count;
+	}
+
 	if (idx >= real_visible_count) {
 		// Beyond the real visible count for this frame - explicitly mark degenerate
 		// (instance_count=0, drawn as a no-op) rather than leaving this slot untouched, since it

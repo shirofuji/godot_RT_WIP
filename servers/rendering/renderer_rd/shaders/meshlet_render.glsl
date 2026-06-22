@@ -6,6 +6,7 @@
 
 layout(location = 0) out vec3 normal_interp;
 layout(location = 1) out flat uint meshlet_index_interp;
+layout(location = 2) out flat uint material_id_interp;
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
@@ -68,6 +69,15 @@ layout(set = 0, binding = 6, std430) restrict readonly buffer VertexAttributes {
 }
 vertex_attributes;
 
+// Per-instance material slot (see MeshletStorage::upload_material()) - resolved once per frame
+// from each instance's real material at scan time (render_forward_clustered.cpp), not baked into
+// MeshletDescriptor: materials are mutable after a mesh is uploaded (mesh_surface_set_material),
+// and meshlets are shared across many instances that may each have a different material override.
+layout(set = 0, binding = 7, std430) restrict readonly buffer InstanceMaterialIds {
+	uint data[];
+}
+instance_material_ids;
+
 vec3 oct_decode_normal(vec2 e) {
 	vec3 v = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
 	float t = clamp(-v.z, 0.0, 1.0);
@@ -100,32 +110,34 @@ void main() {
 	vec4 attrib = vertex_attributes.data[global_vertex_id];
 
 	vec3 world_pos = (transform * vec4(local_pos.xyz, 1.0)).xyz;
+	gl_Position = params.view_projection * vec4(world_pos, 1.0);
+
 	vec3 world_normal = normalize(mat3(transform) * oct_decode_normal(attrib.xy));
 
 	normal_interp = world_normal;
 	meshlet_index_interp = item.meshlet_index;
-	gl_Position = params.view_projection * vec4(world_pos, 1.0);
+	material_id_interp = instance_material_ids.data[item.instance_index];
 
 	// Manual depth bias toward "nearer" (reversed-Z: larger device-Z = nearer - see
 	// meshlet_occlusion_test.glsl's comment). This pipeline frequently draws on top of real depth
-	// already written for the exact same surface by Forward+'s own depth pre-pass (intentional -
-	// see _render_meshlet_debug_overlay's comment); this vertex-pulling path and Forward+'s own
-	// real vertex shader compute device-Z for the same logical point via two different paths,
-	// which produces a small but consistent (not floating-point-noise-level) gap. Without this
-	// nudge, GREATER_OR_EQUAL loses that near-tie far more often than it wins, leaving only
-	// edge/silhouette meshlets visible (confirmed live: a single GPU-readback sample measured a
-	// ~0.0013 gap for one meshlet, but that undersold the real range - 0.002 had no visible effect
-	// at all, while 0.005-0.05 reliably fixed full coverage; 0.005 is the smallest value tested
-	// that worked, kept deliberately small since this is a real tradeoff - too large a bias risks
-	// this object incorrectly rendering in front of *other*, genuinely-nearer-by-a-smaller-margin
-	// geometry elsewhere in a real scene). RD's own depth_bias_* pipeline state was tried first and
-	// found useless here: it scales by Vulkan's per-fragment minimum-resolvable-difference (sized
-	// for sub-ULP anti-z-fighting noise), nowhere near large enough for this systematic gap even
-	// at high constant-factor values. Scaling by gl_Position.w keeps the nudge a fixed fraction of
-	// NDC-Z regardless of distance, rather than a fixed absolute amount that would be too large up
-	// close and too small far away.
+	// already written for the exact same surface by Forward+'s own depth pre-pass (intentional);
+	// this vertex-pulling path and Forward+'s own real vertex shader compute device-Z for the
+	// same logical point via two different paths, which produces a small but consistent (not
+	// floating-point-noise-level) gap. Without this nudge, GREATER_OR_EQUAL loses that near-tie
+	// far more often than it wins, leaving only edge/silhouette meshlets visible (confirmed live:
+	// a single GPU-readback sample measured a ~0.0013 gap for one meshlet, but that undersold the
+	// real range - 0.002 had no visible effect at all, while 0.005-0.05 reliably fixed full
+	// coverage; 0.005 is the smallest value tested that worked, kept deliberately small since
+	// this is a real tradeoff - too large a bias risks this object incorrectly rendering in front
+	// of *other*, genuinely-nearer-by-a-smaller-margin geometry elsewhere in a real scene). RD's
+	// own depth_bias_* pipeline state was tried first and found useless here: it scales by
+	// Vulkan's per-fragment minimum-resolvable-difference (sized for sub-ULP anti-z-fighting
+	// noise), nowhere near large enough for this systematic gap even at high constant-factor
+	// values. Scaling by gl_Position.w keeps the nudge a fixed fraction of NDC-Z regardless of
+	// distance, rather than a fixed absolute amount that would be too large up close and too
+	// small far away.
 	const float DEPTH_BIAS_NDC_FRACTION = 0.005;
-	gl_Position.z += DEPTH_BIAS_NDC_FRACTION * gl_Position.w;
+	gl_Position.z = min(gl_Position.z + DEPTH_BIAS_NDC_FRACTION * gl_Position.w, gl_Position.w);
 }
 
 #[fragment]
@@ -136,6 +148,7 @@ void main() {
 
 layout(location = 0) in vec3 normal_interp;
 layout(location = 1) in flat uint meshlet_index_interp;
+layout(location = 2) in flat uint material_id_interp;
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
@@ -144,22 +157,46 @@ layout(push_constant, std430) uniform Params {
 }
 params;
 
+#ifndef MESHLET_DEPTH_ONLY
 layout(location = 0) out vec4 frag_color;
 
-// Cheap hash -> a distinct pseudo-random color per meshlet, so meshlet boundaries/coverage are
-// visible in the rendered image - this is a debug visualization, not final shading.
-vec3 meshlet_debug_color(uint p_index) {
-	uint h = p_index * 2654435761u;
-	h ^= h >> 13;
-	h *= 2246822519u;
-	h ^= h >> 16;
-	return vec3(float((h >> 0) & 0xFFu), float((h >> 8) & 0xFFu), float((h >> 16) & 0xFFu)) / 255.0;
+// Mirrors MeshletStorage::MeshletMaterialGPU exactly (std430 layout) - a flattened snapshot of
+// the subset of StandardMaterial3D/ORMMaterial3D parameters this milestone (B1: unlit/emissive)
+// reads; metallic/roughness/specular/texture indices are uploaded but not consumed yet (B2/B3).
+struct MeshletMaterial {
+	vec4 albedo;
+	vec3 emission;
+	float metallic;
+	float roughness;
+	float specular;
+	uint albedo_texture_index;
+	uint normal_texture_index;
+	uint orm_texture_index;
+	uint emission_texture_index;
+	uint flags;
+	float alpha_scissor_threshold;
+	vec2 uv1_scale;
+	vec2 uv1_offset;
+};
+
+layout(set = 0, binding = 8, std430) restrict readonly buffer MeshletMaterials {
+	MeshletMaterial data[];
 }
+meshlet_materials;
+#endif
 
 void main() {
-	vec3 n = normalize(normal_interp);
-	float ndotl = max(dot(n, normalize(-params.light_direction)), 0.0);
-	vec3 base_color = meshlet_debug_color(meshlet_index_interp);
-	vec3 color = base_color * (0.25 + 0.75 * ndotl);
-	frag_color = vec4(color, 1.0);
+#ifndef MESHLET_DEPTH_ONLY
+	MeshletMaterial mat = meshlet_materials.data[material_id_interp];
+	// B1 (unlit/emissive milestone): flat albedo + emission, no lighting at all - this proves the
+	// material-id threading end-to-end (per-instance resolution -> upload_material() dedup ->
+	// this lookup, across however many distinct real materials are present in one indirect
+	// multi-draw) before taking on per-vertex/per-fragment lighting (B2/B3).
+	vec3 color = mat.albedo.rgb + mat.emission;
+	frag_color = vec4(color, mat.albedo.a);
+#endif
+	// MESHLET_DEPTH_ONLY: no color output at all - this variant targets a depth-only
+	// framebuffer (Forward+'s real depth pre-pass framebuffer, which has zero color
+	// attachments) for the temporal early pass; depth write/test happens via fixed-function
+	// state regardless of what (if anything) the fragment shader writes.
 }

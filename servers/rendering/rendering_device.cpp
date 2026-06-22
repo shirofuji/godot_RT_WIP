@@ -6260,6 +6260,110 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 	_check_transfer_worker_buffer(buffer);
 }
 
+void RenderingDevice::draw_list_draw_indirect_count(DrawListID p_list, bool p_use_indices, RID p_buffer, uint32_t p_offset, RID p_count_buffer, uint32_t p_count_buffer_offset, uint32_t p_max_draw_count, uint32_t p_stride) {
+	ERR_RENDER_THREAD_GUARD();
+
+	ERR_FAIL_COND(!draw_list.active);
+
+	Buffer *buffer = storage_buffer_owner.get_or_null(p_buffer);
+	ERR_FAIL_NULL(buffer);
+	ERR_FAIL_COND_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_INDIRECT_BIT), "Buffer provided was not created to do indirect dispatch.");
+
+	Buffer *count_buffer = storage_buffer_owner.get_or_null(p_count_buffer);
+	ERR_FAIL_NULL(count_buffer);
+
+#ifdef DEBUG_ENABLED
+	ERR_FAIL_COND_MSG(!draw_list.validation.pipeline_active,
+			"No render pipeline was set before attempting to draw.");
+	if (draw_list.validation.pipeline_vertex_format != INVALID_ID) {
+		ERR_FAIL_COND_MSG(draw_list.validation.vertex_format == INVALID_ID,
+				"No vertex array was bound, and render pipeline expects vertices.");
+		ERR_FAIL_COND_MSG(draw_list.validation.pipeline_vertex_format != draw_list.validation.vertex_format,
+				"The vertex format used to create the pipeline does not match the vertex format bound.");
+	}
+
+	if (draw_list.validation.pipeline_push_constant_size > 0) {
+		ERR_FAIL_COND_MSG(!draw_list.validation.pipeline_push_constant_supplied,
+				"The shader in this pipeline requires a push constant to be set before drawing, but it's not present.");
+	}
+#endif
+
+#ifdef DEBUG_ENABLED
+	for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
+		if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+			continue;
+		}
+
+		if (draw_list.state.sets[i].pipeline_expected_format != draw_list.state.sets[i].uniform_set_format) {
+			if (draw_list.state.sets[i].uniform_set_format == 0) {
+				ERR_FAIL_MSG(vformat("Uniforms were never supplied for set (%d) at the time of drawing, which are required by the pipeline.", i));
+			} else if (uniform_set_owner.owns(draw_list.state.sets[i].uniform_set)) {
+				UniformSet *us = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
+				const String us_info = us ? vformat("(%d):\n%s\n", i, _shader_uniform_debug(us->shader_id, us->shader_set)) : vformat("(%d, which was just freed) ", i);
+				ERR_FAIL_MSG(vformat("Uniforms supplied for set %sare not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", us_info, _shader_uniform_debug(draw_list.state.pipeline_shader)));
+			} else {
+				ERR_FAIL_MSG(vformat("Uniforms supplied for set (%d, which was just freed) are not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", i, _shader_uniform_debug(draw_list.state.pipeline_shader)));
+			}
+		}
+	}
+#endif
+
+	// Prepare descriptor sets if the API doesn't use pipeline barriers.
+	if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
+		for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
+			if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+				continue;
+			}
+
+			draw_graph.add_draw_list_uniform_set_prepare_for_use(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i);
+		}
+	}
+
+	// Bind descriptor sets.
+	for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
+		if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+			continue; // Nothing expected by this pipeline.
+		}
+		if (!draw_list.state.sets[i].bound) {
+			draw_graph.add_draw_list_bind_uniform_set(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i);
+
+			UniformSet *uniform_set = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
+			ERR_FAIL_NULL(uniform_set);
+			_uniform_set_update_shared(uniform_set);
+			_uniform_set_update_clears(uniform_set);
+
+			draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+
+			draw_list.state.sets[i].bound = true;
+		}
+	}
+
+	// Only the indexed path is supported for now (meshlets use indexed draws).
+	ERR_FAIL_COND_MSG(!p_use_indices, "draw_list_draw_indirect_count currently only supports indexed draws.");
+
+#ifdef DEBUG_ENABLED
+	ERR_FAIL_COND_MSG(!draw_list.validation.index_array_count,
+			"Draw command requested indices, but no index buffer was set.");
+
+	ERR_FAIL_COND_MSG(draw_list.validation.pipeline_uses_restart_indices != draw_list.validation.index_buffer_uses_restart_indices,
+			"The usage of restart indices in index buffer does not match the render primitive in the pipeline.");
+#endif
+
+	draw_graph.add_draw_list_draw_indexed_indirect_count(buffer->driver_id, p_offset, count_buffer->driver_id, p_count_buffer_offset, p_max_draw_count, p_stride);
+
+	draw_list.state.draw_count++;
+
+	if (buffer->draw_tracker != nullptr) {
+		draw_graph.add_draw_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+	}
+	if (count_buffer->draw_tracker != nullptr) {
+		draw_graph.add_draw_list_usage(count_buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+	}
+
+	_check_transfer_worker_buffer(buffer);
+	_check_transfer_worker_buffer(count_buffer);
+}
+
 void RenderingDevice::draw_list_set_viewport(DrawListID p_list, const Rect2 &p_rect) {
 	ERR_FAIL_COND(!draw_list.active);
 

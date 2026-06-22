@@ -40,6 +40,7 @@
 #include "servers/rendering/renderer_rd/meshlet_culler.h"
 #include "servers/rendering/renderer_rd/meshlet_renderer.h"
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 
 namespace {
 
@@ -330,7 +331,18 @@ void test_hiz_occlusion_vs_cpu_reference() {
 	// version of this test used the raw projection directly, which was internally consistent but
 	// never caught the real engine's convention being different - confirmed wrong against a real
 	// scene (near/foreground objects were wrongly culled instead of distant ones).
-	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 0.05f, 20.0f);
+	// Near=1.0 (not the usual 0.05) is deliberate here: under reversed-Z, a device-Z value's
+	// magnitude for a given world distance scales with the near-plane value (precision is
+	// "front-loaded" relative to near, not to the camera in absolute terms) - this test's
+	// occluder/occludee distances (4 and 8 world units) only produced a genuine device-Z gap of
+	// ~0.006 at near=0.05, which is smaller than meshlet_occlusion_test.glsl's
+	// OCCLUSION_MARGIN_FLOOR (5e-2) and made this test's intentionally-occluded instance wrongly
+	// pass as visible once that margin was raised to handle precision drift at real-world scale.
+	// near=1.0 produces a gap of ~0.13 for the same world distances (safely > the margin) without
+	// moving any of the test's hand-placed instances or changing the qualitative occluder-in-
+	// front-of/behind-instances story. All test instances stay well clear of this new near plane
+	// (closest is instance C at distance 2, still 2x near).
+	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 1.0f, 20.0f);
 	Projection depth_correction;
 	depth_correction.set_depth_correction();
 	Projection projection = depth_correction * raw_projection;
@@ -366,7 +378,13 @@ void test_hiz_occlusion_vs_cpu_reference() {
 	memcpy(depth_bytes.ptrw(), depth_pixels.ptr(), depth_bytes.size());
 	RD::get_singleton()->texture_update(source_depth_texture, 0, depth_bytes);
 
-	RendererRD::HiZBuilder::HiZResult hiz = hiz_builder->build(source_depth_texture, Size2i(screen_size, screen_size));
+	// HiZBuilder now needs a RenderSceneBuffersRD to own its destination texture (for temporal
+	// two-pass persistence in the live engine) - a bare, unconfigured instance is fine here since
+	// build_into() always passes explicit sizes/layers, never falling back to
+	// RenderSceneBuffersRD's own internal_size/view_count (which would be unset without configure()).
+	Ref<RenderSceneBuffersRD> hiz_rb;
+	hiz_rb.instantiate();
+	RendererRD::HiZBuilder::HiZResult hiz = hiz_builder->build_into(hiz_rb, RB_MESHLET_HIZ_A, source_depth_texture, Size2i(screen_size, screen_size));
 	check(hiz.is_valid(), "HiZBuilder::build returned a valid result");
 	if (!hiz.is_valid()) {
 		RD::get_singleton()->free_rid(source_depth_texture);
@@ -508,6 +526,143 @@ void test_hiz_occlusion_vs_cpu_reference() {
 	RD::get_singleton()->free_rid(source_depth_texture);
 }
 
+// Temporal two-pass Hi-Z occlusion (see project plan/memory): proves the actual point of running
+// two passes instead of one - that an instance wrongly occluded by a *stale* Hi-Z (the early
+// pass's situation, testing against last frame's data) gets correctly recovered once re-tested
+// against a *fresh* Hi-Z built after whatever was blocking it is gone (the late pass's situation).
+// Tests MeshletCuller::occlude() directly against two hand-built depth buffers representing
+// "last frame" and "this frame," at the same level of abstraction as
+// test_hiz_occlusion_vs_cpu_reference() above, rather than simulating RenderForwardClustered's
+// full _render_scene flow (which would need much heavier RenderDataRD/viewport scaffolding to
+// construct here).
+void test_temporal_hiz_two_pass_disocclusion_recovery() {
+	RendererRD::MeshletStorage *storage = RendererRD::MeshletStorage::get_singleton();
+	RendererRD::MeshletCuller *culler = RendererRD::MeshletCuller::get_singleton();
+	RendererRD::HiZBuilder *hiz_builder = RendererRD::HiZBuilder::get_singleton();
+	if (!storage || !culler || !hiz_builder) {
+		return;
+	}
+
+	const int screen_size = 64;
+	Transform3D camera_xform(Basis(), Vector3(0, 0, 5));
+	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 1.0f, 20.0f);
+	Projection depth_correction;
+	depth_correction.set_depth_correction();
+	Projection projection = depth_correction * raw_projection;
+	float proj_z_a = projection.columns[2][2];
+	float proj_z_b = projection.columns[3][2];
+
+	auto device_depth_for_world_z = [&](float p_world_z) -> float {
+		float view_z = p_world_z - camera_xform.origin.z;
+		return (view_z * proj_z_a + proj_z_b) / (-view_z);
+	};
+
+	float occluder_depth = device_depth_for_world_z(1.0f); // World Z=1, distance 4 from camera.
+
+	// "Last frame": an occluder blocks the screen rect where instance D will project.
+	LocalVector<float> stale_depth_pixels;
+	stale_depth_pixels.resize(screen_size * screen_size);
+	for (int y = 0; y < screen_size; y++) {
+		for (int x = 0; x < screen_size; x++) {
+			bool in_occluder_rect = x >= 16 && x < 48 && y >= 16 && y < 48;
+			stale_depth_pixels[y * screen_size + x] = in_occluder_rect ? occluder_depth : 0.0f;
+		}
+	}
+	// "This frame": the occluder is gone (disocclusion) - everywhere reads far/clear.
+	LocalVector<float> fresh_depth_pixels;
+	fresh_depth_pixels.resize(screen_size * screen_size);
+	for (uint32_t i = 0; i < fresh_depth_pixels.size(); i++) {
+		fresh_depth_pixels[i] = 0.0f;
+	}
+
+	auto make_depth_texture = [&](const LocalVector<float> &p_pixels) -> RID {
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R32_SFLOAT;
+		tf.width = screen_size;
+		tf.height = screen_size;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+		RID tex = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		Vector<uint8_t> bytes;
+		bytes.resize(p_pixels.size() * sizeof(float));
+		memcpy(bytes.ptrw(), p_pixels.ptr(), bytes.size());
+		RD::get_singleton()->texture_update(tex, 0, bytes);
+		return tex;
+	};
+	RID stale_depth_texture = make_depth_texture(stale_depth_pixels);
+	RID fresh_depth_texture = make_depth_texture(fresh_depth_pixels);
+
+	// Same RenderSceneBuffersRD, two different named textures - mirrors how the live engine
+	// alternates RB_MESHLET_HIZ_A/RB_MESHLET_HIZ_B roles across frames rather than overwriting one
+	// texture in place (see render_forward_clustered.h's meshlet_hiz_a_is_current comment).
+	Ref<RenderSceneBuffersRD> hiz_rb;
+	hiz_rb.instantiate();
+	RendererRD::HiZBuilder::HiZResult stale_hiz = hiz_builder->build_into(hiz_rb, RB_MESHLET_HIZ_A, stale_depth_texture, Size2i(screen_size, screen_size));
+	RendererRD::HiZBuilder::HiZResult fresh_hiz = hiz_builder->build_into(hiz_rb, RB_MESHLET_HIZ_B, fresh_depth_texture, Size2i(screen_size, screen_size));
+	check(stale_hiz.is_valid() && fresh_hiz.is_valid(), "Temporal test: both stale and fresh Hi-Z built successfully");
+	if (!stale_hiz.is_valid() || !fresh_hiz.is_valid()) {
+		RD::get_singleton()->free_rid(stale_depth_texture);
+		RD::get_singleton()->free_rid(fresh_depth_texture);
+		return;
+	}
+
+	// Instance D: world Z=-3 (distance 8), same screen position as the occluder rect above -
+	// occluded against the stale Hi-Z, must be recovered against the fresh one.
+	PackedVector3Array vertices;
+	PackedInt32Array indices;
+	get_sphere_geometry(vertices, indices);
+	PackedInt32Array meshlet_vertices;
+	PackedByteArray meshlet_triangles;
+	Vector<SurfaceTool::MeshletBounds> bounds_st;
+	Vector<SurfaceTool::Meshlet> meshlets_st = SurfaceTool::build_meshlets(vertices, indices, 64, 124, 0.5f, meshlet_vertices, meshlet_triangles, bounds_st);
+	Vector<RenderingServerTypes::MeshletInfo> meshlets_info;
+	meshlets_info.resize(meshlets_st.size());
+	memcpy(meshlets_info.ptrw(), meshlets_st.ptr(), sizeof(SurfaceTool::Meshlet) * meshlets_st.size());
+	Vector<RenderingServerTypes::MeshletBoundsInfo> bounds_info;
+	bounds_info.resize(bounds_st.size());
+	memcpy(bounds_info.ptrw(), bounds_st.ptr(), sizeof(SurfaceTool::MeshletBounds) * bounds_st.size());
+	RendererRD::MeshletStorage::UploadResult upload = storage->upload_mesh_meshlets(vertices, PackedVector3Array(), PackedVector2Array(), meshlets_info, meshlet_vertices, meshlet_triangles, bounds_info);
+
+	Transform3D instance_d_transform(Basis(), Vector3(0, 0, -3));
+	LocalVector<float> transforms_data;
+	transforms_data.resize(16);
+	transform_to_mat4_columns(instance_d_transform, transforms_data.ptr());
+	RID transforms_buffer = RD::get_singleton()->storage_buffer_create(transforms_data.size() * sizeof(float));
+	RD::get_singleton()->buffer_update(transforms_buffer, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
+
+	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> ranges;
+	RendererRD::MeshletCuller::InstanceMeshletRange r;
+	r.instance_index = 0;
+	r.meshlet_offset = upload.meshlet_range.offset;
+	r.meshlet_count = upload.meshlet_range.count;
+	ranges.push_back(r);
+
+	Vector<Plane> planes = projection.get_projection_planes(camera_xform);
+	RendererRD::MeshletCuller::CullResult frustum_result = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin);
+
+	// Early pass's situation: occlude-test against last frame's (stale) Hi-Z.
+	RendererRD::MeshletCuller::CullResult stale_occlusion_result = culler->occlude(transforms_buffer, frustum_result, stale_hiz.texture, stale_hiz.mip_count, camera_xform, projection, Size2i(screen_size, screen_size));
+	Vector<RendererRD::MeshletCuller::VisibleMeshlet> stale_visible = culler->debug_read_visible(stale_occlusion_result);
+	check(stale_visible.is_empty(), "Temporal test: instance D is wrongly occluded against the stale Hi-Z (expected - this is what the early pass would see)");
+
+	// Late pass's situation: re-test the *same* frustum survivors against a fresh Hi-Z built after
+	// the occluder is gone - this is the actual point of two-pass over single-pass.
+	RendererRD::MeshletCuller::CullResult fresh_occlusion_result = culler->occlude(transforms_buffer, frustum_result, fresh_hiz.texture, fresh_hiz.mip_count, camera_xform, projection, Size2i(screen_size, screen_size));
+	Vector<RendererRD::MeshletCuller::VisibleMeshlet> fresh_visible = culler->debug_read_visible(fresh_occlusion_result);
+	check(!fresh_visible.is_empty(), "Temporal test: late pass recovers instance D against the fresh Hi-Z (disocclusion correctly handled)");
+	bool all_instance_d = true;
+	for (int i = 0; i < fresh_visible.size(); i++) {
+		if (fresh_visible[i].instance_index != 0) {
+			all_instance_d = false;
+		}
+	}
+	check(all_instance_d, "Temporal test: every fresh-pass-visible meshlet belongs to instance D (no spurious results)");
+
+	storage->free_mesh_meshlets(upload);
+	RD::get_singleton()->free_rid(transforms_buffer);
+	RD::get_singleton()->free_rid(stale_depth_texture);
+	RD::get_singleton()->free_rid(fresh_depth_texture);
+}
+
 // Phase 5 visual proof: renders an actual frame through the full pipeline (cull -> occlude ->
 // emit indirect draws -> vertex-pulling indirect multi-draw) into an offscreen framebuffer,
 // checks the resulting pixels are sane, and saves a PNG so it can also be looked at directly -
@@ -552,6 +707,14 @@ void test_meshlet_render_visual_proof() {
 	RID transforms_buffer = RD::get_singleton()->storage_buffer_create(transforms_data.size() * sizeof(float));
 	RD::get_singleton()->buffer_update(transforms_buffer, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
 
+	// Default-constructed MeshletMaterialGPU (flat white, no textures) explicitly uploaded to a
+	// known slot - the shader unconditionally indexes meshlet_materials.data[material_id], so this
+	// must be a real, populated slot rather than relying on the buffer's uninitialized backing
+	// storage.
+	uint32_t material_id = storage->upload_material(RID(), RendererRD::MeshletStorage::MeshletMaterialGPU());
+	RID material_ids_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t));
+	RD::get_singleton()->buffer_update(material_ids_buffer, 0, sizeof(uint32_t), &material_id);
+
 	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> ranges;
 	RendererRD::MeshletCuller::InstanceMeshletRange r;
 	r.instance_index = 0;
@@ -589,13 +752,15 @@ void test_meshlet_render_visual_proof() {
 		}
 	}
 	RD::get_singleton()->texture_update(far_depth_texture, 0, far_bytes);
-	RendererRD::HiZBuilder::HiZResult hiz = hiz_builder->build(far_depth_texture, Size2i(hiz_source_size, hiz_source_size));
+	Ref<RenderSceneBuffersRD> hiz_rb;
+	hiz_rb.instantiate();
+	RendererRD::HiZBuilder::HiZResult hiz = hiz_builder->build_into(hiz_rb, RB_MESHLET_HIZ_A, far_depth_texture, Size2i(hiz_source_size, hiz_source_size));
 
 	RendererRD::MeshletCuller::CullResult occlusion_result = culler->occlude(transforms_buffer, frustum_result, hiz.texture, hiz.mip_count, camera_xform, projection, Size2i(hiz_source_size, hiz_source_size));
 	check(occlusion_result.is_valid(), "occlude() returned a valid result (trivial all-far Hi-Z)");
 
 	RendererRD::MeshletCuller::IndirectDrawResult draws = culler->emit_indirect_draws(occlusion_result);
-	check(draws.is_valid() && draws.draw_count > 0, "emit_indirect_draws produced at least one draw command");
+	check(draws.is_valid() && draws.max_draw_count > 0, "emit_indirect_draws produced at least one draw command");
 
 	// Offscreen render target.
 	const int render_size = 256;
@@ -619,7 +784,7 @@ void test_meshlet_render_visual_proof() {
 	RID framebuffer = RD::get_singleton()->framebuffer_create(attachments);
 	RD::FramebufferFormatID framebuffer_format = RD::get_singleton()->framebuffer_get_format(framebuffer);
 
-	renderer->render(occlusion_result, draws, transforms_buffer, framebuffer, framebuffer_format, Rect2i(0, 0, render_size, render_size), projection, camera_xform, Vector3(-0.5f, -1.0f, -0.5f));
+	renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, framebuffer, framebuffer_format, Rect2i(0, 0, render_size, render_size), projection, camera_xform, Vector3(-0.5f, -1.0f, -0.5f));
 
 	Vector<uint8_t> pixels = RD::get_singleton()->texture_get_data(color_texture, 0);
 	check((int)pixels.size() == render_size * render_size * 4, "Color texture readback has the expected byte size");
@@ -652,6 +817,7 @@ void test_meshlet_render_visual_proof() {
 
 	storage->free_mesh_meshlets(upload);
 	RD::get_singleton()->free_rid(transforms_buffer);
+	RD::get_singleton()->free_rid(material_ids_buffer);
 	RD::get_singleton()->free_rid(far_depth_texture);
 	// Free the framebuffer before the textures it attaches - freeing an attached texture first
 	// cascades to free the framebuffer too (same dependency-tracking behavior as vertex
@@ -673,6 +839,7 @@ void run_meshlet_selftest_if_requested() {
 	test_meshlet_storage_round_trip();
 	test_meshlet_culler_vs_cpu_reference();
 	test_hiz_occlusion_vs_cpu_reference();
+	test_temporal_hiz_two_pass_disocclusion_recovery();
 	test_meshlet_render_visual_proof();
 	if (g_failures == 0) {
 		print_line("MESHLET_SELFTEST: all checks passed");

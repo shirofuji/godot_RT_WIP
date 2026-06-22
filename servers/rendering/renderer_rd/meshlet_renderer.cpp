@@ -44,10 +44,12 @@ MeshletRenderer::MeshletRenderer() {
 	singleton = this;
 
 	Vector<String> versions;
-	versions.push_back("");
+	versions.push_back(""); // Version 0: normal (debug color + depth).
+	versions.push_back("\n#define MESHLET_DEPTH_ONLY\n"); // Version 1: no fragment color output.
 	render_shader.initialize(versions);
 	render_shader_version = render_shader.version_create();
 	render_shader_rid = render_shader.version_get_shader(render_shader_version, 0);
+	depth_only_shader_rid = render_shader.version_get_shader(render_shader_version, 1);
 
 	// Vertex-pulling: no per-surface vertex buffer at all, every attribute is fetched manually
 	// in the vertex shader body via gl_VertexIndex/gl_InstanceIndex.
@@ -68,6 +70,9 @@ MeshletRenderer::~MeshletRenderer() {
 	if (cached_pipeline.is_valid()) {
 		RD::get_singleton()->free_rid(cached_pipeline);
 	}
+	if (cached_depth_only_pipeline.is_valid()) {
+		RD::get_singleton()->free_rid(cached_depth_only_pipeline);
+	}
 	RD::get_singleton()->free_rid(synthetic_index_buffer);
 	RD::get_singleton()->free_rid(empty_vertex_array);
 	// vertex_format is a VertexFormatID (cached/interned by RD, not an owned RID) - no free needed.
@@ -75,12 +80,15 @@ MeshletRenderer::~MeshletRenderer() {
 	singleton = nullptr;
 }
 
-void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format) {
-	if (cached_pipeline.is_valid() && cached_framebuffer_format == p_framebuffer_format) {
+void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only) {
+	RID &cached = p_depth_only ? cached_depth_only_pipeline : cached_pipeline;
+	RD::FramebufferFormatID &cached_format = p_depth_only ? cached_depth_only_framebuffer_format : cached_framebuffer_format;
+
+	if (cached.is_valid() && cached_format == p_framebuffer_format) {
 		return;
 	}
-	if (cached_pipeline.is_valid()) {
-		RD::get_singleton()->free_rid(cached_pipeline);
+	if (cached.is_valid()) {
+		RD::get_singleton()->free_rid(cached);
 	}
 
 	RD::PipelineDepthStencilState ds;
@@ -107,7 +115,7 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	// Worth investigating directly - fixing it would roughly halve this pipeline's fill-rate cost,
 	// real performance work given Phase 6's whole point is hundreds-of-millions-of-polygon scenes.
 	RD::PipelineRasterizationState rs;
-	rs.cull_mode = RD::POLYGON_CULL_DISABLED;
+	rs.cull_mode = RD::POLYGON_CULL_FRONT;
 
 	// Depth bias is handled manually in the vertex shader (see meshlet_render.glsl), not via
 	// RD::PipelineRasterizationState's depth_bias_* fields - those scale by Vulkan's own per-
@@ -119,30 +127,40 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	// vertex-pulling vs. Forward+'s own real vertex shader, both targeting the same mesh). A
 	// direct, fixed-fraction nudge in the shader gives predictable, measured control instead.
 
-	cached_pipeline = RD::get_singleton()->render_pipeline_create(render_shader_rid, p_framebuffer_format, vertex_format, RD::RENDER_PRIMITIVE_TRIANGLES, rs, RD::PipelineMultisampleState(), ds, RD::PipelineColorBlendState::create_disabled());
-	cached_framebuffer_format = p_framebuffer_format;
+	RID shader_rid = p_depth_only ? depth_only_shader_rid : render_shader_rid;
+	// create_disabled(0): the depth-only variant targets a framebuffer with zero color
+	// attachments (e.g. Forward+'s real depth pre-pass framebuffer) - the color blend state's
+	// attachment count must match the framebuffer's actual color attachment count.
+	RD::PipelineColorBlendState blend_state = p_depth_only ? RD::PipelineColorBlendState::create_disabled(0) : RD::PipelineColorBlendState::create_disabled();
+
+	cached = RD::get_singleton()->render_pipeline_create(shader_rid, p_framebuffer_format, vertex_format, RD::RENDER_PRIMITIVE_TRIANGLES, rs, RD::PipelineMultisampleState(), ds, blend_state);
+	cached_format = p_framebuffer_format;
 }
 
-void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, bool p_clear) {
+void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, bool p_clear, bool p_depth_only) {
 	ERR_FAIL_NULL(MeshletStorage::get_singleton());
 
-	_ensure_pipeline(p_framebuffer_format);
+	_ensure_pipeline(p_framebuffer_format, p_depth_only);
 
 	RD::DrawListID draw_list;
 	if (p_clear) {
-		Vector<Color> clear_colors;
-		clear_colors.push_back(Color(0, 0, 0, 1));
 		// 0.0 = far under Godot RD's reversed-Z convention (near=1.0, far=0.0) - matches the
 		// pipeline's GREATER_OR_EQUAL depth compare op (see _ensure_pipeline()): clearing to 1.0
 		// (the old, non-reversed-style "far" value) would make every real fragment's device-Z
 		// (always < 1.0) fail the depth test against it, since nothing can be "more near" than
 		// the maximum possible value.
-		draw_list = RD::get_singleton()->draw_list_begin(p_framebuffer, RD::DRAW_CLEAR_ALL, clear_colors, 0.0f);
+		if (p_depth_only) {
+			draw_list = RD::get_singleton()->draw_list_begin(p_framebuffer, RD::DRAW_CLEAR_DEPTH, Vector<Color>(), 0.0f);
+		} else {
+			Vector<Color> clear_colors;
+			clear_colors.push_back(Color(0, 0, 0, 1));
+			draw_list = RD::get_singleton()->draw_list_begin(p_framebuffer, RD::DRAW_CLEAR_ALL, clear_colors, 0.0f);
+		}
 	} else {
 		draw_list = RD::get_singleton()->draw_list_begin(p_framebuffer, RD::DRAW_DEFAULT_ALL);
 	}
 
-	if (p_visible.is_valid() && p_draws.is_valid() && p_draws.draw_count > 0) {
+	if (p_visible.is_valid() && p_draws.is_valid() && p_draws.max_draw_count > 0) {
 		MeshletStorage *storage = MeshletStorage::get_singleton();
 
 		Vector<RD::Uniform> uniforms;
@@ -195,7 +213,27 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			u.append_id(storage->get_vertex_attribute_buffer_rid());
 			uniforms.push_back(u);
 		}
-		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, render_shader_rid, 0);
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 7;
+			u.append_id(p_material_ids_buffer);
+			uniforms.push_back(u);
+		}
+		if (!p_depth_only) {
+			// Binding 8 (MeshletMaterials) only exists in the normal shader version's descriptor
+			// set layout - the depth-only fragment variant has no material lookup at all (guarded
+			// out via #ifndef MESHLET_DEPTH_ONLY in meshlet_render.glsl), so its compiled shader
+			// doesn't declare this binding; including it here for that variant would mismatch the
+			// shader's actual layout.
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 8;
+			u.append_id(storage->get_meshlet_material_buffer_rid());
+			uniforms.push_back(u);
+		}
+		RID render_shader_rid_to_use = p_depth_only ? depth_only_shader_rid : render_shader_rid;
+		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, render_shader_rid_to_use, 0);
 
 		struct RenderPushConstant {
 			float view_projection[16];
@@ -215,13 +253,13 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		push_constant.light_direction[2] = light_dir.z;
 		push_constant.pad0 = 0;
 
-		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, cached_pipeline);
+		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : cached_pipeline);
 		RD::get_singleton()->draw_list_bind_vertex_array(draw_list, empty_vertex_array);
 		RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set, 0);
 		RD::get_singleton()->draw_list_bind_index_array(draw_list, synthetic_index_array);
 		RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, sizeof(push_constant));
 		RD::get_singleton()->draw_list_set_viewport(draw_list, Rect2(p_viewport));
-		RD::get_singleton()->draw_list_draw_indirect(draw_list, true, p_draws.command_buffer, 0, p_draws.draw_count, sizeof(MeshletCuller::IndirectCommand));
+		RD::get_singleton()->draw_list_draw_indirect_count(draw_list, true, p_draws.command_buffer, 0, p_draws.count_buffer, 0, p_draws.max_draw_count, sizeof(MeshletCuller::IndirectCommand));
 
 		RD::get_singleton()->free_rid(uniform_set);
 	}

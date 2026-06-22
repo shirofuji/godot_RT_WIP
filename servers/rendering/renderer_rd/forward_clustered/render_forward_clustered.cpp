@@ -1704,8 +1704,55 @@ static void _meshlet_debug_transform_to_mat4_columns(const Transform3D &p_transf
 	r_out[15] = 1.0f;
 }
 
+uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_material_rid) {
+	RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
+	if (!meshlet_storage) {
+		return 0;
+	}
+
+	RendererRD::MeshletStorage::MeshletMaterialGPU data; // Defaults: flat white, no textures, unlit-safe.
+	RID material_rid = p_material_rid;
+	if (material_rid.is_valid()) {
+		RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+
+		Variant albedo_v = material_storage->material_get_param(material_rid, "albedo");
+		if (albedo_v.get_type() != Variant::NIL) {
+			Color albedo = albedo_v.operator Color();
+			data.albedo[0] = albedo.r;
+			data.albedo[1] = albedo.g;
+			data.albedo[2] = albedo.b;
+			data.albedo[3] = albedo.a;
+		}
+		Variant metallic_v = material_storage->material_get_param(material_rid, "metallic");
+		if (metallic_v.get_type() != Variant::NIL) {
+			data.metallic = metallic_v;
+		}
+		Variant roughness_v = material_storage->material_get_param(material_rid, "roughness");
+		if (roughness_v.get_type() != Variant::NIL) {
+			data.roughness = roughness_v;
+		}
+		Variant specular_v = material_storage->material_get_param(material_rid, "specular");
+		if (specular_v.get_type() != Variant::NIL) {
+			data.specular = specular_v;
+		}
+		Variant emission_v = material_storage->material_get_param(material_rid, "emission");
+		if (emission_v.get_type() != Variant::NIL) {
+			Color emission = emission_v.operator Color();
+			Variant emission_energy_v = material_storage->material_get_param(material_rid, "emission_energy");
+			float energy = emission_energy_v.get_type() != Variant::NIL ? (float)emission_energy_v : 1.0f;
+			data.emission[0] = emission.r * energy;
+			data.emission[1] = emission.g * energy;
+			data.emission[2] = emission.b * energy;
+		}
+	}
+	// material_rid stays an invalid/default RID when p_material is null (no material assigned) -
+	// upload_material()'s RID-keyed dedup means every such instance shares one default slot.
+	return meshlet_storage->upload_material(material_rid, data);
+}
+
 void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_data) {
 	meshlet_scan_instance_transforms.clear();
+	meshlet_scan_material_ids.clear();
 	meshlet_scan_ranges.clear();
 	meshlet_replace_skip_set.clear();
 	meshlet_replace_default_active = false;
@@ -1739,6 +1786,10 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		}
 		uint32_t instance_index = (uint32_t)meshlet_scan_instance_transforms.size();
 		meshlet_scan_instance_transforms.push_back(inst->transform);
+		// material_override (if set) replaces every surface's material - same precedence Godot's
+		// own normal rendering gives it. Otherwise use this specific surface's own material.
+		RID surface_material_rid = inst->data->material_override.is_valid() ? inst->data->material_override : (sdcache->surface_index < inst->data->surface_materials.size() ? inst->data->surface_materials[sdcache->surface_index] : RID());
+		meshlet_scan_material_ids.push_back(_meshlet_resolve_material_id(surface_material_rid));
 		RendererRD::MeshletCuller::InstanceMeshletRange r;
 		r.instance_index = instance_index;
 		r.meshlet_offset = range.offset;
@@ -1751,24 +1802,22 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 	}
 }
 
-void RenderForwardClustered::_render_meshlet_debug_overlay(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer) {
-	if (p_render_buffers.is_null() || !p_color_only_framebuffer.is_valid()) {
-		return;
-	}
-	if (meshlet_scan_ranges.is_empty()) {
-		return;
-	}
+// Work-item/visible-meshlet/indirect-draw slot capacity shared by every meshlet cull/occlude/draw
+// call this frame (early and late pass alike). The default capacity (1<<16 = 65536) is sized for
+// self-tests and small scratch scenes, not real stress-test scale: a single 100k-triangle mesh
+// already has ~800 meshlets, so a few hundred simultaneously CPU-frustum-visible instances
+// sharing one such mesh (a real, confirmed scenario - many instances of one shared high-poly
+// SphereMesh) need *hundreds of thousands* of work items/visible-meshlet slots. Once Pass A's
+// atomic counter exceeds capacity, only an arbitrary ~capacity-sized subset (in GPU atomic-race
+// order, not spatially coherent) of the true count ever survives - manifesting as geometry
+// scattered randomly and sparsely across every visible instance, not a clean per-object falloff.
+// Confirmed via the user's real stress scene (3000 instances of a shared 100k-tri SphereMesh,
+// ~600-700 simultaneously visible): this capacity, not the occlusion-margin tuning, was the
+// dominant cause of "spheres rendering as scattered fragments."
+static const uint32_t MESHLET_LIVE_CAPACITY = 1 << 22; // ~4M.
 
-	RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
-	RendererRD::MeshletCuller *meshlet_culler = RendererRD::MeshletCuller::get_singleton();
-	RendererRD::HiZBuilder *hiz_builder = RendererRD::HiZBuilder::get_singleton();
-	RendererRD::MeshletRenderer *meshlet_renderer = RendererRD::MeshletRenderer::get_singleton();
-	if (!meshlet_storage || !meshlet_culler || !hiz_builder || !meshlet_renderer) {
-		return;
-	}
-
+RID RenderForwardClustered::meshlet_scan_transforms_buffer() {
 	const Vector<Transform3D> &instance_transforms = meshlet_scan_instance_transforms;
-	const Vector<RendererRD::MeshletCuller::InstanceMeshletRange> &ranges = meshlet_scan_ranges;
 
 	LocalVector<float> transforms_data;
 	transforms_data.resize(instance_transforms.size() * 16);
@@ -1777,7 +1826,9 @@ void RenderForwardClustered::_render_meshlet_debug_overlay(RenderDataRD *p_rende
 	}
 	// Reuse a persistent buffer across frames (grow-with-realloc, only when an actually larger
 	// capacity is needed) instead of creating and destroying a new storage buffer every frame -
-	// buffer creation/destruction has real CPU/driver overhead that adds up at 60+ fps.
+	// buffer creation/destruction has real CPU/driver overhead that adds up at 60+ fps. Shared by
+	// both the early and late pass within the same frame - they cull/draw from the exact same
+	// per-frame instance/range scan, so one upload per frame is enough.
 	uint32_t needed_capacity = (uint32_t)instance_transforms.size();
 	if (needed_capacity > meshlet_debug_overlay_transforms_capacity) {
 		if (meshlet_debug_overlay_transforms_buffer.is_valid()) {
@@ -1788,6 +1839,127 @@ void RenderForwardClustered::_render_meshlet_debug_overlay(RenderDataRD *p_rende
 	}
 	RID transforms_buffer = meshlet_debug_overlay_transforms_buffer;
 	RD::get_singleton()->buffer_update(transforms_buffer, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
+	return transforms_buffer;
+}
+
+RID RenderForwardClustered::meshlet_scan_material_ids_buffer() {
+	uint32_t needed_capacity = (uint32_t)meshlet_scan_material_ids.size();
+	if (needed_capacity > meshlet_material_ids_buffer_capacity) {
+		if (meshlet_material_ids_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(meshlet_material_ids_buffer);
+		}
+		meshlet_material_ids_buffer = RD::get_singleton()->storage_buffer_create(needed_capacity * sizeof(uint32_t));
+		meshlet_material_ids_buffer_capacity = needed_capacity;
+	}
+	if (!meshlet_scan_material_ids.is_empty()) {
+		RD::get_singleton()->buffer_update(meshlet_material_ids_buffer, 0, meshlet_scan_material_ids.size() * sizeof(uint32_t), meshlet_scan_material_ids.ptr());
+	}
+	return meshlet_material_ids_buffer;
+}
+
+bool RenderForwardClustered::_meshlet_early_pass_should_engage(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_is_reflection_probe, bool p_depth_pre_pass, PassMode p_depth_pass_mode) const {
+	// Reflection probes (and any other non-primary _render_scene call) never read or write the
+	// temporal Hi-Z state at all - meshlet_hiz_history_valid/meshlet_hiz_a_is_current are members
+	// on this shared renderer object, not scoped per-RenderSceneBuffersRD, so letting a
+	// reflection-probe pass touch them would corrupt the primary view's history with a different
+	// camera's data. Excluding them here means those calls always take the "early pass skipped"
+	// fallback path below, which is exactly today's existing single-pass behavior - safe by
+	// construction, not just by omission.
+	if (p_is_reflection_probe) {
+		return false;
+	}
+	if (!meshlet_replace_default_active || meshlet_scan_ranges.is_empty()) {
+		return false;
+	}
+	if (!meshlet_hiz_history_valid) {
+		// No valid Hi-Z from a previous frame yet (first frame, or history was just invalidated -
+		// see the taa_frame_count==0 check at the top of _render_scene). Falls back to today's
+		// existing behavior: full-detail depth pre-pass for meshlet instances too, late pass
+		// builds a fresh Hi-Z and draws everyone.
+		return false;
+	}
+	if (!p_depth_pre_pass) {
+		// Nothing to optimize - Forward+ isn't running a separate depth-writing phase at all this
+		// frame (depth gets written by the opaque color pass instead), so there's no pre-pass
+		// duplication to fix and no point engaging the early pass.
+		return false;
+	}
+	if (p_depth_pass_mode != PASS_MODE_DEPTH) {
+		// PASS_MODE_DEPTH_NORMAL_ROUGHNESS(_VOXEL_GI): the real depth pre-pass framebuffer also
+		// has normal_roughness (and voxelgi) color attachments this frame (SSAO/SSIL/SDFGI/VOXELGI
+		// or the normal-buffer debug view are active) that the depth-only meshlet pipeline doesn't
+		// populate at all - drawing into that framebuffer would leave those attachments
+		// unwritten/garbage wherever the early pass draws. Scoped out for this first cut; the
+		// common case (no SSAO/SSIL/SDFGI/VOXELGI active) hits PASS_MODE_DEPTH and is unaffected.
+		return false;
+	}
+	// Defensive: meshlet_hiz_history_valid is set true at the end of a frame that successfully
+	// rebuilt a Hi-Z, but RenderSceneBuffersRD::configure() wipes all named textures (including
+	// ours) on any resize/reconfigure between frames - meaning the flag could say "valid" for one
+	// frame immediately after a resize even though the actual texture was just discarded. Checking
+	// the texture's real existence here (cheap - just a HashMap lookup) avoids reading/occluding
+	// against a stale or invalid RID in that edge case; falls back to the always-safe path below.
+	if (p_render_buffers.is_null() || !p_render_buffers->has_texture(RB_SCOPE_MESHLET_HIZ, meshlet_hiz_a_is_current ? RB_MESHLET_HIZ_A : RB_MESHLET_HIZ_B)) {
+		return false;
+	}
+	return true;
+}
+
+void RenderForwardClustered::_render_meshlet_early_depth_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_depth_framebuffer) {
+	RendererRD::MeshletCuller *meshlet_culler = RendererRD::MeshletCuller::get_singleton();
+	RendererRD::MeshletRenderer *meshlet_renderer = RendererRD::MeshletRenderer::get_singleton();
+	if (!meshlet_culler || !meshlet_renderer) {
+		return;
+	}
+
+	RID transforms_buffer = meshlet_scan_transforms_buffer();
+
+	// Frustum cull against *this* frame's current camera (this is what's actually being
+	// displayed this frame, regardless of which Hi-Z history we test occlusion against below).
+	Transform3D camera_transform = p_render_data->scene_data->cam_transform;
+	Projection projection = p_render_data->scene_data->get_cam_projection();
+	Vector<Plane> planes = projection.get_projection_planes(camera_transform);
+	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY);
+
+	// Occlude against *last* frame's Hi-Z, using *last* frame's camera transform/projection - the
+	// Hi-Z's texels are addressed in that camera's clip/screen space, so the world->screen mapping
+	// used to sample it must match the camera it was built with, not this frame's current one.
+	const StringName &last_frame_hiz_name = meshlet_hiz_a_is_current ? RB_MESHLET_HIZ_A : RB_MESHLET_HIZ_B;
+	Size2i screen_size = p_render_buffers->get_internal_size();
+	RID last_frame_hiz_texture = p_render_buffers->get_texture(RB_SCOPE_MESHLET_HIZ, last_frame_hiz_name);
+	uint32_t last_frame_hiz_mip_count = p_render_buffers->get_texture_format(RB_SCOPE_MESHLET_HIZ, last_frame_hiz_name).mipmaps;
+	Transform3D prev_camera_transform = p_render_data->scene_data->prev_cam_transform;
+	Projection prev_projection = p_render_data->scene_data->prev_cam_projection;
+	RendererRD::MeshletCuller::CullResult occlusion_result = meshlet_culler->occlude(transforms_buffer, frustum_result, last_frame_hiz_texture, last_frame_hiz_mip_count, prev_camera_transform, prev_projection, screen_size, MESHLET_LIVE_CAPACITY);
+
+	RendererRD::MeshletCuller::IndirectDrawResult draws = meshlet_culler->emit_indirect_draws(occlusion_result, MESHLET_LIVE_CAPACITY);
+
+	// Rasterize into *this* frame's current camera, depth-only, full clear (this pass runs first,
+	// before Forward+'s own real depth pre-pass).
+	RID material_ids_buffer = meshlet_scan_material_ids_buffer();
+	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_depth_framebuffer);
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_depth_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, Vector3(), true, true);
+}
+
+void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer) {
+	if (p_render_buffers.is_null() || !p_color_only_framebuffer.is_valid()) {
+		return;
+	}
+	if (meshlet_scan_ranges.is_empty()) {
+		meshlet_hiz_history_valid = false;
+		return;
+	}
+
+	RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
+	RendererRD::MeshletCuller *meshlet_culler = RendererRD::MeshletCuller::get_singleton();
+	RendererRD::HiZBuilder *hiz_builder = RendererRD::HiZBuilder::get_singleton();
+	RendererRD::MeshletRenderer *meshlet_renderer = RendererRD::MeshletRenderer::get_singleton();
+	if (!meshlet_storage || !meshlet_culler || !hiz_builder || !meshlet_renderer) {
+		meshlet_hiz_history_valid = false;
+		return;
+	}
+
+	RID transforms_buffer = meshlet_scan_transforms_buffer();
 
 	Transform3D camera_transform = p_render_data->scene_data->cam_transform;
 	// get_cam_projection() (not the raw cam_projection field) applies the same depth-correction
@@ -1802,30 +1974,41 @@ void RenderForwardClustered::_render_meshlet_debug_overlay(RenderDataRD *p_rende
 	Projection projection = p_render_data->scene_data->get_cam_projection();
 	Vector<Plane> planes = projection.get_projection_planes(camera_transform);
 
-	// The default capacity (1<<16 = 65536) is sized for self-tests and small scratch scenes, not
-	// real stress-test scale: a single 100k-triangle mesh already has ~800 meshlets, so a few
-	// hundred simultaneously CPU-frustum-visible instances sharing one such mesh (a real,
-	// confirmed scenario - many instances of one shared high-poly SphereMesh) need *hundreds of
-	// thousands* of work items/visible-meshlet slots. Once Pass A's atomic counter exceeds
-	// capacity, only an arbitrary ~capacity-sized subset (in GPU atomic-race order, not spatially
-	// coherent) of the true count ever survives - manifesting as geometry scattered randomly and
-	// sparsely across every visible instance, not a clean per-object falloff. Confirmed via the
-	// user's real stress scene (3000 instances of a shared 100k-tri SphereMesh, ~600-700
-	// simultaneously visible): this capacity, not the occlusion-margin tuning above, was the
-	// dominant cause of "spheres rendering as scattered fragments."
-	const uint32_t MESHLET_LIVE_CAPACITY = 1 << 20; // ~1M - work items/visible meshlets/indirect draws.
-	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY);
+	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY);
 
+	// Occlude against a Hi-Z rebuilt from *this* frame's current real depth (whatever's in the
+	// depth buffer right now: real depth pre-pass output for non-meshlet instances, plus the early
+	// pass's partial coverage for meshlet instances if it ran this frame, or full real detail for
+	// everyone if it didn't) - re-testing the *full* meshlet_scan_ranges set against this fresh
+	// data (not just whatever the early pass culled) is what catches this-frame disocclusion:
+	// objects the early pass wrongly culled against stale history get drawn here instead.
+	// Redundant re-draws of what the early pass already correctly drew are harmless (depth-test-
+	// discarded as ties, not wrong) - not worth an early-pass-diff skip-list unless profiling shows
+	// the redundant draws cost more than that bookkeeping would save.
 	Size2i screen_size = p_render_buffers->get_internal_size();
 	RID depth_tex = p_render_buffers->get_depth_texture(0);
-	RendererRD::HiZBuilder::HiZResult hiz = hiz_builder->build(depth_tex, screen_size);
+	const StringName &write_hiz_name = meshlet_hiz_a_is_current ? RB_MESHLET_HIZ_B : RB_MESHLET_HIZ_A;
+	RendererRD::HiZBuilder::HiZResult mid_hiz = hiz_builder->build_into(p_render_buffers, write_hiz_name, depth_tex, screen_size);
 
-	RendererRD::MeshletCuller::CullResult occlusion_result = meshlet_culler->occlude(transforms_buffer, frustum_result, hiz.texture, hiz.mip_count, camera_transform, projection, screen_size, MESHLET_LIVE_CAPACITY);
+	RendererRD::MeshletCuller::CullResult occlusion_result = meshlet_culler->occlude(transforms_buffer, frustum_result, mid_hiz.texture, mid_hiz.mip_count, camera_transform, projection, screen_size, MESHLET_LIVE_CAPACITY);
 
 	RendererRD::MeshletCuller::IndirectDrawResult draws = meshlet_culler->emit_indirect_draws(occlusion_result, MESHLET_LIVE_CAPACITY);
 
+	RID material_ids_buffer = meshlet_scan_material_ids_buffer();
 	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_color_only_framebuffer);
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, Vector3(-0.5f, -1.0f, -0.5f), false);
+	// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
+	// color (and, if the early pass ran, its partial depth contribution too) - never true here,
+	// matching this pass's existing pre-restructuring behavior.
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, Vector3(-0.5f, -1.0f, -0.5f), false);
+
+	// Rebuild Hi-Z once more, now from the fully-resolved depth (everything drawn this frame,
+	// including what this late pass itself just drew) - this becomes *next* frame's "last frame's
+	// Hi-Z" for its early pass. Writing into the same role-flipped texture as the mid-build above
+	// (overwriting it) since nothing else reads the mid version after this point in the frame.
+	RID final_depth_tex = p_render_buffers->get_depth_texture(0);
+	hiz_builder->build_into(p_render_buffers, write_hiz_name, final_depth_tex, screen_size);
+	meshlet_hiz_a_is_current = !meshlet_hiz_a_is_current;
+	meshlet_hiz_history_valid = true;
 }
 
 void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera) {
@@ -2265,6 +2448,25 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	bool using_ssao = depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment);
 
+	// Temporal two-pass Hi-Z occlusion (see project plan/memory): no explicit "camera teleported"
+	// detection here - taa_frame_count (TAA's own history-invalidation signal) was considered and
+	// rejected: it only increments when TAA's jitter is actually active (renderer_scene_cull.cpp's
+	// render_camera(), p_jitter_phase_count > 0), staying 0 forever - and therefore looking
+	// permanently "invalid" - in any project without TAA enabled, which would silently disable this
+	// entire optimization for the common case. Not needed for correctness anyway: a stale Hi-Z
+	// (first frame, or a same-session camera teleport/scene change) can only cause one frame of
+	// over- or under-culling in the early pass - the early pass's frustum cull already uses *this*
+	// frame's real camera, so a wrong occlusion decision against stale data either skips drawing
+	// something the late pass's full re-test will catch this same frame (safe), or draws something
+	// extra at the correct on-screen position anyway (harmless). meshlet_hiz_history_valid's
+	// default-false-then-true-after-first-rebuild lifecycle, plus the texture-existence check in
+	// _meshlet_early_pass_should_engage() (handles resize wiping the buffer), are sufficient.
+	bool meshlet_early_pass_engaged = _meshlet_early_pass_should_engage(rb, is_reflection_probe, depth_pre_pass, depth_pass_mode);
+	if (meshlet_early_pass_engaged) {
+		RENDER_TIMESTAMP("Render Meshlet Early Depth Pass (Temporal Hi-Z)");
+		_render_meshlet_early_depth_pass(p_render_data, rb, depth_framebuffer);
+	}
+
 	if (depth_pre_pass) { //depth pre pass
 		bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
 		if (needs_pre_resolve) {
@@ -2273,9 +2475,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RENDER_TIMESTAMP("Render Depth Pre-Pass");
 		}
 		if (needs_pre_resolve) {
-			//pre clear the depth framebuffer, as AMD (and maybe others?) use compute for it, and barrier other compute shaders.
-			RD::get_singleton()->draw_list_begin(depth_framebuffer, RD::DRAW_CLEAR_ALL, depth_pass_clear, 0.0f);
-			RD::get_singleton()->draw_list_end();
+			if (!meshlet_early_pass_engaged) {
+				//pre clear the depth framebuffer, as AMD (and maybe others?) use compute for it, and barrier other compute shaders.
+				RD::get_singleton()->draw_list_begin(depth_framebuffer, RD::DRAW_CLEAR_ALL, depth_pass_clear, 0.0f);
+				RD::get_singleton()->draw_list_end();
+			} // else: the early pass already cleared+wrote depth_framebuffer this frame - clearing again here would discard its output.
 			//start compute processes here, so they run at the same time as depth pre-pass
 			_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
 		}
@@ -2285,8 +2489,31 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, nullptr, RID(), samplers, depth_prepass_uniform_buffer_index);
 
 		bool finish_depth = using_ssao || using_ssil || using_sdfgi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
-		RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-		_render_list_with_draw_list(&render_list_params, depth_framebuffer, RD::DrawFlags(needs_pre_resolve ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL), depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
+
+		// When the early meshlet pass engaged this frame, it already cleared+wrote depth_framebuffer
+		// for meshlet-replaceable instances - skip them here (same meshlet_replace_skip_set filtering
+		// the opaque color pass already applies below) and don't clear what it just wrote.
+		GeometryInstanceSurfaceDataCache **depth_elements_ptr = render_list[RENDER_LIST_OPAQUE].elements.ptr();
+		RenderElementInfo *depth_element_info_ptr = render_list[RENDER_LIST_OPAQUE].element_info.ptr();
+		int depth_elements_count = render_list[RENDER_LIST_OPAQUE].elements.size();
+		LocalVector<GeometryInstanceSurfaceDataCache *> meshlet_depth_filtered_elements;
+		LocalVector<RenderElementInfo> meshlet_depth_filtered_element_info;
+		if (meshlet_early_pass_engaged && !meshlet_replace_skip_set.is_empty()) {
+			for (uint32_t i = 0; i < render_list[RENDER_LIST_OPAQUE].elements.size(); i++) {
+				if (meshlet_replace_skip_set.has(render_list[RENDER_LIST_OPAQUE].elements[i])) {
+					continue;
+				}
+				meshlet_depth_filtered_elements.push_back(render_list[RENDER_LIST_OPAQUE].elements[i]);
+				meshlet_depth_filtered_element_info.push_back(render_list[RENDER_LIST_OPAQUE].element_info[i]);
+			}
+			depth_elements_ptr = meshlet_depth_filtered_elements.ptr();
+			depth_element_info_ptr = meshlet_depth_filtered_element_info.ptr();
+			depth_elements_count = meshlet_depth_filtered_elements.size();
+		}
+
+		RenderListParameters render_list_params(depth_elements_ptr, depth_element_info_ptr, depth_elements_count, reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+		RD::DrawFlags depth_pre_pass_draw_flags = (needs_pre_resolve || meshlet_early_pass_engaged) ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL;
+		_render_list_with_draw_list(&render_list_params, depth_framebuffer, depth_pre_pass_draw_flags, depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
 
 		RD::get_singleton()->draw_command_end_label();
 
@@ -2440,7 +2667,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE, p_render_data);
 	}
 
-	_render_meshlet_debug_overlay(p_render_data, rb, color_only_framebuffer);
+	_render_meshlet_late_pass(p_render_data, rb, color_only_framebuffer);
 
 	if (debug_voxelgis) {
 		Projection dc;

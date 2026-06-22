@@ -795,13 +795,56 @@ private:
 	// Both flags can be active independently; _meshlet_scan_render_list() does the one shared
 	// per-frame scan of the real opaque render list that both need.
 	void _meshlet_scan_render_list(RenderDataRD *p_render_data);
-	void _render_meshlet_debug_overlay(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer);
+	// Resolves one surface's material into a meshlet_material_buffer slot (see
+	// MeshletStorage::MeshletMaterialGPU/upload_material()) - extracts the BaseMaterial3D/
+	// ORMMaterial3D shader-parameter convention's flattened albedo/metallic/roughness/emission via
+	// MaterialStorage::material_get_param() directly off the material RID. p_material_rid may be
+	// invalid (no material assigned) - resolves to one shared default slot. Re-resolves and
+	// re-uploads every call (no per-frame change-detection yet) - acceptable for now since this
+	// mirrors the existing per-frame transform re-upload's level of (lack of) optimization.
+	uint32_t _meshlet_resolve_material_id(const RID &p_material_rid);
+	Vector<uint32_t> meshlet_scan_material_ids; // Parallel to meshlet_scan_instance_transforms.
+	RID meshlet_scan_material_ids_buffer(); // Builds/reuses a per-instance material-id SSBO from
+			// meshlet_scan_material_ids, the same way meshlet_scan_transforms_buffer() does for
+			// transforms.
+	RID meshlet_material_ids_buffer;
+	uint32_t meshlet_material_ids_buffer_capacity = 0;
+	// Temporal two-pass occlusion (see project plan): _render_meshlet_early_depth_pass() (depth
+	// only, runs before the real depth pre-pass, culls against *last* frame's Hi-Z) lets the real
+	// depth pre-pass skip meshlet-replaceable instances; _render_meshlet_late_pass() (depth+color,
+	// runs where the single-pass overlay used to) re-tests everything against a freshly-rebuilt
+	// Hi-Z to catch this-frame disocclusion, then rebuilds Hi-Z once more for next frame's early
+	// pass. Returns the RenderSceneBuffersRD-scoped Hi-Z StringName that was just written into
+	// (the role-flipped one), so the caller can pass it to the next rebuild/early pass.
+	RID meshlet_scan_transforms_buffer(); // Builds/reuses meshlet_debug_overlay_transforms_buffer
+			// from meshlet_scan_instance_transforms - shared by both passes since they cull/draw
+			// from the exact same per-frame instance/range scan.
+	bool _meshlet_early_pass_should_engage(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_is_reflection_probe, bool p_depth_pre_pass, PassMode p_depth_pass_mode) const;
+	void _render_meshlet_early_depth_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_depth_framebuffer);
+	void _render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer);
 	RID meshlet_debug_overlay_transforms_buffer;
 	uint32_t meshlet_debug_overlay_transforms_capacity = 0;
 	bool meshlet_replace_default_active = false;
 	HashSet<GeometryInstanceSurfaceDataCache *> meshlet_replace_skip_set;
 	Vector<Transform3D> meshlet_scan_instance_transforms;
 	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> meshlet_scan_ranges;
+
+	// Temporal two-pass Hi-Z occlusion state (see project plan/memory for the full design): an
+	// early pass culls against *last* frame's Hi-Z (so the real depth pre-pass can skip
+	// meshlet-replaceable instances entirely), a late pass re-tests everything against a
+	// freshly-rebuilt Hi-Z to catch this-frame disocclusion. RB_MESHLET_HIZ_A/RB_MESHLET_HIZ_B
+	// (hiz_builder.h) alternate roles every frame rather than using fixed "curr"/"prev" names,
+	// since which one is "last frame's read source" vs "this frame's write target" flips each
+	// frame - no mip-chain copying needed, just swap which name is read vs written.
+	bool meshlet_hiz_history_valid = false; // True once a late pass has actually rebuilt a Hi-Z
+			// this frame; checked next frame before attempting an early pass. No explicit
+			// "camera teleported" reset - a stale Hi-Z self-corrects within one frame via the
+			// late pass's full re-test (see _meshlet_early_pass_should_engage's comment in the
+			// .cpp for why taa_frame_count specifically isn't used as a reset signal here).
+	bool meshlet_hiz_a_is_current = false; // Which of RB_MESHLET_HIZ_A/_B holds the most
+			// recently fully-rebuilt ("current") Hi-Z - the OTHER one is what the early pass
+			// reads as "last frame's Hi-Z". Flipped at the end of every frame that completes a
+			// late-pass rebuild.
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);

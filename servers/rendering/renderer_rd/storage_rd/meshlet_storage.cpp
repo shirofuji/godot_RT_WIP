@@ -148,11 +148,14 @@ MeshletStorage::MeshletStorage() {
 	const uint32_t initial_meshlet_triangle_bytes = 4096; // Must stay a multiple of 4.
 	const uint32_t initial_meshlets = 256;
 
+	const uint32_t initial_materials = 16;
+
 	vertex_position_buffer.init(sizeof(float) * 4, initial_vertices);
 	vertex_attribute_buffer.init(sizeof(float) * 4, initial_vertices);
 	meshlet_vertex_buffer.init(sizeof(uint32_t), initial_meshlet_vertices);
 	meshlet_triangle_buffer.init(sizeof(uint8_t), initial_meshlet_triangle_bytes);
 	meshlet_descriptor_buffer.init(sizeof(MeshletDescriptorGPU), initial_meshlets);
+	meshlet_material_buffer.init(sizeof(MeshletMaterialGPU), initial_materials);
 
 	vertex_allocator.grow(initial_vertices);
 	meshlet_vertex_allocator.grow(initial_meshlet_vertices);
@@ -166,7 +169,23 @@ MeshletStorage::~MeshletStorage() {
 	meshlet_vertex_buffer.free();
 	meshlet_triangle_buffer.free();
 	meshlet_descriptor_buffer.free();
+	meshlet_material_buffer.free();
 	singleton = nullptr;
+}
+
+uint32_t MeshletStorage::upload_material(const RID &p_material_rid, const MeshletMaterialGPU &p_material_data) {
+	HashMap<RID, uint32_t>::Iterator it = material_rid_to_slot.find(p_material_rid);
+	uint32_t slot;
+	if (it != material_rid_to_slot.end()) {
+		slot = it->value;
+	} else {
+		slot = meshlet_material_count;
+		meshlet_material_count++;
+		meshlet_material_buffer.ensure_capacity(meshlet_material_count);
+		material_rid_to_slot[p_material_rid] = slot;
+	}
+	meshlet_material_buffer.upload(slot, &p_material_data, 1);
+	return slot;
 }
 
 Vector2 MeshletStorage::_oct_encode_normal(const Vector3 &p_normal) {

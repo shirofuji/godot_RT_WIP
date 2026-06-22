@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -60,6 +61,30 @@ public:
 		uint32_t triangle_offset = 0; // Byte offset into the global meshlet-triangle buffer.
 		uint32_t vertex_count = 0;
 		uint32_t triangle_count = 0;
+	};
+
+	// std430 layout, matches the GLSL-side MeshletMaterial struct (see meshlet_render.glsl) - a
+	// flattened snapshot of the subset of StandardMaterial3D/ORMMaterial3D parameters Forward+'s
+	// own fragment shader reads into local variables, not a generic shader-graph evaluator. Custom
+	// ShaderMaterial/visual-shader materials can't be represented here and fall back to normal
+	// Forward+ rendering (see _meshlet_scan_render_list's qualifying-mesh filtering).
+	struct MeshletMaterialGPU {
+		float albedo[4] = { 1, 1, 1, 1 }; // rgb + alpha.
+		float emission[3] = { 0, 0, 0 };
+		float metallic = 0.0f;
+		float roughness = 1.0f;
+		float specular = 0.5f;
+		uint32_t albedo_texture_index = 0xFFFFFFFF; // Index into the bindless texture array
+				// (meshlet_render.glsl's material_textures[]); 0xFFFFFFFF = none, use the flat
+				// albedo color above instead.
+		uint32_t normal_texture_index = 0xFFFFFFFF;
+		uint32_t orm_texture_index = 0xFFFFFFFF; // Packed occlusion/roughness/metallic (Godot's
+				// existing ORM convention).
+		uint32_t emission_texture_index = 0xFFFFFFFF;
+		uint32_t flags = 0; // Bit 0: alpha_scissor. Bit 1: unlit. Bit 2: backface_enabled.
+		float alpha_scissor_threshold = 0.5f;
+		float uv1_scale[2] = { 1, 1 };
+		float uv1_offset[2] = { 0, 0 };
 	};
 
 	struct UploadResult {
@@ -119,6 +144,14 @@ private:
 	GrowableBuffer meshlet_triangle_buffer; // packed uint8 local triangle indices.
 	GrowableBuffer meshlet_descriptor_buffer; // MeshletDescriptorGPU per meshlet.
 
+	GrowableBuffer meshlet_material_buffer; // MeshletMaterialGPU per uploaded material.
+	uint32_t meshlet_material_count = 0; // Simple append-only counter, not a RangeAllocator - one
+			// entry per distinct material RID; materials accumulate but aren't freed for now
+			// (this renderer's per-scene material count is expected to be small and bounded,
+			// unlike vertices/meshlets which scale with geometry - revisit if that assumption
+			// breaks in practice).
+	HashMap<RID, uint32_t> material_rid_to_slot; // Dedup - many surfaces share one material RID.
+
 	static Vector2 _oct_encode_normal(const Vector3 &p_normal);
 
 public:
@@ -142,6 +175,15 @@ public:
 	// Frees only the meshlet-side ranges of p_result (vertex_range is owned by upload_vertices()'s
 	// caller and must be freed separately via free_vertices(), once all of its LODs are gone).
 	void free_meshlets(const UploadResult &p_result);
+
+	// Uploads (or returns the existing slot for, if p_material_rid was already uploaded) one
+	// material's flattened GPU snapshot. Returns the slot index into meshlet_material_buffer.
+	// p_material_rid is purely a dedup key (RID equality, no lifetime/ownership implications for
+	// MeshletStorage) - callers are expected to re-call this whenever a material's parameters may
+	// have changed (e.g. a ShaderMaterial uniform was edited) with the updated p_material_data;
+	// the existing slot's contents get overwritten in place rather than allocating a new one.
+	uint32_t upload_material(const RID &p_material_rid, const MeshletMaterialGPU &p_material_data);
+	RID get_meshlet_material_buffer_rid() const { return meshlet_material_buffer.rid; }
 
 	RID get_vertex_position_buffer_rid() const { return vertex_position_buffer.rid; }
 	RID get_vertex_attribute_buffer_rid() const { return vertex_attribute_buffer.rid; }

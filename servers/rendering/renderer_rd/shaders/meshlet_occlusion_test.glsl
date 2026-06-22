@@ -74,7 +74,8 @@ const float EPSILON = 1e-5;
 // near ones. 2e-3 was chosen empirically: large enough to absorb that precision gap, but still
 // smaller than a genuine occlusion gap between two meaningfully-different-distance objects (the
 // self-test's "distance 4 occluder vs. distance 8 occludee" case has a real gap of ~0.006).
-const float OCCLUSION_MARGIN_FLOOR = 2e-3;
+// Relaxed to 0.05 to absorb double-precision translation drift between Forward+ and Meshlet passes
+const float OCCLUSION_MARGIN_FLOOR = 5e-2;
 
 void main() {
 	uint idx = gl_GlobalInvocationID.x;

@@ -96,6 +96,9 @@ MeshletCuller::~MeshletCuller() {
 	if (command_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(command_buffer);
 	}
+	if (draw_count_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(draw_count_buffer);
+	}
 	RD::get_singleton()->free_rid(hiz_sampler);
 	expand_shader.version_free(expand_shader_version);
 	cull_shader.version_free(cull_shader_version);
@@ -417,13 +420,15 @@ MeshletCuller::IndirectDrawResult MeshletCuller::emit_indirect_draws(const CullR
 
 	_ensure_command_capacity(p_max_draws);
 	result.command_buffer = command_buffer;
-	// No CPU readback of the real visible count: the dispatch below always covers the full fixed
-	// p_max_draws capacity, with the shader writing an explicit degenerate (instance_count=0)
-	// command for any slot beyond the real count (read GPU-side from visible_meshlets.count) -
-	// so draw_count is always p_max_draws too, known without ever touching the GPU's actual
-	// result. draw_list_draw_indirect then issues p_max_draws commands every frame, the vast
-	// majority of which are free no-ops on any reasonable GPU.
-	result.draw_count = p_max_draws;
+	result.max_draw_count = p_max_draws;
+
+	// Lazily create a persistent 4-byte SSBO for the draw count. The emit-draws compute shader
+	// writes the actual visible count here; vkCmdDrawIndexedIndirectCount reads it at draw time
+	// so the GPU only processes the real number of draws, not the full p_max_draws capacity.
+	if (!draw_count_buffer.is_valid()) {
+		draw_count_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t), Span<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+	}
+	result.count_buffer = draw_count_buffer;
 
 	Vector<RD::Uniform> uniforms;
 	{
@@ -445,6 +450,13 @@ MeshletCuller::IndirectDrawResult MeshletCuller::emit_indirect_draws(const CullR
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		u.binding = 2;
 		u.append_id(command_buffer);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = 3;
+		u.append_id(draw_count_buffer);
 		uniforms.push_back(u);
 	}
 	RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, emit_draws_shader_rid, 0);
@@ -475,13 +487,13 @@ MeshletCuller::IndirectDrawResult MeshletCuller::emit_indirect_draws(const CullR
 
 Vector<MeshletCuller::IndirectCommand> MeshletCuller::debug_read_commands(const IndirectDrawResult &p_result) {
 	Vector<IndirectCommand> out;
-	if (!p_result.is_valid() || p_result.draw_count == 0) {
+	if (!p_result.is_valid() || p_result.max_draw_count == 0) {
 		return out;
 	}
-	Vector<uint8_t> data = RD::get_singleton()->buffer_get_data(p_result.command_buffer, 0, p_result.draw_count * sizeof(IndirectCommand));
-	out.resize(p_result.draw_count);
-	if ((uint32_t)data.size() >= p_result.draw_count * sizeof(IndirectCommand)) {
-		memcpy(out.ptrw(), data.ptr(), p_result.draw_count * sizeof(IndirectCommand));
+	Vector<uint8_t> data = RD::get_singleton()->buffer_get_data(p_result.command_buffer, 0, p_result.max_draw_count * sizeof(IndirectCommand));
+	out.resize(p_result.max_draw_count);
+	if ((uint32_t)data.size() >= p_result.max_draw_count * sizeof(IndirectCommand)) {
+		memcpy(out.ptrw(), data.ptr(), p_result.max_draw_count * sizeof(IndirectCommand));
 	}
 	return out;
 }

@@ -54,7 +54,10 @@ private:
 
 	MeshletRenderShaderRD render_shader;
 	RID render_shader_version;
-	RID render_shader_rid;
+	RID render_shader_rid; // Version 0: normal (debug color + depth).
+	RID depth_only_shader_rid; // Version 1 (MESHLET_DEPTH_ONLY): no fragment color output at
+			// all - for the temporal early pass, which targets Forward+'s real depth pre-pass
+			// framebuffer (zero color attachments).
 
 	RD::VertexFormatID vertex_format = 0; // Empty - all attribute fetch is manual (vertex-pulling).
 	RID empty_vertex_array; // Zero attributes/buffers, but RD still requires *some* vertex array
@@ -65,8 +68,10 @@ private:
 
 	RD::FramebufferFormatID cached_framebuffer_format = RD::INVALID_FORMAT_ID;
 	RID cached_pipeline;
+	RD::FramebufferFormatID cached_depth_only_framebuffer_format = RD::INVALID_FORMAT_ID;
+	RID cached_depth_only_pipeline;
 
-	void _ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format);
+	void _ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only);
 
 public:
 	static MeshletRenderer *get_singleton();
@@ -74,14 +79,21 @@ public:
 	// p_visible must be the exact CullResult that p_draws was generated from
 	// (MeshletCuller::emit_indirect_draws(p_visible)) - the vertex shader looks up
 	// (instance_index, meshlet_index) from p_visible's buffer via gl_InstanceIndex, while
-	// p_draws.command_buffer only supplies the draw parameters themselves. p_framebuffer must
-	// have been created with a depth attachment (depth test/write is always enabled) plus one
-	// color attachment. p_transforms_buffer: SSBO of mat4, one per instance, indexed the same way
-	// as p_visible. p_clear: true clears color+depth first (standalone/offscreen use, e.g. tests);
-	// false draws additively on top of whatever's already in p_framebuffer, depth-testing against
-	// its existing depth contents - required when compositing into a framebuffer another pass
-	// (e.g. Forward+'s real opaque pass) already rendered into this frame.
-	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, bool p_clear = true);
+	// p_draws.command_buffer only supplies the draw parameters themselves. p_transforms_buffer:
+	// SSBO of mat4, one per instance, indexed the same way as p_visible. p_material_ids_buffer:
+	// SSBO of uint32 (slot into MeshletStorage's meshlet_material_buffer), one per instance,
+	// indexed the same way - must be valid even when p_depth_only is true (the vertex shader reads
+	// it unconditionally; only the fragment-side material lookup is skipped in that variant).
+	// p_clear: true clears depth (and color, if p_depth_only is false) first (standalone/offscreen
+	// use, e.g. tests); false draws additively on top of whatever's already in p_framebuffer,
+	// depth-testing against its existing depth contents - required when compositing into a
+	// framebuffer another pass (e.g. Forward+'s real opaque pass) already rendered into this frame.
+	// p_depth_only: targets a framebuffer with zero color attachments (e.g. Forward+'s real depth
+	// pre-pass framebuffer) using a fragment shader variant that writes no color at all - used by
+	// the temporal early pass (see project plan); when false, p_framebuffer must have a depth
+	// attachment plus exactly one color attachment, and p_light_direction is used for the
+	// debug N.L shading.
+	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, bool p_clear = true, bool p_depth_only = false);
 
 	MeshletRenderer();
 	~MeshletRenderer();

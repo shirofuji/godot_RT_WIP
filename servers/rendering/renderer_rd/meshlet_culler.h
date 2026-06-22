@@ -83,9 +83,10 @@ public:
 
 	struct IndirectDrawResult {
 		RID command_buffer; // SSBO of IndirectCommand, sized max_draws.
-		uint32_t draw_count = 0; // CPU-known actual count - pass directly as draw_list_draw_indirect's p_draw_count.
+		RID count_buffer; // SSBO containing actual draw count (uint32_t), for vkCmdDrawIndexedIndirectCount.
+		uint32_t max_draw_count = 0; // Maximum capacity - the GPU count buffer contains the real count.
 
-		bool is_valid() const { return command_buffer.is_valid(); }
+		bool is_valid() const { return command_buffer.is_valid() && count_buffer.is_valid(); }
 	};
 
 private:
@@ -125,6 +126,7 @@ private:
 	uint32_t occluded_capacity = 0;
 	RID command_buffer;
 	uint32_t command_capacity = 0;
+	RID draw_count_buffer; // 4-byte SSBO for vkCmdDrawIndexedIndirectCount.
 
 	void _ensure_work_items_capacity(uint32_t p_capacity);
 	void _ensure_visible_capacity(uint32_t p_capacity);
