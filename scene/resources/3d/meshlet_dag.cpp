@@ -335,3 +335,87 @@ bool MeshletDAG::build(const PackedVector3Array &p_positions, const PackedInt32A
 
 	return true;
 }
+
+void MeshletDAG::flatten_to_arrays(const LocalVector<Cluster> &p_clusters, const PackedVector3Array &p_positions, Vector<SurfaceTool::Meshlet> &r_meshlets, PackedInt32Array &r_meshlet_vertices, PackedByteArray &r_meshlet_triangles, Vector<SurfaceTool::MeshletBounds> &r_bounds, LocalVector<ClusterLOD> &r_lods) {
+	r_meshlets.clear();
+	r_meshlet_vertices.clear();
+	r_meshlet_triangles.clear();
+	r_bounds.clear();
+	r_lods.clear();
+
+	const uint32_t vertex_count = (uint32_t)p_positions.size();
+	const Vector3 *positions = p_positions.ptr();
+
+	// Float copy of positions for meshoptimizer's bounds computation (real_t may be double).
+	LocalVector<float> positions_f;
+	positions_f.resize(vertex_count * 3);
+	for (uint32_t i = 0; i < vertex_count; i++) {
+		positions_f[i * 3 + 0] = (float)positions[i].x;
+		positions_f[i * 3 + 1] = (float)positions[i].y;
+		positions_f[i * 3 + 2] = (float)positions[i].z;
+	}
+
+	r_meshlets.resize(p_clusters.size());
+	r_bounds.resize(p_clusters.size());
+	r_lods.resize(p_clusters.size());
+
+	for (uint32_t c = 0; c < p_clusters.size(); c++) {
+		const Cluster &cluster = p_clusters[c];
+		uint32_t tri_count = cluster.indices.size() / 3;
+
+		// Local vertex remap: assign each distinct global vertex used by this cluster a small local
+		// index (the meshlet form), in first-seen order.
+		HashMap<uint32_t, uint8_t> remap;
+		LocalVector<uint32_t> local_to_global;
+		uint32_t vertex_offset = (uint32_t)r_meshlet_vertices.size();
+		uint32_t triangle_offset = (uint32_t)r_meshlet_triangles.size();
+
+		for (uint32_t idx : cluster.indices) {
+			if (!remap.has(idx)) {
+				uint8_t local = (uint8_t)local_to_global.size();
+				remap[idx] = local;
+				local_to_global.push_back(idx);
+				r_meshlet_vertices.push_back((int)idx);
+			}
+		}
+		for (uint32_t idx : cluster.indices) {
+			r_meshlet_triangles.push_back(remap[idx]);
+		}
+
+		SurfaceTool::Meshlet ml;
+		ml.vertex_offset = vertex_offset;
+		ml.triangle_offset = triangle_offset;
+		ml.vertex_count = (uint32_t)local_to_global.size();
+		ml.triangle_count = tri_count;
+		r_meshlets.write[c] = ml;
+
+		// Cull bounds (center/radius + backface cone) via meshoptimizer over this cluster's meshlet
+		// slice. Falls back to the cluster's own centroid sphere (no cone) if the hook is missing.
+		SurfaceTool::MeshletBounds b;
+		if (SurfaceTool::compute_meshlet_bounds_func != nullptr && tri_count > 0) {
+			b = SurfaceTool::compute_meshlet_bounds_func(
+					(const unsigned int *)r_meshlet_vertices.ptr() + vertex_offset,
+					(const unsigned char *)r_meshlet_triangles.ptr() + triangle_offset,
+					tri_count, positions_f.ptr(), vertex_count, sizeof(float) * 3);
+		} else {
+			b.center[0] = cluster.bounds_center.x;
+			b.center[1] = cluster.bounds_center.y;
+			b.center[2] = cluster.bounds_center.z;
+			b.radius = cluster.bounds_radius;
+		}
+		r_bounds.write[c] = b;
+
+		ClusterLOD lod;
+		lod.self_center[0] = cluster.self_lod_center.x;
+		lod.self_center[1] = cluster.self_lod_center.y;
+		lod.self_center[2] = cluster.self_lod_center.z;
+		lod.self_radius = cluster.self_lod_radius;
+		lod.self_error = cluster.self_error;
+		lod.parent_center[0] = cluster.parent_lod_center.x;
+		lod.parent_center[1] = cluster.parent_lod_center.y;
+		lod.parent_center[2] = cluster.parent_lod_center.z;
+		lod.parent_radius = cluster.parent_lod_radius;
+		lod.parent_error = cluster.parent_error;
+		r_lods[c] = lod;
+	}
+}

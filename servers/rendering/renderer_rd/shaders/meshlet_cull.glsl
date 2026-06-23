@@ -60,6 +60,26 @@ layout(set = 0, binding = 3, std430) restrict buffer VisibleMeshlets {
 }
 visible_meshlets;
 
+// Per-meshlet Nanite-style LOD-cut data (parallel to meshlet_descriptors, same index). Mirrors
+// MeshletStorage::MeshletLODGPU (48 bytes / 3 vec4 slots). self_* is the LOD this cluster is valid
+// at, parent_* the coarser LOD that replaces it. For surfaces baked without a DAG, every record is
+// all-zero (self_error 0), which the LOD test below treats as "always selectable".
+struct MeshletLOD {
+	vec3 self_center;
+	float self_error;
+	vec3 parent_center;
+	float parent_error;
+	float self_radius;
+	float parent_radius;
+	float pad0;
+	float pad1;
+};
+
+layout(set = 0, binding = 4, std430) restrict readonly buffer MeshletLODs {
+	MeshletLOD data[];
+}
+meshlet_lods;
+
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
 	// Read the real survivor count from Pass A's own output buffer rather than a CPU-supplied
@@ -76,6 +96,17 @@ void main() {
 	WorkItem item = work_items.data[idx];
 	mat4 transform = transforms.data[item.instance_index];
 	MeshletDescriptor d = meshlet_descriptors.data[item.meshlet_index];
+
+	// LOD selection (Phase D2 placeholder: leaf clusters only). A DAG surface uploads its whole
+	// multi-level cluster pool into this range; rendering all levels at once would overdraw and
+	// z-fight, so for now keep only the finest level (self_error == 0). Non-DAG surfaces have
+	// self_error == 0 on every meshlet, so they're unaffected. Phase D3 replaces this with the real
+	// projected-error cut: keep a cluster iff projected_error(self) <= threshold < projected_error(
+	// parent), which picks a crack-free mixed-LOD subset instead of always the finest.
+	MeshletLOD lod = meshlet_lods.data[item.meshlet_index];
+	if (lod.self_error != 0.0) {
+		return;
+	}
 
 	vec3 world_center = (transform * vec4(d.bounds_center, 1.0)).xyz;
 

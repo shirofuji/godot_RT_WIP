@@ -36,6 +36,7 @@
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 #include "core/variant/typed_array.h"
+#include "scene/resources/3d/meshlet_dag.h"
 #include "scene/resources/surface_tool.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -1202,6 +1203,17 @@ static Vector<RenderingServerTypes::MeshletBoundsInfo> _meshlet_bounds_convert(c
 	return dst;
 }
 
+static Vector<RenderingServerTypes::MeshletLODInfo> _meshlet_lod_convert(const LocalVector<MeshletDAG::ClusterLOD> &p_src) {
+	Vector<RenderingServerTypes::MeshletLODInfo> dst;
+	dst.resize(p_src.size());
+	if (!p_src.is_empty()) {
+		// MeshletDAG::ClusterLOD and RenderingServerTypes::MeshletLODInfo are layout-identical (same
+		// 10-float field order), so this is a plain memcpy like the meshlet/bounds converters above.
+		memcpy(dst.ptrw(), p_src.ptr(), sizeof(MeshletDAG::ClusterLOD) * p_src.size());
+	}
+	return dst;
+}
+
 Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes, const Dictionary &p_lods, uint64_t p_compress_format) {
 	ERR_FAIL_INDEX_V(p_primitive, RSE::PRIMITIVE_MAX, ERR_INVALID_PARAMETER);
 	ERR_FAIL_COND_V(p_arrays.size() != RSE::ARRAY_MAX, ERR_INVALID_PARAMETER);
@@ -1410,6 +1422,7 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	PackedInt32Array base_meshlet_vertices;
 	PackedByteArray base_meshlet_triangles;
 	Vector<RenderingServerTypes::MeshletBoundsInfo> base_meshlet_bounds;
+	Vector<RenderingServerTypes::MeshletLODInfo> base_meshlet_lods;
 	PackedVector3Array base_vertices;
 	PackedVector3Array base_normals;
 	PackedVector2Array base_uvs;
@@ -1419,10 +1432,23 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 		base_uvs = p_arrays[RSE::ARRAY_TEX_UV];
 		PackedInt32Array base_indices = p_arrays[RSE::ARRAY_INDEX];
 		if (base_indices.size() % 3 == 0) {
+			// The surface's full-resolution meshlet set IS the Nanite-style cluster DAG: every LOD
+			// level baked into one pool, with per-cluster LOD-cut data (self/parent error + bounds)
+			// so the GPU can pick a crack-free continuous-LOD subset at render time. If the DAG bake
+			// can't run (meshopt hooks missing / degenerate input), fall back to a single-level
+			// meshlet split (base_meshlet_lods stays empty -> legacy LOD-0-only behavior downstream).
 			Vector<SurfaceTool::MeshletBounds> base_bounds_st;
-			Vector<SurfaceTool::Meshlet> base_meshlets_st = SurfaceTool::build_meshlets(base_vertices, base_indices, 64, 124, 0.5f, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st);
+			Vector<SurfaceTool::Meshlet> base_meshlets_st;
+			LocalVector<MeshletDAG::Cluster> dag_clusters;
+			LocalVector<MeshletDAG::ClusterLOD> dag_lods;
+			if (MeshletDAG::build(base_vertices, base_indices, dag_clusters) && !dag_clusters.is_empty()) {
+				MeshletDAG::flatten_to_arrays(dag_clusters, base_vertices, base_meshlets_st, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st, dag_lods);
+			} else {
+				base_meshlets_st = SurfaceTool::build_meshlets(base_vertices, base_indices, 64, 124, 0.5f, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st);
+			}
 			base_meshlets = _meshlet_info_convert(base_meshlets_st);
 			base_meshlet_bounds = _meshlet_bounds_convert(base_bounds_st);
+			base_meshlet_lods = _meshlet_lod_convert(dag_lods);
 
 			for (int i = 0; i < lods.size(); i++) {
 				PackedInt32Array lod_indices;
@@ -1466,6 +1492,7 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	surface_data.meshlet_vertices = base_meshlet_vertices;
 	surface_data.meshlet_triangles = base_meshlet_triangles;
 	surface_data.meshlet_bounds = base_meshlet_bounds;
+	surface_data.meshlet_lods = base_meshlet_lods;
 	surface_data.meshlet_positions = base_vertices;
 	surface_data.meshlet_normals = base_normals;
 	surface_data.meshlet_uvs = base_uvs;

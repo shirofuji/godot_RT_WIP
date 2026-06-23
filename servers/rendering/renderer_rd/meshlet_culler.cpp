@@ -262,6 +262,15 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 			u.append_id(visible_buffer);
 			uniforms.push_back(u);
 		}
+		{
+			// Binding 4: per-meshlet LOD-cut data (parallel to descriptors) for DAG cluster-LOD
+			// selection - see meshlet_cull.glsl's MeshletLODs.
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 4;
+			u.append_id(MeshletStorage::get_singleton()->get_meshlet_lod_buffer_rid());
+			uniforms.push_back(u);
+		}
 		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, cull_shader_rid, 0);
 
 		struct CullPushConstant {

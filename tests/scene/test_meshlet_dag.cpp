@@ -128,6 +128,42 @@ TEST_CASE("[SceneTree][MeshletDAG] Builds a multi-level cluster DAG with monoton
 		}
 	}
 	CHECK_MESSAGE(root_tris < leaf_tris, "Coarsest (root) level must hold fewer triangles than LOD 0.");
+
+	// --- flatten_to_arrays(): the cluster pool must convert losslessly into meshlet upload form. ---
+	Vector<SurfaceTool::Meshlet> meshlets;
+	PackedInt32Array meshlet_vertices;
+	PackedByteArray meshlet_triangles;
+	Vector<SurfaceTool::MeshletBounds> bounds;
+	LocalVector<MeshletDAG::ClusterLOD> lods;
+	MeshletDAG::flatten_to_arrays(clusters, vertices, meshlets, meshlet_vertices, meshlet_triangles, bounds, lods);
+
+	REQUIRE_MESSAGE(meshlets.size() == (int)clusters.size(), "One meshlet per cluster.");
+	REQUIRE_MESSAGE(lods.size() == clusters.size(), "One LOD-cut record per cluster.");
+	REQUIRE_MESSAGE(bounds.size() == (int)clusters.size(), "One bound per cluster.");
+
+	for (uint32_t c = 0; c < clusters.size(); c++) {
+		const SurfaceTool::Meshlet &ml = meshlets[c];
+		const MeshletDAG::Cluster &cl = clusters[c];
+		CHECK_MESSAGE(ml.triangle_count == cl.indices.size() / 3, "Meshlet triangle count matches the cluster.");
+		CHECK_MESSAGE(ml.vertex_count <= 64, "Meshlet vertex count within cap.");
+		CHECK_MESSAGE(ml.triangle_count <= 124, "Meshlet triangle count within cap.");
+
+		// Reconstruct this meshlet's global triangle indices and compare to the cluster's, in order.
+		bool match = true;
+		for (uint32_t t = 0; t < ml.triangle_count * 3; t++) {
+			uint8_t local = meshlet_triangles[ml.triangle_offset + t];
+			int global = meshlet_vertices[ml.vertex_offset + local];
+			CHECK_MESSAGE((uint32_t)global < vertex_count, "Remapped meshlet vertex is in range.");
+			if ((uint32_t)global != cl.indices[t]) {
+				match = false;
+			}
+		}
+		CHECK_MESSAGE(match, "Reconstructed meshlet triangles must equal the cluster's flat indices.");
+
+		// LOD-cut data must survive the conversion exactly.
+		CHECK(lods[c].self_error == cl.self_error);
+		CHECK(lods[c].parent_error == cl.parent_error);
+	}
 }
 
 } // namespace TestMeshletDAG

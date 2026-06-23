@@ -442,7 +442,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		if (meshlet_storage && new_surface.meshlets.size() > 0) {
 			MeshletStorage::Range vertex_range = meshlet_storage->upload_vertices(new_surface.meshlet_positions, new_surface.meshlet_normals, new_surface.meshlet_uvs);
 			if (vertex_range.is_valid()) {
-				s->meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.meshlets, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlet_bounds);
+				s->meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.meshlets, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlet_bounds, new_surface.meshlet_lods);
 
 				for (int i = 0; i < new_surface.lods.size(); i++) {
 					if (new_surface.lods[i].meshlets.size() > 0) {

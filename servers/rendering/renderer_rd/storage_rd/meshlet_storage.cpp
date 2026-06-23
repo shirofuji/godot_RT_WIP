@@ -155,6 +155,7 @@ MeshletStorage::MeshletStorage() {
 	meshlet_vertex_buffer.init(sizeof(uint32_t), initial_meshlet_vertices);
 	meshlet_triangle_buffer.init(sizeof(uint8_t), initial_meshlet_triangle_bytes);
 	meshlet_descriptor_buffer.init(sizeof(MeshletDescriptorGPU), initial_meshlets);
+	meshlet_lod_buffer.init(sizeof(MeshletLODGPU), initial_meshlets);
 	meshlet_material_buffer.init(sizeof(MeshletMaterialGPU), initial_materials);
 
 	vertex_allocator.grow(initial_vertices);
@@ -169,6 +170,7 @@ MeshletStorage::~MeshletStorage() {
 	meshlet_vertex_buffer.free();
 	meshlet_triangle_buffer.free();
 	meshlet_descriptor_buffer.free();
+	meshlet_lod_buffer.free();
 	meshlet_material_buffer.free();
 	singleton = nullptr;
 }
@@ -212,7 +214,7 @@ Vector2 MeshletStorage::_oct_encode_normal(const Vector3 &p_normal) {
 			(1.0f - Math::abs(n.x)) * (n.y >= 0 ? 1.0f : -1.0f));
 }
 
-MeshletStorage::UploadResult MeshletStorage::upload_mesh_meshlets(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds) {
+MeshletStorage::UploadResult MeshletStorage::upload_mesh_meshlets(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds, const Vector<RenderingServerTypes::MeshletLODInfo> &p_lods) {
 	UploadResult result;
 
 	ERR_FAIL_COND_V(p_positions.is_empty(), result);
@@ -222,7 +224,7 @@ MeshletStorage::UploadResult MeshletStorage::upload_mesh_meshlets(const PackedVe
 	ERR_FAIL_COND_V(!p_uvs.is_empty() && p_uvs.size() != p_positions.size(), result);
 
 	result.vertex_range = upload_vertices(p_positions, p_normals, p_uvs);
-	UploadResult meshlet_result = upload_meshlets(result.vertex_range, p_meshlets, p_meshlet_vertices, p_meshlet_triangles, p_bounds);
+	UploadResult meshlet_result = upload_meshlets(result.vertex_range, p_meshlets, p_meshlet_vertices, p_meshlet_triangles, p_bounds, p_lods);
 	result.meshlet_vertex_range = meshlet_result.meshlet_vertex_range;
 	result.meshlet_triangle_range = meshlet_result.meshlet_triangle_range;
 	result.meshlet_range = meshlet_result.meshlet_range;
@@ -276,7 +278,7 @@ void MeshletStorage::free_vertices(const Range &p_vertex_range) {
 	vertex_allocator.free(p_vertex_range);
 }
 
-MeshletStorage::UploadResult MeshletStorage::upload_meshlets(const Range &p_vertex_range, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds) {
+MeshletStorage::UploadResult MeshletStorage::upload_meshlets(const Range &p_vertex_range, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds, const Vector<RenderingServerTypes::MeshletLODInfo> &p_lods) {
 	UploadResult result;
 	result.vertex_range = p_vertex_range;
 
@@ -310,6 +312,7 @@ MeshletStorage::UploadResult MeshletStorage::upload_meshlets(const Range &p_vert
 		result.meshlet_range = meshlet_allocator.allocate(meshlet_count);
 	}
 	meshlet_descriptor_buffer.ensure_capacity(meshlet_allocator.get_capacity());
+	meshlet_lod_buffer.ensure_capacity(meshlet_allocator.get_capacity());
 
 	// Upload meshlet vertex remap, rebased onto the (shared) global vertex range.
 	{
@@ -348,6 +351,35 @@ MeshletStorage::UploadResult MeshletStorage::upload_meshlets(const Range &p_vert
 			d.triangle_count = m.triangle_count;
 		}
 		meshlet_descriptor_buffer.upload(result.meshlet_range.offset, descriptors.ptr(), meshlet_count);
+	}
+
+	// Upload the parallel per-meshlet LOD-cut data (same index range as descriptors). When the
+	// surface wasn't DAG-baked, p_lods is empty and we upload all-zero records - which the cull
+	// shader reads as self_error 0 / parent_error 0, i.e. "this is always the right LOD" (the leaf
+	// filter / cut both treat error-0 clusters as unconditionally selectable), preserving the legacy
+	// single-level behavior. When present, p_lods must be parallel to p_meshlets.
+	{
+		LocalVector<MeshletLODGPU> lods;
+		lods.resize(meshlet_count);
+		bool have_lods = (uint32_t)p_lods.size() == meshlet_count;
+		for (uint32_t i = 0; i < meshlet_count; i++) {
+			MeshletLODGPU &g = lods[i];
+			if (have_lods) {
+				const RenderingServerTypes::MeshletLODInfo &l = p_lods[i];
+				g.self_center[0] = l.self_center[0];
+				g.self_center[1] = l.self_center[1];
+				g.self_center[2] = l.self_center[2];
+				g.self_radius = l.self_radius;
+				g.self_error = l.self_error;
+				g.parent_center[0] = l.parent_center[0];
+				g.parent_center[1] = l.parent_center[1];
+				g.parent_center[2] = l.parent_center[2];
+				g.parent_radius = l.parent_radius;
+				g.parent_error = l.parent_error;
+			}
+			// else: default-constructed all-zero record (legacy non-DAG surface).
+		}
+		meshlet_lod_buffer.upload(result.meshlet_range.offset, lods.ptr(), meshlet_count);
 	}
 
 	return result;

@@ -294,13 +294,22 @@ TEST_CASE("[SceneTree][Meshlet] mesh_create_surface_data_from_arrays bakes meshl
 	CHECK(surface_data.meshlets.size() == surface_data.meshlet_bounds.size());
 	CHECK(surface_data.meshlet_positions.size() == vertices.size());
 
-	// surface_data.meshlets is RenderingServerTypes::MeshletInfo, a layout-identical mirror of
-	// SurfaceTool::Meshlet kept separately so the servers layer avoids a scene/ dependency;
-	// reinterpret here purely to reuse the existing coverage-check helper.
-	Vector<SurfaceTool::Meshlet> meshlets_st;
-	meshlets_st.resize(surface_data.meshlets.size());
-	memcpy(meshlets_st.ptrw(), surface_data.meshlets.ptr(), sizeof(SurfaceTool::Meshlet) * surface_data.meshlets.size());
-	check_meshlets_cover_triangles(indices, meshlets_st, surface_data.meshlet_vertices, surface_data.meshlet_triangles);
+	// surface_data.meshlets is now the full Nanite-style cluster DAG (every LOD level baked into one
+	// pool), with parallel per-cluster LOD-cut data in surface_data.meshlet_lods. The coarse levels
+	// hold SIMPLIFIED geometry that intentionally isn't in the source mesh, so only the LEAF clusters
+	// (self_error == 0 - the finest LOD) are expected to exactly cover the source triangles. Filter
+	// to the leaves and verify coverage over those.
+	REQUIRE(surface_data.meshlet_lods.size() == surface_data.meshlets.size());
+	Vector<SurfaceTool::Meshlet> leaf_meshlets;
+	for (int i = 0; i < surface_data.meshlets.size(); i++) {
+		if (surface_data.meshlet_lods[i].self_error == 0.0f) {
+			SurfaceTool::Meshlet ml;
+			memcpy(&ml, &surface_data.meshlets[i], sizeof(SurfaceTool::Meshlet)); // Layout-identical mirror.
+			leaf_meshlets.push_back(ml);
+		}
+	}
+	CHECK_MESSAGE(leaf_meshlets.size() > 0, "DAG must contain LOD-0 leaf clusters.");
+	check_meshlets_cover_triangles(indices, leaf_meshlets, surface_data.meshlet_vertices, surface_data.meshlet_triangles);
 }
 
 TEST_CASE("[SceneTree][Meshlet] A real PrimitiveMesh uploads meshlets into MeshletStorage automatically") {

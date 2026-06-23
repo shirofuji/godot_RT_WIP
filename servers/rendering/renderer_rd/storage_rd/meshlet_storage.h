@@ -63,6 +63,22 @@ public:
 		uint32_t triangle_count = 0;
 	};
 
+	// std430 layout (48 bytes, three vec4 slots). Per-meshlet Nanite-style LOD-cut data, in a buffer
+	// PARALLEL to meshlet_descriptor_buffer (same global meshlet index) so adding it doesn't disturb
+	// MeshletDescriptorGPU - which five shaders read - and only the cull shader binds it. self_* is
+	// the LOD this cluster is valid at; parent_* the coarser LOD that replaces it. All-zero (error 0)
+	// for surfaces baked without a DAG, which the cull shader treats as "always the right LOD".
+	struct MeshletLODGPU {
+		float self_center[3] = { 0, 0, 0 };
+		float self_error = 0;
+		float parent_center[3] = { 0, 0, 0 };
+		float parent_error = 0;
+		float self_radius = 0;
+		float parent_radius = 0;
+		float pad0 = 0;
+		float pad1 = 0;
+	};
+
 	// std430 layout, matches the GLSL-side MeshletMaterial struct (see meshlet_render.glsl) - a
 	// flattened snapshot of the subset of StandardMaterial3D/ORMMaterial3D parameters Forward+'s
 	// own fragment shader reads into local variables, not a generic shader-graph evaluator. Custom
@@ -143,6 +159,7 @@ private:
 	GrowableBuffer meshlet_vertex_buffer; // uint32 remap indices into the vertex buffers above.
 	GrowableBuffer meshlet_triangle_buffer; // packed uint8 local triangle indices.
 	GrowableBuffer meshlet_descriptor_buffer; // MeshletDescriptorGPU per meshlet.
+	GrowableBuffer meshlet_lod_buffer; // MeshletLODGPU per meshlet (parallel to descriptors).
 
 	GrowableBuffer meshlet_material_buffer; // MeshletMaterialGPU per uploaded material.
 	uint32_t meshlet_material_count = 0; // Simple append-only counter, not a RangeAllocator - one
@@ -161,7 +178,7 @@ public:
 	// step using SurfaceTool::build_meshlets(), converted to the layout-compatible
 	// RenderingServerTypes::MeshletInfo/MeshletBoundsInfo mirrors) into the global buffers,
 	// growing them as needed. p_normals/p_uvs may be empty (defaults to zero).
-	UploadResult upload_mesh_meshlets(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds);
+	UploadResult upload_mesh_meshlets(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds, const Vector<RenderingServerTypes::MeshletLODInfo> &p_lods = Vector<RenderingServerTypes::MeshletLODInfo>());
 
 	void free_mesh_meshlets(const UploadResult &p_result);
 
@@ -171,7 +188,7 @@ public:
 	// vertex_range instead of re-uploading duplicate vertex data per LOD.
 	Range upload_vertices(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs);
 	void free_vertices(const Range &p_vertex_range);
-	UploadResult upload_meshlets(const Range &p_vertex_range, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds);
+	UploadResult upload_meshlets(const Range &p_vertex_range, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds, const Vector<RenderingServerTypes::MeshletLODInfo> &p_lods = Vector<RenderingServerTypes::MeshletLODInfo>());
 	// Frees only the meshlet-side ranges of p_result (vertex_range is owned by upload_vertices()'s
 	// caller and must be freed separately via free_vertices(), once all of its LODs are gone).
 	void free_meshlets(const UploadResult &p_result);
@@ -190,6 +207,7 @@ public:
 	RID get_meshlet_vertex_buffer_rid() const { return meshlet_vertex_buffer.rid; }
 	RID get_meshlet_triangle_buffer_rid() const { return meshlet_triangle_buffer.rid; }
 	RID get_meshlet_descriptor_buffer_rid() const { return meshlet_descriptor_buffer.rid; }
+	RID get_meshlet_lod_buffer_rid() const { return meshlet_lod_buffer.rid; }
 
 	// Read-back helpers (stall the GPU - test/debug use only, never call these per-frame).
 	MeshletDescriptorGPU debug_get_meshlet_descriptor(uint32_t p_global_meshlet_index) const;

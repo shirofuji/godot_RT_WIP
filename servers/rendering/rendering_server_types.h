@@ -103,6 +103,20 @@ struct MeshletBoundsInfo {
 	int8_t cone_cutoff_s8 = 0;
 };
 
+// Layout-identical mirror of MeshletDAG::ClusterLOD (scene/resources/3d/meshlet_dag.h). Per-meshlet
+// LOD-cut data for Nanite-style continuous cluster LOD: the self LOD bounding sphere + error (the
+// LOD this meshlet is valid at) and the parent LOD bounding sphere + error (the coarser LOD that
+// replaces it). Empty unless the surface was baked as a DAG. Converted to MeshletStorage's
+// MeshletLODGPU at upload; consumed by the GPU cut in meshlet_cull.glsl.
+struct MeshletLODInfo {
+	float self_center[3] = { 0, 0, 0 };
+	float self_radius = 0;
+	float self_error = 0;
+	float parent_center[3] = { 0, 0, 0 };
+	float parent_radius = 0;
+	float parent_error = 0;
+};
+
 struct SurfaceData {
 	RSE::PrimitiveType primitive = RSE::PRIMITIVE_MAX;
 
@@ -135,6 +149,12 @@ struct SurfaceData {
 	PackedInt32Array meshlet_vertices;
 	PackedByteArray meshlet_triangles;
 	Vector<MeshletBoundsInfo> meshlet_bounds;
+
+	// Per-meshlet LOD-cut data, parallel to `meshlets` (same index). Non-empty when the surface was
+	// baked as a Nanite-style cluster DAG (MeshletDAG): `meshlets` then holds the full multi-level
+	// cluster pool and this gives each cluster the error/bounds the GPU cut uses to pick a
+	// crack-free LOD subset. Empty for the legacy single-level (LOD-0-only) meshlet path.
+	Vector<MeshletLODInfo> meshlet_lods;
 
 	// Raw (uncompressed) per-vertex source data the meshlets above are indexed against; kept
 	// separately from vertex_data because that one may already be quantized/compressed by the

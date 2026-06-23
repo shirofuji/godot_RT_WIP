@@ -33,6 +33,7 @@
 #include "core/math/vector3.h"
 #include "core/templates/local_vector.h"
 #include "core/variant/variant.h"
+#include "scene/resources/surface_tool.h"
 
 // Builds a Nanite-style meshlet DAG (directed acyclic graph of cluster LODs) from a triangle mesh.
 //
@@ -78,4 +79,23 @@ public:
 	// or the input is degenerate. p_max_vertices/p_max_triangles follow the meshlet cap used
 	// elsewhere in the renderer (64 / 124).
 	static bool build(const PackedVector3Array &p_positions, const PackedInt32Array &p_indices, LocalVector<Cluster> &r_clusters, uint32_t p_max_vertices = 64, uint32_t p_max_triangles = 124);
+
+	// Per-cluster LOD-cut data, parallel to the meshlet arrays flatten_to_arrays() produces. Packs
+	// the two bounding spheres + two errors the GPU cut needs (self = the LOD this cluster is valid
+	// at; parent = the coarser LOD that replaces it). 10 floats, std430-friendly for upload.
+	struct ClusterLOD {
+		float self_center[3] = { 0, 0, 0 };
+		float self_radius = 0;
+		float self_error = 0;
+		float parent_center[3] = { 0, 0, 0 };
+		float parent_radius = 0;
+		float parent_error = 0;
+	};
+
+	// Converts a built cluster pool into the renderer's meshlet upload form: one meshlet per cluster
+	// (clusters are already meshlet-sized), with a local vertex remap + triangle bytes concatenated
+	// across all clusters, per-meshlet cull bounds (center/radius/cone via meshoptimizer), and the
+	// parallel per-cluster LOD-cut data. r_meshlet_vertices entries are global indices into
+	// p_positions (the shared surface vertex array). This is what feeds SurfaceData / MeshletStorage.
+	static void flatten_to_arrays(const LocalVector<Cluster> &p_clusters, const PackedVector3Array &p_positions, Vector<SurfaceTool::Meshlet> &r_meshlets, PackedInt32Array &r_meshlet_vertices, PackedByteArray &r_meshlet_triangles, Vector<SurfaceTool::MeshletBounds> &r_bounds, LocalVector<ClusterLOD> &r_lods);
 };
