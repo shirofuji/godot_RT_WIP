@@ -89,10 +89,17 @@ void main() {
 
 	// Normal-cone backface rejection (meshoptimizer's apex-free formula - see
 	// meshopt_computeMeshletBounds's docs): cull if facing away from the camera everywhere on
-	// the meshlet's bounding sphere. mat3(transform) is an approximation for non-uniform scale
-	// (a true normal transform needs the inverse-transpose); acceptable since cone_axis is an
-	// aggregate direction, not a precise surface normal.
-	vec3 world_cone_axis = normalize(mat3(transform) * d.cone_axis);
+	// the meshlet's bounding sphere. Needs the inverse-transpose of the model matrix, not the
+	// model matrix itself, to transform a normal/cone-axis direction correctly under non-uniform
+	// scale - mat3(transform) directly was tried here as a cheaper approximation under the
+	// assumption that cone_axis (an aggregate direction, not a precise surface normal) wouldn't be
+	// sensitive to the error, but that assumption broke down for combined rotation + non-uniform
+	// scale: confirmed live, an instance with both produced a normalized cone_axis skewed enough
+	// to make the cone test wrongly classify nearly the entire meshlet set as backfacing, leaving
+	// only a thin ring of silhouette-adjacent meshlets visible (the same shader-level bug class as
+	// meshlet_render.glsl's per-vertex normal fix, just earlier in the pipeline - in the cull pass,
+	// not the render pass).
+	vec3 world_cone_axis = normalize(transpose(inverse(mat3(transform))) * d.cone_axis);
 	vec3 to_meshlet = world_center - params.camera_position;
 	float dist = length(to_meshlet);
 	if (dist > 0.0001) {
