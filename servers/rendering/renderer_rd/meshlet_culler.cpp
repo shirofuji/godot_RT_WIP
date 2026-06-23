@@ -156,7 +156,7 @@ void MeshletCuller::_ensure_command_capacity(uint32_t p_capacity) {
 	command_capacity = p_capacity;
 }
 
-MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items, uint32_t p_max_visible) {
+MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items, uint32_t p_max_visible, float p_projection_scale, float p_lod_threshold) {
 	CullResult result;
 
 	ERR_FAIL_COND_V(p_frustum_planes.size() != 6, result);
@@ -276,8 +276,8 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 		struct CullPushConstant {
 			uint32_t work_item_count;
 			uint32_t max_visible;
-			uint32_t pad0;
-			uint32_t pad1;
+			float projection_scale;
+			float lod_threshold;
 			float planes[6][4];
 			float camera_position[3];
 			float pad2;
@@ -285,8 +285,8 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 		CullPushConstant push_constant;
 		push_constant.work_item_count = p_max_work_items; // Capacity, not the real count - see shader.
 		push_constant.max_visible = p_max_visible;
-		push_constant.pad0 = 0;
-		push_constant.pad1 = 0;
+		push_constant.projection_scale = p_projection_scale; // <=0 disables the LOD cut (leaf-only).
+		push_constant.lod_threshold = p_lod_threshold;
 		for (int i = 0; i < 6; i++) {
 			push_constant.planes[i][0] = p_frustum_planes[i].normal.x;
 			push_constant.planes[i][1] = p_frustum_planes[i].normal.y;

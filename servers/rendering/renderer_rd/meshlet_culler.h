@@ -138,7 +138,11 @@ public:
 
 	// p_transforms_buffer: SSBO of mat4, one per instance, indexed by InstanceMeshletRange::instance_index.
 	// p_frustum_planes: exactly 6 planes (e.g. from Projection::get_projection_planes()).
-	CullResult cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items = 1 << 16, uint32_t p_max_visible = 1 << 16);
+	// p_projection_scale = |P[1][1]| * viewport_height * 0.5 (world length -> screen px at unit
+	// distance); p_lod_threshold = max acceptable cluster screen-error in pixels. Together they drive
+	// the Nanite-style per-cluster LOD cut in meshlet_cull.glsl. p_projection_scale <= 0 disables the
+	// cut and renders the finest LOD only (for callers without projection info).
+	CullResult cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items = 1 << 16, uint32_t p_max_visible = 1 << 16, float p_projection_scale = 0.0f, float p_lod_threshold = 0.0f);
 
 	// Tests p_frustum_result's survivors (e.g. from cull() above) against a Hi-Z depth pyramid
 	// (see HiZBuilder) and returns a new, final CullResult. p_camera_transform/p_projection

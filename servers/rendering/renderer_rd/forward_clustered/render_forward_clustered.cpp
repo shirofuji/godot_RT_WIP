@@ -1953,6 +1953,12 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 // dominant cause of "spheres rendering as scattered fragments."
 static const uint32_t MESHLET_LIVE_CAPACITY = 1 << 22; // ~4M.
 
+// Max acceptable per-cluster screen-space geometric error, in pixels, for the Nanite-style
+// continuous-LOD cut (see meshlet_cull.glsl). Lower = crisper but more triangles; higher = more
+// aggressive LOD reduction. ~1px is the standard "switch when the error is about a pixel" target;
+// kept as a single tunable here pending a project setting.
+static const float MESHLET_LOD_THRESHOLD_PX = 1.0f;
+
 RID RenderForwardClustered::meshlet_scan_transforms_buffer() {
 	const Vector<Transform3D> &instance_transforms = meshlet_scan_instance_transforms;
 
@@ -2056,7 +2062,11 @@ void RenderForwardClustered::_render_meshlet_early_depth_pass(RenderDataRD *p_re
 	Transform3D camera_transform = p_render_data->scene_data->cam_transform;
 	Projection projection = p_render_data->scene_data->get_cam_projection();
 	Vector<Plane> planes = projection.get_projection_planes(camera_transform);
-	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY);
+	// projection_scale projects a world-space length to screen pixels at unit distance (the cull's
+	// continuous-LOD cut needs it). columns[1].y is the projection's Y scale (cot(fov_y/2), possibly
+	// Y-flipped -> abs); * half the viewport height converts NDC to pixels.
+	float lod_projection_scale = Math::abs((float)projection.columns[1].y) * (float)p_render_buffers->get_internal_size().y * 0.5f;
+	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY, lod_projection_scale, MESHLET_LOD_THRESHOLD_PX);
 
 	// Occlude against *last* frame's Hi-Z, using *last* frame's camera transform/projection - the
 	// Hi-Z's texels are addressed in that camera's clip/screen space, so the world->screen mapping
@@ -2111,7 +2121,9 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	Projection projection = p_render_data->scene_data->get_cam_projection();
 	Vector<Plane> planes = projection.get_projection_planes(camera_transform);
 
-	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY);
+	// Continuous-LOD cut projection scale (see the early pass for the derivation).
+	float lod_projection_scale = Math::abs((float)projection.columns[1].y) * (float)p_render_buffers->get_internal_size().y * 0.5f;
+	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY, lod_projection_scale, MESHLET_LOD_THRESHOLD_PX);
 
 	// Occlude against a Hi-Z rebuilt from *this* frame's current real depth (whatever's in the
 	// depth buffer right now: real depth pre-pass output for non-meshlet instances, plus the early

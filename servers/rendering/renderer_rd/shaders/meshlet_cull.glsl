@@ -9,8 +9,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant, std430) uniform Params {
 	uint work_item_count;
 	uint max_visible;
-	uint pad0;
-	uint pad1;
+	float projection_scale; // |P[1][1]| * viewport_height * 0.5: world length -> screen px at unit dist.
+	float lod_threshold; // Max acceptable screen-space cluster error, in pixels. <=0 projection_scale = LOD cut off (leaf-only).
 	vec4 planes[6]; // xyz = normal, w = d; matches core/math/Plane: distance_to(p) = dot(normal,p) - d.
 	vec3 camera_position;
 	float pad2;
@@ -97,25 +97,52 @@ void main() {
 	mat4 transform = transforms.data[item.instance_index];
 	MeshletDescriptor d = meshlet_descriptors.data[item.meshlet_index];
 
-	// LOD selection (Phase D2 placeholder: leaf clusters only). A DAG surface uploads its whole
-	// multi-level cluster pool into this range; rendering all levels at once would overdraw and
-	// z-fight, so for now keep only the finest level (self_error == 0). Non-DAG surfaces have
-	// self_error == 0 on every meshlet, so they're unaffected. Phase D3 replaces this with the real
-	// projected-error cut: keep a cluster iff projected_error(self) <= threshold < projected_error(
-	// parent), which picks a crack-free mixed-LOD subset instead of always the finest.
 	MeshletLOD lod = meshlet_lods.data[item.meshlet_index];
-	if (lod.self_error != 0.0) {
-		return;
-	}
-
-	vec3 world_center = (transform * vec4(d.bounds_center, 1.0)).xyz;
 
 	// Conservative radius scale: largest axis scale of the transform's basis (exact for uniform
-	// scale, conservative - never under-estimates - for non-uniform scale).
+	// scale, conservative - never under-estimates - for non-uniform scale). Also scales the LOD
+	// error/bounds below (object-space lengths) into world space.
 	float scale_x = length(transform[0].xyz);
 	float scale_y = length(transform[1].xyz);
 	float scale_z = length(transform[2].xyz);
 	float max_scale = max(max(scale_x, scale_y), scale_z);
+
+	// Continuous per-cluster LOD cut (Nanite-style). Keep a cluster iff its own simplification error
+	// is acceptable on screen (<= threshold) AND the coarser parent LOD that would replace it is NOT
+	// (parent error > threshold) - so exactly one LOD per region survives, and because every cluster
+	// in a group shares the same LOD sphere on each side with monotonic error, the surviving subset
+	// is watertight across mixed LODs. Errors/bounds are object-space; transform centers, scale
+	// lengths by max_scale, and project to screen pixels as error * projection_scale / distance (to
+	// the bound's nearest point). projection_scale <= 0 disables the cut (e.g. contexts with no
+	// projection info) -> fall back to leaf-only (LOD-0). Non-DAG surfaces have all-zero LOD records
+	// (self_error 0, parent_error 0), which both paths keep unconditionally.
+	if (params.projection_scale <= 0.0) {
+		if (lod.self_error != 0.0) {
+			return; // No projection info: render the finest level only.
+		}
+	} else {
+		const float ROOT_ERROR = 1e30; // parent_error sentinel (FLT_MAX) = no coarser parent.
+		float self_px = 0.0;
+		if (lod.self_error > 0.0) {
+			vec3 self_c = (transform * vec4(lod.self_center, 1.0)).xyz;
+			float self_d = max(length(self_c - params.camera_position) - lod.self_radius * max_scale, 0.001);
+			self_px = (lod.self_error * max_scale) * params.projection_scale / self_d;
+		}
+		bool is_root = lod.parent_error >= ROOT_ERROR;
+		float parent_px = ROOT_ERROR;
+		if (!is_root && lod.parent_error > 0.0) {
+			vec3 par_c = (transform * vec4(lod.parent_center, 1.0)).xyz;
+			float par_d = max(length(par_c - params.camera_position) - lod.parent_radius * max_scale, 0.001);
+			parent_px = (lod.parent_error * max_scale) * params.projection_scale / par_d;
+		}
+		bool lower_ok = self_px <= params.lod_threshold; // this cluster's own error is fine
+		bool upper_ok = (lod.parent_error <= 0.0) || is_root || (parent_px > params.lod_threshold); // parent too coarse / none
+		if (!(lower_ok && upper_ok)) {
+			return; // Not the right LOD for this view.
+		}
+	}
+
+	vec3 world_center = (transform * vec4(d.bounds_center, 1.0)).xyz;
 	float world_radius = d.bounds_radius * max_scale;
 
 	// Normal-cone backface rejection (meshoptimizer's apex-free formula - see
