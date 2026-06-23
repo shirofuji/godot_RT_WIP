@@ -428,14 +428,19 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 			// Internal nodes hold mipmap-aggregated data (see svogi_mipmap.glsl), so sampling a
 			// coarser level for a wide cone is correct, not just empty.
 			if (current_half * 2.0 <= target_size || depth == 5u) {
-				uint albedo_packed = svogi_nodes.data[node_idx].albedo;
-				if (albedo_packed != 0u) {
-					vec3 vox_albedo = vec3(
-							float((albedo_packed >> 24u) & 0xFFu),
-							float((albedo_packed >> 16u) & 0xFFu),
-							float((albedo_packed >> 8u) & 0xFFu)) /
+				// The node's "albedo" field actually holds LIT RADIANCE (outgoing diffuse light =
+				// surface albedo * direct light + emission), written by svogi_voxelize.glsl's
+				// direct-light-injection step. So this returns the bounced light arriving from that
+				// voxel; the caller multiplies it by the *receiving* surface's albedo, giving proper
+				// one-bounce indirect diffuse (red lit surface bounces red light onto its neighbors).
+				uint radiance_packed = svogi_nodes.data[node_idx].albedo;
+				if (radiance_packed != 0u) {
+					vec3 vox_radiance = vec3(
+							float((radiance_packed >> 24u) & 0xFFu),
+							float((radiance_packed >> 16u) & 0xFFu),
+							float((radiance_packed >> 8u) & 0xFFu)) /
 							255.0;
-					voxel_color = vec4(vox_albedo * energy, 1.0);
+					voxel_color = vec4(vox_radiance * energy, 1.0);
 				}
 				break;
 			}
@@ -479,13 +484,18 @@ void main() {
 	// frame - see svogi_bounds' push-constant comment). A single wide diffuse cone along the
 	// surface normal: a coarse, cheap first-cut "is there bounced light arriving roughly from the
 	// hemisphere I face" - not a full multi-cone hemisphere integration. Folded into diffuse_light
-	// so it picks up the same albedo*(1-metallic) modulation as direct/ambient diffuse below. Bias
-	// of one root-voxel step pushes the cone start off this surface so it doesn't immediately
-	// self-intersect the voxel it sits in.
+	// so it picks up the same albedo*(1-metallic) modulation as direct/ambient diffuse below.
+	// Cone params are a deliberate self-bleed-vs-reach tradeoff: a single normal-aligned cone on a
+	// convex surface will sample the surface's OWN adjacent lit voxels unless the cone is narrow
+	// enough and started far enough off the surface to clear its local curvature. tan_half_angle
+	// 0.5 (~53 deg full cone, not the full 90 deg hemisphere) plus a start bias of several leaf
+	// voxels keeps self-bleed from saturating everything while still letting the cone reach a
+	// nearby neighbor for actual inter-object color bleed. Still crude (one cone, no occlusion-
+	// aware weighting) - a proper multi-cone cosine-weighted hemisphere is the real quality step.
 	vec3 gi_diffuse = vec3(0.0);
 	if (params.svogi_bounds.w > 0.0) {
 		float voxel_size = params.svogi_bounds.w / 32.0; // root half-size / 32 ~= leaf diameter.
-		vec4 gi = svogi_cone_trace(world_pos_interp, N, 1.0, params.svogi_bounds.w * 2.0, voxel_size, params.svogi_bounds.xyz, params.svogi_bounds.w, params.svogi_params.x);
+		vec4 gi = svogi_cone_trace(world_pos_interp, N, 0.5, params.svogi_bounds.w * 2.0, voxel_size * 3.0, params.svogi_bounds.xyz, params.svogi_bounds.w, params.svogi_params.x);
 		gi_diffuse = gi.rgb;
 	}
 

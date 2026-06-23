@@ -299,7 +299,8 @@ private:
 			float bounds_center[3];
 			float bounds_half_size;
 			uint32_t max_nodes;
-			uint32_t pad[3];
+			uint32_t light_count;
+			uint32_t pad[2];
 		};
 
 		struct MipmapPushConstant {
@@ -762,7 +763,7 @@ public:
 		void debug_probes(RID p_framebuffer, const uint32_t p_view_count, const Projection *p_camera_with_transforms);
 
 		void pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_render_data);
-		void render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_region, const PagedArray<RenderGeometryInstance *> &p_instances, float p_exposure_normalization);
+		void render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_region, const PagedArray<RenderGeometryInstance *> &p_instances, float p_exposure_normalization, RID p_lights_buffer = RID(), uint32_t p_light_count = 0);
 		void render_static_lights(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_cascade_count, const uint32_t *p_cascade_indices, const PagedArray<RID> *p_positional_light_cull_result);
 	};
 

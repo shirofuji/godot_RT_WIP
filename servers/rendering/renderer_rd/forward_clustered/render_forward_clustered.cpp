@@ -1285,8 +1285,13 @@ void RenderForwardClustered::_update_svogi(RenderDataRD *p_render_data) {
 		if (p_render_data->camera_attributes.is_valid()) {
 			exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 		}
+		// Scene lights for SVOGI direct-light injection - the same set the meshlet renderer is
+		// handed, so voxelization can store lit radiance (albedo * direct light) instead of raw
+		// albedo (see svogi_voxelize.glsl's voxel_direct_light()). Collected once for all regions.
+		Vector<MeshletLightGPU> svogi_lights = _meshlet_collect_lights(p_render_data);
+		RID svogi_lights_buffer = meshlet_lights_buffer_rid(svogi_lights);
 		for (int i = 0; i < p_render_data->render_svogi_region_count; i++) {
-			svogi->render_region(rb, p_render_data->render_svogi_regions[i].region, p_render_data->render_svogi_regions[i].instances, exposure_normalization);
+			svogi->render_region(rb, p_render_data->render_svogi_regions[i].region, p_render_data->render_svogi_regions[i].instances, exposure_normalization, svogi_lights_buffer, (uint32_t)svogi_lights.size());
 		}
 		if (p_render_data->svogi_update_data->update_static) {
 			svogi->render_static_lights(p_render_data, rb, p_render_data->svogi_update_data->static_cascade_count, p_render_data->svogi_update_data->static_cascade_indices, p_render_data->svogi_update_data->static_positional_lights);
@@ -2160,10 +2165,31 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 		}
 	}
 
+	// SVOGI indirect bounce: if this view has a built octree (SVOGI enabled and at least one
+	// cascade-0 voxelization has completed), hand the meshlet renderer the octree buffer + the
+	// absolute-world root bounds it was voxelized against + the GI energy, so its fragment shader
+	// can cone-trace real bounced light (see MeshletRenderer::render()/svogi_cone_trace()). When
+	// absent, half_size stays 0 and the shader skips the trace - meshes still get flat ambient.
+	RID svogi_octree_buffer;
+	Vector3 svogi_bounds_center;
+	float svogi_bounds_half_size = 0.0f;
+	float svogi_energy = 1.0f;
+	if (p_render_buffers->has_custom_data(RB_SCOPE_SVOGI)) {
+		Ref<RendererRD::GI::SVOGI> svogi = p_render_buffers->get_custom_data(RB_SCOPE_SVOGI);
+		if (svogi.is_valid() && svogi->octree_has_data && svogi->octree_nodes_buffer.is_valid()) {
+			svogi_octree_buffer = svogi->octree_nodes_buffer;
+			svogi_bounds_center = svogi->octree_bounds_center;
+			svogi_bounds_half_size = svogi->octree_bounds_half_size;
+			if (p_render_data->environment.is_valid()) {
+				svogi_energy = environment_get_svogi_energy(p_render_data->environment);
+			}
+		}
+	}
+
 	// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
 	// color (and, if the early pass ran, its partial depth contribution too) - never true here,
 	// matching this pass's existing pre-restructuring behavior.
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color);
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy);
 
 	// Rebuild Hi-Z once more, now from the fully-resolved depth (everything drawn this frame,
 	// including what this late pass itself just drew) - this becomes *next* frame's "last frame's

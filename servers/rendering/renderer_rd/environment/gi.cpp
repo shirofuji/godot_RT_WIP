@@ -2098,7 +2098,7 @@ void GI::SVOGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_r
 	}
 }
 
-void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_region, const PagedArray<RenderGeometryInstance *> &p_instances, float p_exposure_normalization) {
+void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_region, const PagedArray<RenderGeometryInstance *> &p_instances, float p_exposure_normalization, RID p_lights_buffer, uint32_t p_light_count) {
 	//print_line("rendering region " + itos(p_region));
 	ERR_FAIL_COND(p_render_buffers.is_null()); // we wouldn't be here if this failed but...
 	AABB bounds;
@@ -2199,6 +2199,17 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 			u.append_id(meshlet_storage->get_meshlet_material_buffer_rid());
 			uniforms.push_back(u);
 		}
+		{
+			// Binding 9 (Lights) for direct-light injection. Always declared by the MODE_VOXELIZE
+			// shader, so always provided; when no lights buffer was supplied (light_count stays 0
+			// in the push constant) a harmless already-valid buffer stands in - the shader's light
+			// loop runs zero iterations and never indexes it.
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 9;
+			u.append_id(p_lights_buffer.is_valid() ? p_lights_buffer : meshlet_storage->get_meshlet_material_buffer_rid());
+			uniforms.push_back(u);
+		}
 
 		// version index 1 = MODE_VOXELIZE (the variant that actually declares set 1's meshlet data
 		// bindings, per voxelize_modes' push_back order below) - version 0 (MODE_CLEAR) doesn't
@@ -2221,6 +2232,9 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 		push_constant.bounds_center[2] = center.z;
 		push_constant.bounds_half_size = bounds.size.x * 0.5;
 		push_constant.max_nodes = MAX_NODES;
+		push_constant.light_count = p_lights_buffer.is_valid() ? p_light_count : 0;
+		push_constant.pad[0] = 0;
+		push_constant.pad[1] = 0;
 
 		// Stash cascade 0's absolute world-space root bounds for downstream consumers that
 		// cone-trace the octree directly in world space (the meshlet renderer - see

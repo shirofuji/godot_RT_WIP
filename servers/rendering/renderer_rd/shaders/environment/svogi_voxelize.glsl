@@ -120,12 +120,73 @@ layout(set = 1, binding = 8, std430) restrict readonly buffer MeshletMaterials {
 	MeshletMaterial data[];
 } meshlet_materials;
 
+// Scene lights for direct-light injection - mirrors RenderForwardClustered::MeshletLightGPU /
+// meshlet_render.glsl's MeshletLight std430 layout exactly (64 bytes). Same buffer the meshlet
+// renderer is handed (RenderForwardClustered::_meshlet_collect_lights()). Used here so each
+// voxelized triangle stores LIT radiance (albedo * direct light) rather than raw albedo, turning
+// the cone trace's result from flat color-bleed into actual direct-bounce lighting.
+struct MeshletLight {
+	vec3 position;
+	float inv_radius;
+	vec3 direction;
+	float attenuation;
+	vec3 color; // Energy-premultiplied.
+	float size;
+	float cone_angle; // cos(angle) - spot lights only.
+	float cone_attenuation;
+	uint is_directional;
+	uint pad0;
+};
+
+layout(set = 1, binding = 9, std430) restrict readonly buffer Lights {
+	MeshletLight data[];
+} lights;
+
 layout(push_constant, std430) uniform Params {
 	vec3 bounds_center;
 	float bounds_half_size;
 	uint max_nodes;
-	uint pad[3];
+	uint light_count;
+	uint pad[2];
 } params;
+
+float voxel_omni_attenuation(float distance, float inv_range, float decay) {
+	float nd = distance * inv_range;
+	nd *= nd;
+	nd *= nd; // nd^4
+	nd = max(1.0 - nd, 0.0);
+	nd *= nd; // nd^2
+	return nd * pow(max(distance, 0.0001), -decay);
+}
+
+// Minimal Lambert (diffuse-only) direct lighting for a voxel at world position p_pos with geometric
+// normal p_normal - no specular/GGX (voxels are treated as ideal diffuse), no shadows. Mirrors the
+// directional/omni/spot selection in meshlet_render.glsl's light loop, but diffuse term only.
+vec3 voxel_direct_light(vec3 p_pos, vec3 p_normal) {
+	vec3 acc = vec3(0.0);
+	for (uint i = 0u; i < params.light_count; i++) {
+		vec3 L;
+		float attenuation = 1.0;
+		if (lights.data[i].is_directional != 0u) {
+			L = normalize(-lights.data[i].direction);
+		} else {
+			vec3 rel = lights.data[i].position - p_pos;
+			float len = length(rel);
+			L = rel / max(len, 0.0001);
+			attenuation = voxel_omni_attenuation(len, lights.data[i].inv_radius, lights.data[i].attenuation);
+			if (lights.data[i].cone_angle < 1.0) {
+				// Spot: same cos-cone falloff as meshlet_render.glsl's light_process_spot().
+				float cone_angle = lights.data[i].cone_angle;
+				float scos = max(dot(-L, lights.data[i].direction), cone_angle);
+				float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - cone_angle));
+				attenuation *= 1.0 - pow(spot_rim, lights.data[i].cone_attenuation);
+			}
+		}
+		float ndotl = max(dot(p_normal, L), 0.0);
+		acc += lights.data[i].color * (ndotl * attenuation);
+	}
+	return acc;
+}
 
 uint fetch_triangle_local_vertex(uint p_byte_index) {
 	uint word = meshlet_triangles.data[p_byte_index / 4u];
@@ -216,18 +277,28 @@ void main() {
 			node_idx = base_idx + child_idx;
 		}
 		
-		// Leaf node insertion - real material albedo/emission (same per-instance resolution the
-		// meshlet renderer itself uses, see InstanceMaterialIds/MeshletMaterials above), replacing
-		// the original hardcoded-white placeholder. Without this, SVOGI could only ever bounce
-		// flat white light regardless of the actual surface's color.
+		// Leaf node insertion. The `albedo` node field stores LIT RADIANCE (outgoing diffuse light),
+		// not raw albedo: radiance = material_albedo * direct_light + emission, computed here where
+		// the world position (tri_centroid) and geometric normal are available. This is the
+		// direct-light-injection step that turns the cone trace's output from flat surface-color
+		// bleed into actual one-bounce indirect lighting - the cone trace (meshlet_render.glsl) and
+		// the mipmap aggregation (svogi_mipmap.glsl) both already operate on this field, so storing
+		// radiance here is all that's needed downstream. Clamped to [0,1] for the R8G8B8A8 packing
+		// (HDR radiance storage - e.g. RGBE - is future work; for now the environment's SVOGI energy
+		// is the brightness knob and bright bounce simply saturates). Multiple triangles mapping to
+		// one voxel resolve via atomicMax (keeps the brightest contributor - a reasonable cheap
+		// approximation).
 		uint material_id = instance_material_ids.data[item.instance_index];
-		vec4 albedo = meshlet_materials.data[material_id].albedo;
-		uvec4 albedo_bytes = uvec4(clamp(albedo, vec4(0.0), vec4(1.0)) * 255.0 + 0.5);
-		uint packed_color = (albedo_bytes.r << 24u) | (albedo_bytes.g << 16u) | (albedo_bytes.b << 8u) | albedo_bytes.a;
+		vec3 mat_albedo = meshlet_materials.data[material_id].albedo.rgb;
+		vec3 mat_emission = meshlet_materials.data[material_id].emission;
+		vec3 radiance = mat_albedo * voxel_direct_light(tri_centroid, normal) + mat_emission;
+		uvec3 radiance_bytes = uvec3(clamp(radiance, vec3(0.0), vec3(1.0)) * 255.0 + 0.5);
+		uint packed_color = (radiance_bytes.r << 24u) | (radiance_bytes.g << 16u) | (radiance_bytes.b << 8u) | 255u;
 		atomicMax(nodes[node_idx].albedo, packed_color); // Use atomicMax to ensure it writes if 0
 
-		vec3 emission = meshlet_materials.data[material_id].emission;
-		uvec3 emission_bytes = uvec3(clamp(emission, vec3(0.0), vec3(1.0)) * 255.0 + 0.5);
+		// Raw emission kept in the emission field too (unused by the current cone trace, which reads
+		// the radiance in the albedo field - retained for potential future multi-bounce/emissive GI).
+		uvec3 emission_bytes = uvec3(clamp(mat_emission, vec3(0.0), vec3(1.0)) * 255.0 + 0.5);
 		uint packed_emission = (emission_bytes.r << 16u) | (emission_bytes.g << 8u) | emission_bytes.b;
 		atomicMax(nodes[node_idx].emission, packed_emission);
 
