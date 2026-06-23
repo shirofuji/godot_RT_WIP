@@ -98,7 +98,13 @@ public:
 	// see _meshlet_collect_lights()'s comment for why there's no real cluster-buffer spatial
 	// culling), p_light_count how many entries it holds. Both ignored when p_depth_only is true
 	// (p_lights_buffer may be an invalid RID and p_light_count 0 in that case).
-	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear = true, bool p_depth_only = false, const Color &p_ambient_color = Color(0, 0, 0, 0));
+	// p_svogi_octree_buffer/p_svogi_bounds_*/p_svogi_energy: SVOGI sparse-voxel-octree GI (see
+	// meshlet_render.glsl's svogi_cone_trace()). p_svogi_bounds_half_size == 0 means SVOGI is off /
+	// has no data this frame - the fragment shader skips the trace, and p_svogi_octree_buffer may
+	// then be an invalid RID (a harmless fallback buffer is bound in its place, never indexed).
+	// bounds are absolute world space (the octree is built in absolute world space). All ignored
+	// when p_depth_only is true.
+	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear = true, bool p_depth_only = false, const Color &p_ambient_color = Color(0, 0, 0, 0), RID p_svogi_octree_buffer = RID(), const Vector3 &p_svogi_bounds_center = Vector3(), float p_svogi_bounds_half_size = 0.0f, float p_svogi_energy = 1.0f);
 
 	MeshletRenderer();
 	~MeshletRenderer();

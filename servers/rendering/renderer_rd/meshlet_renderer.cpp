@@ -159,7 +159,7 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	cached_format = p_framebuffer_format;
 }
 
-void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only, const Color &p_ambient_color) {
+void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only, const Color &p_ambient_color, RID p_svogi_octree_buffer, const Vector3 &p_svogi_bounds_center, float p_svogi_bounds_half_size, float p_svogi_energy) {
 	ERR_FAIL_NULL(MeshletStorage::get_singleton());
 
 	_ensure_pipeline(p_framebuffer_format, p_depth_only);
@@ -265,14 +265,32 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			u.append_id(p_lights_buffer);
 			uniforms.push_back(u);
 		}
+		if (!p_depth_only) {
+			// Binding 10 (SVOGINodes) - same depth-only exclusion reasoning as 8/9. The descriptor
+			// set layout always declares this binding for the non-depth-only shader, so it must
+			// always be provided; when SVOGI is off / has no octree this frame (octree RID invalid)
+			// a harmless already-valid storage buffer stands in - the fragment shader never indexes
+			// it in that case (svogi_bounds.w == 0 short-circuits the trace).
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 10;
+			u.append_id(p_svogi_octree_buffer.is_valid() ? p_svogi_octree_buffer : storage->get_meshlet_material_buffer_rid());
+			uniforms.push_back(u);
+		}
 		RID render_shader_rid_to_use = p_depth_only ? depth_only_shader_rid : render_shader_rid;
 		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, render_shader_rid_to_use, 0);
 
+		// Matches meshlet_render.glsl's Params push-constant block exactly (128 bytes). The same
+		// block is declared (outside any MESHLET_DEPTH_ONLY guard) by both the color and depth-only
+		// vertex shaders, so this single struct/size is correct for both pipelines; the depth-only
+		// path just leaves the color/ambient/svogi fields zeroed.
 		struct RenderPushConstant {
 			float view_projection[16];
 			float camera_position[3];
 			uint32_t light_count;
 			float ambient_color[4]; // .rgb = pre-multiplied color*energy (linear), .a = reserved
+			float svogi_bounds[4]; // xyz = octree root center (absolute world), w = root half-size (0 = SVOGI off)
+			float svogi_params[4]; // x = energy, yzw reserved
 		};
 		RenderPushConstant push_constant;
 		Projection vp = p_projection * Projection(p_camera_transform.affine_inverse());
@@ -289,6 +307,17 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		push_constant.ambient_color[1] = p_depth_only ? 0.0f : p_ambient_color.g;
 		push_constant.ambient_color[2] = p_depth_only ? 0.0f : p_ambient_color.b;
 		push_constant.ambient_color[3] = 0.0f;
+		// svogi_bounds.w (root half-size) == 0 signals "SVOGI off / no data" to the shader, which
+		// then skips the trace entirely - so zero it whenever depth-only or no octree was supplied.
+		bool svogi_active = !p_depth_only && p_svogi_bounds_half_size > 0.0f;
+		push_constant.svogi_bounds[0] = svogi_active ? (float)p_svogi_bounds_center.x : 0.0f;
+		push_constant.svogi_bounds[1] = svogi_active ? (float)p_svogi_bounds_center.y : 0.0f;
+		push_constant.svogi_bounds[2] = svogi_active ? (float)p_svogi_bounds_center.z : 0.0f;
+		push_constant.svogi_bounds[3] = svogi_active ? p_svogi_bounds_half_size : 0.0f;
+		push_constant.svogi_params[0] = svogi_active ? p_svogi_energy : 0.0f;
+		push_constant.svogi_params[1] = 0.0f;
+		push_constant.svogi_params[2] = 0.0f;
+		push_constant.svogi_params[3] = 0.0f;
 
 		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : cached_pipeline);
 		RD::get_singleton()->draw_list_bind_vertex_array(draw_list, empty_vertex_array);

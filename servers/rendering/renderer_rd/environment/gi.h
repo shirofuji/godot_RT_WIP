@@ -730,6 +730,17 @@ public:
 		RID atomic_counter_buffer;
 		RID octree_uniform_set;
 
+		// Absolute world-space root bounds the octree was most recently voxelized against (set in
+		// render_region() for cascade 0 - the finest cascade). The octree is built in plain
+		// absolute world space (voxelize transforms vertices by their full model matrix and
+		// compares against bounds.get_center()), so consumers that already have absolute world
+		// positions (e.g. the meshlet renderer's fragment shader) can cone-trace it directly
+		// against these bounds without any camera-relative-space conversion. octree_has_data is
+		// false until the first cascade-0 voxelization completes.
+		Vector3 octree_bounds_center;
+		float octree_bounds_half_size = 0.0;
+		bool octree_has_data = false;
+
 		// Uniforms for SVOGI Compute Passes
 		RID svogi_voxelize_uniform_set;
 		RID svogi_build_uniform_set;

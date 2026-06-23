@@ -14,6 +14,8 @@ layout(push_constant, std430) uniform Params {
 	vec3 camera_position;
 	uint light_count;
 	vec4 ambient_color; // .rgb = pre-multiplied color*energy (linear), .a = reserved
+	vec4 svogi_bounds; // .xyz = octree root center (absolute world), .w = root half-size (0 = SVOGI off)
+	vec4 svogi_params; // .x = energy, .yzw reserved
 }
 params;
 
@@ -191,6 +193,8 @@ layout(push_constant, std430) uniform Params {
 	vec3 camera_position;
 	uint light_count;
 	vec4 ambient_color; // .rgb = pre-multiplied color*energy (linear), .a = reserved
+	vec4 svogi_bounds; // .xyz = octree root center (absolute world), .w = root half-size (0 = SVOGI off)
+	vec4 svogi_params; // .x = energy, .yzw reserved
 }
 params;
 
@@ -247,6 +251,32 @@ layout(set = 0, binding = 9, std430) restrict readonly buffer Lights {
 	MeshletLight data[];
 }
 lights;
+
+// SVOGI sparse-voxel-octree GI (see servers/rendering/renderer_rd/environment/gi.cpp and
+// svogi_voxelize.glsl). Mirrors svogi_voxelize.glsl's Node struct exactly (32 bytes). The octree
+// is built in plain ABSOLUTE world space (voxelize transforms each vertex by its full model matrix
+// and inserts at its absolute world position), so this fragment shader - which already has
+// world_pos_interp/world_normal_interp in absolute world space - cone-traces it directly, with no
+// camera-relative-space conversion (unlike Forward+'s scene_forward_gi_inc.glsl, which works in a
+// camera-centered space). The root bounds (params.svogi_bounds) are the exact absolute-world AABB
+// voxelize used for cascade 0, threaded in via push constant. When params.svogi_bounds.w (the root
+// half-size) is 0, SVOGI is off / has no data this frame and the trace is skipped entirely (so the
+// buffer below may legitimately be a harmless fallback that's never indexed).
+struct SVOGINode {
+	uint children_base_index;
+	uint child_mask;
+	uint albedo;
+	uint normal;
+	uint emission;
+	uint pad0;
+	uint pad1;
+	uint pad2;
+};
+
+layout(set = 0, binding = 10, std430) restrict readonly buffer SVOGINodes {
+	SVOGINode data[];
+}
+svogi_nodes;
 
 const float M_PI = 3.14159265358979323846;
 
@@ -353,6 +383,74 @@ void light_process_spot(uint idx, vec3 vertex, vec3 N, vec3 V, vec3 f0, float ro
 	light_compute(N, L, V, lights.data[idx].color, false, attenuation, f0, roughness, metallic, specular_amount, albedo, diffuse_light, specular_light);
 }
 
+// Diffuse cone-march of the SVOGI octree, in absolute world space. Adapted from
+// scene_forward_gi_inc.glsl's svogi_cone_trace(), but simplified: bounds come straight from the
+// push constant (the absolute-world AABB voxelize actually used for cascade 0) instead of being
+// reconstructed from a camera-relative cascade UBO, and the octree root is treated as cubic with
+// half-extent bounds_half (matching voxelize, which uses bounds.size.x*0.5 for a cubic root even
+// when the source AABB isn't cubic). Returns rgb = accumulated incident radiance, a = coverage.
+vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distance, float bias, vec3 bounds_center, float bounds_half, float energy) {
+	vec4 color = vec4(0.0);
+	float dist = bias;
+
+	while (dist < max_distance && color.a < 0.95) {
+		float diameter = max(1.0, 2.0 * tan_half_angle * dist);
+		vec3 sample_pos = pos + dir * dist;
+
+		vec3 d = abs(sample_pos - bounds_center);
+		if (d.x > bounds_half || d.y > bounds_half || d.z > bounds_half) {
+			break; // Left the octree's bounds.
+		}
+
+		uint node_idx = 0u;
+		vec3 current_center = bounds_center;
+		float current_half = bounds_half;
+		vec4 voxel_color = vec4(0.0);
+		float target_size = max(diameter, current_half / 64.0); // 6 levels: leaf = bounds/64.
+
+		for (uint depth = 0u; depth < 6u; depth++) {
+			bvec3 is_pos = greaterThan(sample_pos, current_center);
+			uint child_idx = (is_pos.x ? 1u : 0u) | ((is_pos.y ? 1u : 0u) << 1) | ((is_pos.z ? 1u : 0u) << 2);
+
+			if ((svogi_nodes.data[node_idx].child_mask & (1u << child_idx)) == 0u) {
+				break; // Empty space.
+			}
+			uint base_idx = svogi_nodes.data[node_idx].children_base_index;
+			if (base_idx == 0u) {
+				break; // No children allocated.
+			}
+			node_idx = base_idx + child_idx;
+
+			vec3 offset = vec3(is_pos.x ? 1.0 : -1.0, is_pos.y ? 1.0 : -1.0, is_pos.z ? 1.0 : -1.0);
+			current_half *= 0.5;
+			current_center += offset * current_half;
+
+			// Internal nodes hold mipmap-aggregated data (see svogi_mipmap.glsl), so sampling a
+			// coarser level for a wide cone is correct, not just empty.
+			if (current_half * 2.0 <= target_size || depth == 5u) {
+				uint albedo_packed = svogi_nodes.data[node_idx].albedo;
+				if (albedo_packed != 0u) {
+					vec3 vox_albedo = vec3(
+							float((albedo_packed >> 24u) & 0xFFu),
+							float((albedo_packed >> 16u) & 0xFFu),
+							float((albedo_packed >> 8u) & 0xFFu)) /
+							255.0;
+					voxel_color = vec4(vox_albedo * energy, 1.0);
+				}
+				break;
+			}
+		}
+
+		if (voxel_color.a > 0.0) {
+			float a = (1.0 - color.a);
+			color += a * voxel_color;
+		}
+		dist += max(0.5, diameter * 0.5);
+	}
+
+	return color;
+}
+
 #endif
 
 void main() {
@@ -377,7 +475,21 @@ void main() {
 		}
 	}
 
-	vec3 color = albedo * (1.0 - mat.metallic) * (diffuse_light + params.ambient_color.rgb) + specular_light + mat.emission;
+	// SVOGI indirect-diffuse bounce (params.svogi_bounds.w > 0 means the octree has data this
+	// frame - see svogi_bounds' push-constant comment). A single wide diffuse cone along the
+	// surface normal: a coarse, cheap first-cut "is there bounced light arriving roughly from the
+	// hemisphere I face" - not a full multi-cone hemisphere integration. Folded into diffuse_light
+	// so it picks up the same albedo*(1-metallic) modulation as direct/ambient diffuse below. Bias
+	// of one root-voxel step pushes the cone start off this surface so it doesn't immediately
+	// self-intersect the voxel it sits in.
+	vec3 gi_diffuse = vec3(0.0);
+	if (params.svogi_bounds.w > 0.0) {
+		float voxel_size = params.svogi_bounds.w / 32.0; // root half-size / 32 ~= leaf diameter.
+		vec4 gi = svogi_cone_trace(world_pos_interp, N, 1.0, params.svogi_bounds.w * 2.0, voxel_size, params.svogi_bounds.xyz, params.svogi_bounds.w, params.svogi_params.x);
+		gi_diffuse = gi.rgb;
+	}
+
+	vec3 color = albedo * (1.0 - mat.metallic) * (diffuse_light + params.ambient_color.rgb + gi_diffuse) + specular_light + mat.emission;
 	frag_color = vec4(color, mat.albedo.a);
 #endif
 	// MESHLET_DEPTH_ONLY: no color output at all - this variant targets a depth-only

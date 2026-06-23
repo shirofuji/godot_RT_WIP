@@ -2222,6 +2222,17 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 		push_constant.bounds_half_size = bounds.size.x * 0.5;
 		push_constant.max_nodes = MAX_NODES;
 
+		// Stash cascade 0's absolute world-space root bounds for downstream consumers that
+		// cone-trace the octree directly in world space (the meshlet renderer - see
+		// octree_bounds_center/half_size's declaration). Cascade 0 is the finest/nearest cascade,
+		// the most useful single cascade for a first-cut GI read; the multi-cascade octree's full
+		// coherence is a separate, larger concern.
+		if (cascade == 0) {
+			octree_bounds_center = center;
+			octree_bounds_half_size = bounds.size.x * 0.5;
+			octree_has_data = true;
+		}
+
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(SVOGIShader::VoxelizePushConstant));
 		
 		uint32_t dispatch_x = (max_visible + 63) / 64;
