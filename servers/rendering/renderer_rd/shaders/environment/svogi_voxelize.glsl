@@ -125,8 +125,60 @@ void main() {
 		vec3 v1 = (transform * vec4(vertex_positions.data[g1].xyz, 1.0)).xyz;
 		vec3 v2 = (transform * vec4(vertex_positions.data[g2].xyz, 1.0)).xyz;
 		
-		// TODO: Compute voxel intersection with triangle (v0, v1, v2)
-		// and atomically insert into octree.
+		// Approximate voxel insertion with the centroid of the triangle
+		vec3 centroid = (v0 + v1 + v2) / 3.0;
+		vec3 normal = normalize(cross(v1 - v0, v2 - v0));
+		
+		// Skip if outside bounds
+		vec3 diff = abs(centroid - params.bounds_center);
+		if (diff.x > params.bounds_half_size || diff.y > params.bounds_half_size || diff.z > params.bounds_half_size) {
+			continue;
+		}
+		
+		uint node_idx = 0;
+		vec3 current_center = params.bounds_center;
+		float current_half_size = params.bounds_half_size;
+		
+		// Traverse and build up to 7 levels deep (root + 6)
+		for (uint depth = 0; depth < 6; depth++) {
+			bvec3 is_pos = greaterThan(centroid, current_center);
+			uint child_idx = (is_pos.x ? 1u : 0u) | ((is_pos.y ? 1u : 0u) << 1) | ((is_pos.z ? 1u : 0u) << 2);
+			
+			vec3 offset = vec3(is_pos) * 2.0 - 1.0;
+			current_half_size *= 0.5;
+			current_center += offset * current_half_size;
+			
+			uint base_idx = nodes[node_idx].children_base_index;
+			if (base_idx == 0u) {
+				uint new_base = atomicAdd(alloc_counter, 8u);
+				if (new_base >= params.max_nodes - 8u) {
+					break; // Out of memory
+				}
+				uint old_val = atomicCompSwap(nodes[node_idx].children_base_index, 0u, new_base);
+				if (old_val != 0u) {
+					// Another thread allocated first, use theirs
+					base_idx = old_val;
+				} else {
+					base_idx = new_base;
+				}
+			}
+			
+			atomicOr(nodes[node_idx].child_mask, 1u << child_idx);
+			node_idx = base_idx + child_idx;
+		}
+		
+		// Leaf node insertion
+		// Simple encoding for albedo (e.g., solid white for prototype if we don't have texture mapping here)
+		uint packed_color = 0xFFFFFFFFu; // R8G8B8A8 white
+		atomicMax(nodes[node_idx].albedo, packed_color); // Use atomicMax to ensure it writes if 0
+		
+		// Pack normal: 8-bit xyz mapped to 0-255
+		vec3 n = normal * 0.5 + 0.5;
+		uint nx = uint(n.x * 255.0) & 0xFFu;
+		uint ny = uint(n.y * 255.0) & 0xFFu;
+		uint nz = uint(n.z * 255.0) & 0xFFu;
+		uint packed_normal = (nx << 16) | (ny << 8) | nz;
+		atomicMax(nodes[node_idx].normal, packed_normal);
 	}
 }
 #endif
