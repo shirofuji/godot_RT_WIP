@@ -290,13 +290,9 @@ private:
 			int32_t step_size;
 
 			int32_t half_size;
-			uint32_t use_occlusion;
-			uint32_t is_first;
-			uint32_t is_half;
-
 			uint32_t occlusion_index;
 			int32_t cascade;
-			uint32_t pad[2];
+			uint32_t pad;
 		};
 
 		struct VoxelizePushConstant {
