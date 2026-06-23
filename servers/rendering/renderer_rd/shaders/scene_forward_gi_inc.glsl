@@ -173,7 +173,9 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 			current_center += offset * current_half_size;
 			
 			// If we reached the target voxel size, stop and sample
-			if (current_half_size * 2.0 <= target_size || depth == 5u) {
+			// PROTOTYPE FIX: We haven't implemented the mipmap pass yet, so internal nodes have 0 albedo.
+			// Force it to always sample the leaf node (depth == 5u) to see the shadows.
+			if (depth == 5u) {
 				uint albedo_packed = svogi_nodes[node_idx].albedo;
 				if (albedo_packed != 0u) {
 					// Unpack R8G8B8A8
