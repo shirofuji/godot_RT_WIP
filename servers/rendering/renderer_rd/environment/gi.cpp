@@ -1156,7 +1156,7 @@ void GI::SVOGI::create(RID p_env, const Vector3 &p_world_position, uint32_t p_re
 			u.append_id(atomic_counter_buffer);
 			uniforms.push_back(u);
 		}
-		octree_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.voxelize_shader, 0);
+		octree_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.voxelize.version_get_shader(gi->svogi_shader.voxelize_shader, 0), 0);
 	}
 }
 
@@ -1661,7 +1661,7 @@ void GI::SVOGI::debug_draw(uint32_t p_view_count, const Projection *p_projection
 				u.append_id(lightprobe_texture);
 				uniforms.push_back(u);
 			}
-			debug_uniform_set[v] = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.debug_shader_version, 0);
+			debug_uniform_set[v] = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.debug.version_get_shader(gi->svogi_shader.debug_shader_version, 0), 0);
 		}
 
 		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
@@ -2179,7 +2179,7 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 			uniforms.push_back(u);
 		}
 
-		RID uniform_set_1 = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.voxelize_shader, 1);
+		RID uniform_set_1 = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.voxelize.version_get_shader(gi->svogi_shader.voxelize_shader, 0), 1);
 
 		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, gi->svogi_shader.voxelize_pipeline.get_rid());
