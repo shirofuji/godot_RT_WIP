@@ -2073,7 +2073,7 @@ void RenderForwardClustered::_render_meshlet_early_depth_pass(RenderDataRD *p_re
 	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_depth_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, RID(), 0, true, true);
 }
 
-void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer) {
+void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer, const Color &p_default_bg_color) {
 	if (p_render_buffers.is_null() || !p_color_only_framebuffer.is_valid()) {
 		return;
 	}
@@ -2135,10 +2135,35 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	Vector<MeshletLightGPU> lights = _meshlet_collect_lights(p_render_data);
 	RID lights_buffer = meshlet_lights_buffer_rid(lights);
 
+	// Compute ambient color for the meshlet shader, mirroring Forward+'s UBO logic
+	// (render_scene_data_rd.cpp lines 159-196). Does not include sky cubemap contribution
+	// (would require binding the radiance texture to the meshlet shader - future work).
+	Color meshlet_ambient_color(0, 0, 0, 0);
+	RID env = p_render_data->environment;
+	if (env.is_valid()) {
+		RSE::EnvironmentAmbientSource ambient_src = environment_get_ambient_source(env);
+		RSE::EnvironmentBG env_bg = environment_get_background(env);
+		float bg_energy_multiplier = environment_get_bg_energy_multiplier(env);
+
+		if (ambient_src == RSE::ENV_AMBIENT_SOURCE_BG && (env_bg == RSE::ENV_BG_CLEAR_COLOR || env_bg == RSE::ENV_BG_COLOR)) {
+			Color color = (env_bg == RSE::ENV_BG_CLEAR_COLOR) ? p_default_bg_color : environment_get_bg_color(env);
+			color = color.srgb_to_linear();
+			meshlet_ambient_color = Color(color.r * bg_energy_multiplier, color.g * bg_energy_multiplier, color.b * bg_energy_multiplier, 1.0);
+		} else {
+			float energy = environment_get_ambient_light_energy(env);
+			Color color = environment_get_ambient_light(env).srgb_to_linear();
+			bool use_ambient_cubemap = (ambient_src == RSE::ENV_AMBIENT_SOURCE_BG && env_bg == RSE::ENV_BG_SKY) || ambient_src == RSE::ENV_AMBIENT_SOURCE_SKY;
+			bool use_ambient_light = use_ambient_cubemap || ambient_src == RSE::ENV_AMBIENT_SOURCE_COLOR;
+			if (use_ambient_light) {
+				meshlet_ambient_color = Color(color.r * energy, color.g * energy, color.b * energy, 1.0);
+			}
+		}
+	}
+
 	// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
 	// color (and, if the early pass ran, its partial depth contribution too) - never true here,
 	// matching this pass's existing pre-restructuring behavior.
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false);
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color);
 
 	// Rebuild Hi-Z once more, now from the fully-resolved depth (everything drawn this frame,
 	// including what this late pass itself just drew) - this becomes *next* frame's "last frame's
@@ -2806,7 +2831,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE, p_render_data);
 	}
 
-	_render_meshlet_late_pass(p_render_data, rb, color_only_framebuffer);
+	_render_meshlet_late_pass(p_render_data, rb, color_only_framebuffer, p_default_bg_color);
 
 	if (debug_voxelgis) {
 		Projection dc;

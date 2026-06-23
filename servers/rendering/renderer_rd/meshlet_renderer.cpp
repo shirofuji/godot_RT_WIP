@@ -159,7 +159,7 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	cached_format = p_framebuffer_format;
 }
 
-void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only) {
+void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only, const Color &p_ambient_color) {
 	ERR_FAIL_NULL(MeshletStorage::get_singleton());
 
 	_ensure_pipeline(p_framebuffer_format, p_depth_only);
@@ -272,6 +272,7 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			float view_projection[16];
 			float camera_position[3];
 			uint32_t light_count;
+			float ambient_color[4]; // .rgb = pre-multiplied color*energy (linear), .a = reserved
 		};
 		RenderPushConstant push_constant;
 		Projection vp = p_projection * Projection(p_camera_transform.affine_inverse());
@@ -284,6 +285,10 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		push_constant.camera_position[1] = p_camera_transform.origin.y;
 		push_constant.camera_position[2] = p_camera_transform.origin.z;
 		push_constant.light_count = p_depth_only ? 0 : p_light_count;
+		push_constant.ambient_color[0] = p_depth_only ? 0.0f : p_ambient_color.r;
+		push_constant.ambient_color[1] = p_depth_only ? 0.0f : p_ambient_color.g;
+		push_constant.ambient_color[2] = p_depth_only ? 0.0f : p_ambient_color.b;
+		push_constant.ambient_color[3] = 0.0f;
 
 		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : cached_pipeline);
 		RD::get_singleton()->draw_list_bind_vertex_array(draw_list, empty_vertex_array);

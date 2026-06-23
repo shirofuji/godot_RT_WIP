@@ -13,6 +13,7 @@ layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
 	vec3 camera_position;
 	uint light_count;
+	vec4 ambient_color; // .rgb = pre-multiplied color*energy (linear), .a = reserved
 }
 params;
 
@@ -182,6 +183,7 @@ layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
 	vec3 camera_position;
 	uint light_count;
+	vec4 ambient_color; // .rgb = pre-multiplied color*energy (linear), .a = reserved
 }
 params;
 
@@ -368,7 +370,7 @@ void main() {
 		}
 	}
 
-	vec3 color = albedo * (1.0 - mat.metallic) * diffuse_light + specular_light + mat.emission;
+	vec3 color = albedo * (1.0 - mat.metallic) * (diffuse_light + params.ambient_color.rgb) + specular_light + mat.emission;
 	frag_color = vec4(color, mat.albedo.a);
 #endif
 	// MESHLET_DEPTH_ONLY: no color output at all - this variant targets a depth-only
