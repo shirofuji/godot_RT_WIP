@@ -129,7 +129,14 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 	
 	// We will use Cascade 0 bounds for this prototype
 	vec3 bounds_half_extents = vec3(1.0 / svogi.cascades[0].to_cell) * svogi.grid_size * 0.5;
-	vec3 bounds_center = svogi.cascades[0].position;
+	// cascades[0].position is the world-space offset of the grid's (0,0,0) CORNER, not its
+	// center (see GI::SVOGI::ProbeCascadeData::position's own comment in gi.h: "offset of (0,0,0)
+	// in world coordinates") - the octree was voxelized using the AABB's true center
+	// (bounds.get_center(), in GI::SVOGI::render_region/the voxelize push constant), so treating
+	// this corner offset as the center here misaligns every top-down octree traversal by half the
+	// grid's extent, walking down the wrong child at every level and never reaching the populated
+	// voxels - confirmed as the root cause of SVOGI producing no visible indirect light at all.
+	vec3 bounds_center = svogi.cascades[0].position + bounds_half_extents;
 	
 	while (dist < max_distance && color.a < 0.95) {
 		float diameter = max(1.0, 2.0 * tan_half_angle * dist);
