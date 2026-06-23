@@ -131,7 +131,16 @@ void main() {
 	// orientation, confirmed via direct side-by-side screenshot comparison.
 	vec3 local_normal = oct_decode_normal(attrib.xy);
 	local_normal.z = -local_normal.z;
-	vec3 world_normal = normalize(mat3(transform) * local_normal);
+	// Normals need the inverse-transpose of the model matrix, not the model matrix itself, to
+	// transform correctly under non-uniform scale (a uniformly-scaled or unscaled transform would
+	// be fine with mat3(transform) directly, but this pipeline has no per-instance "is this
+	// uniform scale" flag to take that cheaper path conditionally like Forward+'s own
+	// model_normal_matrix does - scene_forward_clustered.glsl checks
+	// INSTANCE_FLAGS_NON_UNIFORM_SCALE per-instance and only pays for the inverse when needed).
+	// Always paying for it here is correct for every transform and cheap enough at this pipeline's
+	// vertex-shader scale not to matter.
+	mat3 normal_matrix = transpose(inverse(mat3(transform)));
+	vec3 world_normal = normalize(normal_matrix * local_normal);
 
 	world_normal_interp = world_normal;
 	world_pos_interp = world_pos;
