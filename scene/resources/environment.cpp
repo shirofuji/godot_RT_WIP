@@ -469,138 +469,138 @@ void Environment::_update_ssil() {
 			ssil_normal_rejection);
 }
 
-// SDFGI
+// SVOGI
 
-void Environment::set_sdfgi_enabled(bool p_enabled) {
-	sdfgi_enabled = p_enabled;
-	_update_sdfgi();
+void Environment::set_svogi_enabled(bool p_enabled) {
+	svogi_enabled = p_enabled;
+	_update_svogi();
 }
 
-bool Environment::is_sdfgi_enabled() const {
-	return sdfgi_enabled;
+bool Environment::is_svogi_enabled() const {
+	return svogi_enabled;
 }
 
-void Environment::set_sdfgi_cascades(int p_cascades) {
-	ERR_FAIL_COND_MSG(p_cascades < 1 || p_cascades > 8, "Invalid number of SDFGI cascades (must be between 1 and 8).");
-	sdfgi_cascades = p_cascades;
-	_update_sdfgi();
+void Environment::set_svogi_cascades(int p_cascades) {
+	ERR_FAIL_COND_MSG(p_cascades < 1 || p_cascades > 8, "Invalid number of SVOGI cascades (must be between 1 and 8).");
+	svogi_cascades = p_cascades;
+	_update_svogi();
 }
 
-int Environment::get_sdfgi_cascades() const {
-	return sdfgi_cascades;
+int Environment::get_svogi_cascades() const {
+	return svogi_cascades;
 }
 
-void Environment::set_sdfgi_min_cell_size(float p_size) {
-	sdfgi_min_cell_size = p_size;
-	_update_sdfgi();
+void Environment::set_svogi_min_cell_size(float p_size) {
+	svogi_min_cell_size = p_size;
+	_update_svogi();
 }
 
-float Environment::get_sdfgi_min_cell_size() const {
-	return sdfgi_min_cell_size;
+float Environment::get_svogi_min_cell_size() const {
+	return svogi_min_cell_size;
 }
 
-void Environment::set_sdfgi_max_distance(float p_distance) {
+void Environment::set_svogi_max_distance(float p_distance) {
 	p_distance /= 64.0;
-	for (int i = 0; i < sdfgi_cascades; i++) {
+	for (int i = 0; i < svogi_cascades; i++) {
 		p_distance *= 0.5; //halve for each cascade
 	}
-	sdfgi_min_cell_size = p_distance;
-	_update_sdfgi();
+	svogi_min_cell_size = p_distance;
+	_update_svogi();
 }
 
-float Environment::get_sdfgi_max_distance() const {
-	float md = sdfgi_min_cell_size;
+float Environment::get_svogi_max_distance() const {
+	float md = svogi_min_cell_size;
 	md *= 64.0;
-	for (int i = 0; i < sdfgi_cascades; i++) {
+	for (int i = 0; i < svogi_cascades; i++) {
 		md *= 2.0;
 	}
 	return md;
 }
 
-void Environment::set_sdfgi_cascade0_distance(float p_distance) {
-	sdfgi_min_cell_size = p_distance / 64.0;
-	_update_sdfgi();
+void Environment::set_svogi_cascade0_distance(float p_distance) {
+	svogi_min_cell_size = p_distance / 64.0;
+	_update_svogi();
 }
 
-float Environment::get_sdfgi_cascade0_distance() const {
-	return sdfgi_min_cell_size * 64.0;
+float Environment::get_svogi_cascade0_distance() const {
+	return svogi_min_cell_size * 64.0;
 }
 
-void Environment::set_sdfgi_y_scale(SDFGIYScale p_y_scale) {
-	sdfgi_y_scale = p_y_scale;
-	_update_sdfgi();
+void Environment::set_svogi_y_scale(SVOGIYScale p_y_scale) {
+	svogi_y_scale = p_y_scale;
+	_update_svogi();
 }
 
-Environment::SDFGIYScale Environment::get_sdfgi_y_scale() const {
-	return sdfgi_y_scale;
+Environment::SVOGIYScale Environment::get_svogi_y_scale() const {
+	return svogi_y_scale;
 }
 
-void Environment::set_sdfgi_use_occlusion(bool p_enabled) {
-	sdfgi_use_occlusion = p_enabled;
-	_update_sdfgi();
+void Environment::set_svogi_use_occlusion(bool p_enabled) {
+	svogi_use_occlusion = p_enabled;
+	_update_svogi();
 }
 
-bool Environment::is_sdfgi_using_occlusion() const {
-	return sdfgi_use_occlusion;
+bool Environment::is_svogi_using_occlusion() const {
+	return svogi_use_occlusion;
 }
 
-void Environment::set_sdfgi_bounce_feedback(float p_amount) {
-	sdfgi_bounce_feedback = p_amount;
-	_update_sdfgi();
+void Environment::set_svogi_bounce_feedback(float p_amount) {
+	svogi_bounce_feedback = p_amount;
+	_update_svogi();
 }
-float Environment::get_sdfgi_bounce_feedback() const {
-	return sdfgi_bounce_feedback;
-}
-
-void Environment::set_sdfgi_read_sky_light(bool p_enabled) {
-	sdfgi_read_sky_light = p_enabled;
-	_update_sdfgi();
+float Environment::get_svogi_bounce_feedback() const {
+	return svogi_bounce_feedback;
 }
 
-bool Environment::is_sdfgi_reading_sky_light() const {
-	return sdfgi_read_sky_light;
+void Environment::set_svogi_read_sky_light(bool p_enabled) {
+	svogi_read_sky_light = p_enabled;
+	_update_svogi();
 }
 
-void Environment::set_sdfgi_energy(float p_energy) {
-	sdfgi_energy = p_energy;
-	_update_sdfgi();
+bool Environment::is_svogi_reading_sky_light() const {
+	return svogi_read_sky_light;
 }
 
-float Environment::get_sdfgi_energy() const {
-	return sdfgi_energy;
+void Environment::set_svogi_energy(float p_energy) {
+	svogi_energy = p_energy;
+	_update_svogi();
 }
 
-void Environment::set_sdfgi_normal_bias(float p_bias) {
-	sdfgi_normal_bias = p_bias;
-	_update_sdfgi();
+float Environment::get_svogi_energy() const {
+	return svogi_energy;
 }
 
-float Environment::get_sdfgi_normal_bias() const {
-	return sdfgi_normal_bias;
+void Environment::set_svogi_normal_bias(float p_bias) {
+	svogi_normal_bias = p_bias;
+	_update_svogi();
 }
 
-void Environment::set_sdfgi_probe_bias(float p_bias) {
-	sdfgi_probe_bias = p_bias;
-	_update_sdfgi();
+float Environment::get_svogi_normal_bias() const {
+	return svogi_normal_bias;
 }
 
-float Environment::get_sdfgi_probe_bias() const {
-	return sdfgi_probe_bias;
+void Environment::set_svogi_probe_bias(float p_bias) {
+	svogi_probe_bias = p_bias;
+	_update_svogi();
 }
 
-void Environment::_update_sdfgi() {
-	RS::get_singleton()->environment_set_sdfgi(
+float Environment::get_svogi_probe_bias() const {
+	return svogi_probe_bias;
+}
+
+void Environment::_update_svogi() {
+	RS::get_singleton()->environment_set_svogi(
 			environment,
-			sdfgi_enabled,
-			sdfgi_cascades,
-			sdfgi_min_cell_size,
-			RSE::EnvironmentSDFGIYScale(sdfgi_y_scale),
-			sdfgi_use_occlusion,
-			sdfgi_bounce_feedback,
-			sdfgi_read_sky_light,
-			sdfgi_energy,
-			sdfgi_normal_bias,
-			sdfgi_probe_bias);
+			svogi_enabled,
+			svogi_cascades,
+			svogi_min_cell_size,
+			RSE::EnvironmentSVOGIYScale(svogi_y_scale),
+			svogi_use_occlusion,
+			svogi_bounce_feedback,
+			svogi_read_sky_light,
+			svogi_energy,
+			svogi_normal_bias,
+			svogi_probe_bias);
 }
 
 // Glow
@@ -1387,48 +1387,48 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "ssil_sharpness", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_ssil_sharpness", "get_ssil_sharpness");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "ssil_normal_rejection", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_ssil_normal_rejection", "get_ssil_normal_rejection");
 
-	// SDFGI
+	// SVOGI
 
-	ClassDB::bind_method(D_METHOD("set_sdfgi_enabled", "enabled"), &Environment::set_sdfgi_enabled);
-	ClassDB::bind_method(D_METHOD("is_sdfgi_enabled"), &Environment::is_sdfgi_enabled);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_cascades", "amount"), &Environment::set_sdfgi_cascades);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_cascades"), &Environment::get_sdfgi_cascades);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_min_cell_size", "size"), &Environment::set_sdfgi_min_cell_size);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_min_cell_size"), &Environment::get_sdfgi_min_cell_size);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_max_distance", "distance"), &Environment::set_sdfgi_max_distance);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_max_distance"), &Environment::get_sdfgi_max_distance);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_cascade0_distance", "distance"), &Environment::set_sdfgi_cascade0_distance);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_cascade0_distance"), &Environment::get_sdfgi_cascade0_distance);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_y_scale", "scale"), &Environment::set_sdfgi_y_scale);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_y_scale"), &Environment::get_sdfgi_y_scale);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_use_occlusion", "enable"), &Environment::set_sdfgi_use_occlusion);
-	ClassDB::bind_method(D_METHOD("is_sdfgi_using_occlusion"), &Environment::is_sdfgi_using_occlusion);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_bounce_feedback", "amount"), &Environment::set_sdfgi_bounce_feedback);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_bounce_feedback"), &Environment::get_sdfgi_bounce_feedback);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_read_sky_light", "enable"), &Environment::set_sdfgi_read_sky_light);
-	ClassDB::bind_method(D_METHOD("is_sdfgi_reading_sky_light"), &Environment::is_sdfgi_reading_sky_light);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_energy", "amount"), &Environment::set_sdfgi_energy);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_energy"), &Environment::get_sdfgi_energy);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_normal_bias", "bias"), &Environment::set_sdfgi_normal_bias);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_normal_bias"), &Environment::get_sdfgi_normal_bias);
-	ClassDB::bind_method(D_METHOD("set_sdfgi_probe_bias", "bias"), &Environment::set_sdfgi_probe_bias);
-	ClassDB::bind_method(D_METHOD("get_sdfgi_probe_bias"), &Environment::get_sdfgi_probe_bias);
+	ClassDB::bind_method(D_METHOD("set_svogi_enabled", "enabled"), &Environment::set_svogi_enabled);
+	ClassDB::bind_method(D_METHOD("is_svogi_enabled"), &Environment::is_svogi_enabled);
+	ClassDB::bind_method(D_METHOD("set_svogi_cascades", "amount"), &Environment::set_svogi_cascades);
+	ClassDB::bind_method(D_METHOD("get_svogi_cascades"), &Environment::get_svogi_cascades);
+	ClassDB::bind_method(D_METHOD("set_svogi_min_cell_size", "size"), &Environment::set_svogi_min_cell_size);
+	ClassDB::bind_method(D_METHOD("get_svogi_min_cell_size"), &Environment::get_svogi_min_cell_size);
+	ClassDB::bind_method(D_METHOD("set_svogi_max_distance", "distance"), &Environment::set_svogi_max_distance);
+	ClassDB::bind_method(D_METHOD("get_svogi_max_distance"), &Environment::get_svogi_max_distance);
+	ClassDB::bind_method(D_METHOD("set_svogi_cascade0_distance", "distance"), &Environment::set_svogi_cascade0_distance);
+	ClassDB::bind_method(D_METHOD("get_svogi_cascade0_distance"), &Environment::get_svogi_cascade0_distance);
+	ClassDB::bind_method(D_METHOD("set_svogi_y_scale", "scale"), &Environment::set_svogi_y_scale);
+	ClassDB::bind_method(D_METHOD("get_svogi_y_scale"), &Environment::get_svogi_y_scale);
+	ClassDB::bind_method(D_METHOD("set_svogi_use_occlusion", "enable"), &Environment::set_svogi_use_occlusion);
+	ClassDB::bind_method(D_METHOD("is_svogi_using_occlusion"), &Environment::is_svogi_using_occlusion);
+	ClassDB::bind_method(D_METHOD("set_svogi_bounce_feedback", "amount"), &Environment::set_svogi_bounce_feedback);
+	ClassDB::bind_method(D_METHOD("get_svogi_bounce_feedback"), &Environment::get_svogi_bounce_feedback);
+	ClassDB::bind_method(D_METHOD("set_svogi_read_sky_light", "enable"), &Environment::set_svogi_read_sky_light);
+	ClassDB::bind_method(D_METHOD("is_svogi_reading_sky_light"), &Environment::is_svogi_reading_sky_light);
+	ClassDB::bind_method(D_METHOD("set_svogi_energy", "amount"), &Environment::set_svogi_energy);
+	ClassDB::bind_method(D_METHOD("get_svogi_energy"), &Environment::get_svogi_energy);
+	ClassDB::bind_method(D_METHOD("set_svogi_normal_bias", "bias"), &Environment::set_svogi_normal_bias);
+	ClassDB::bind_method(D_METHOD("get_svogi_normal_bias"), &Environment::get_svogi_normal_bias);
+	ClassDB::bind_method(D_METHOD("set_svogi_probe_bias", "bias"), &Environment::set_svogi_probe_bias);
+	ClassDB::bind_method(D_METHOD("get_svogi_probe_bias"), &Environment::get_svogi_probe_bias);
 
-	ADD_GROUP("SDFGI", "sdfgi_");
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "sdfgi_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_sdfgi_enabled", "is_sdfgi_enabled");
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "sdfgi_use_occlusion"), "set_sdfgi_use_occlusion", "is_sdfgi_using_occlusion");
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "sdfgi_read_sky_light"), "set_sdfgi_read_sky_light", "is_sdfgi_reading_sky_light");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_bounce_feedback", PROPERTY_HINT_RANGE, "0,1.99,0.01"), "set_sdfgi_bounce_feedback", "get_sdfgi_bounce_feedback");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "sdfgi_cascades", PROPERTY_HINT_RANGE, "1,8,1"), "set_sdfgi_cascades", "get_sdfgi_cascades");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_min_cell_size", PROPERTY_HINT_RANGE, "0.01,64,0.01"), "set_sdfgi_min_cell_size", "get_sdfgi_min_cell_size");
-	// Don't store the values of `sdfgi_cascade0_distance` and `sdfgi_max_distance`
-	// as they're derived from `sdfgi_min_cell_size`.
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_cascade0_distance", PROPERTY_HINT_RANGE, "0.1,16384,0.1,or_greater", PROPERTY_USAGE_EDITOR), "set_sdfgi_cascade0_distance", "get_sdfgi_cascade0_distance");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_max_distance", PROPERTY_HINT_RANGE, "0.1,16384,0.1,or_greater", PROPERTY_USAGE_EDITOR), "set_sdfgi_max_distance", "get_sdfgi_max_distance");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "sdfgi_y_scale", PROPERTY_HINT_ENUM, "50% (Compact),75% (Balanced),100% (Sparse)"), "set_sdfgi_y_scale", "get_sdfgi_y_scale");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_energy"), "set_sdfgi_energy", "get_sdfgi_energy");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_normal_bias"), "set_sdfgi_normal_bias", "get_sdfgi_normal_bias");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_probe_bias"), "set_sdfgi_probe_bias", "get_sdfgi_probe_bias");
+	ADD_GROUP("SVOGI", "svogi_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "svogi_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_svogi_enabled", "is_svogi_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "svogi_use_occlusion"), "set_svogi_use_occlusion", "is_svogi_using_occlusion");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "svogi_read_sky_light"), "set_svogi_read_sky_light", "is_svogi_reading_sky_light");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "svogi_bounce_feedback", PROPERTY_HINT_RANGE, "0,1.99,0.01"), "set_svogi_bounce_feedback", "get_svogi_bounce_feedback");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "svogi_cascades", PROPERTY_HINT_RANGE, "1,8,1"), "set_svogi_cascades", "get_svogi_cascades");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "svogi_min_cell_size", PROPERTY_HINT_RANGE, "0.01,64,0.01"), "set_svogi_min_cell_size", "get_svogi_min_cell_size");
+	// Don't store the values of `svogi_cascade0_distance` and `svogi_max_distance`
+	// as they're derived from `svogi_min_cell_size`.
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "svogi_cascade0_distance", PROPERTY_HINT_RANGE, "0.1,16384,0.1,or_greater", PROPERTY_USAGE_EDITOR), "set_svogi_cascade0_distance", "get_svogi_cascade0_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "svogi_max_distance", PROPERTY_HINT_RANGE, "0.1,16384,0.1,or_greater", PROPERTY_USAGE_EDITOR), "set_svogi_max_distance", "get_svogi_max_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "svogi_y_scale", PROPERTY_HINT_ENUM, "50% (Compact),75% (Balanced),100% (Sparse)"), "set_svogi_y_scale", "get_svogi_y_scale");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "svogi_energy"), "set_svogi_energy", "get_svogi_energy");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "svogi_normal_bias"), "set_svogi_normal_bias", "get_svogi_normal_bias");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "svogi_probe_bias"), "set_svogi_probe_bias", "get_svogi_probe_bias");
 
 	// Glow
 
@@ -1629,9 +1629,9 @@ void Environment::_bind_methods() {
 	BIND_ENUM_CONSTANT(FOG_MODE_EXPONENTIAL);
 	BIND_ENUM_CONSTANT(FOG_MODE_DEPTH);
 
-	BIND_ENUM_CONSTANT(SDFGI_Y_SCALE_50_PERCENT);
-	BIND_ENUM_CONSTANT(SDFGI_Y_SCALE_75_PERCENT);
-	BIND_ENUM_CONSTANT(SDFGI_Y_SCALE_100_PERCENT);
+	BIND_ENUM_CONSTANT(SVOGI_Y_SCALE_50_PERCENT);
+	BIND_ENUM_CONSTANT(SVOGI_Y_SCALE_75_PERCENT);
+	BIND_ENUM_CONSTANT(SVOGI_Y_SCALE_100_PERCENT);
 }
 
 Environment::Environment() {
@@ -1653,7 +1653,7 @@ Environment::Environment() {
 	_update_ssr();
 	_update_ssao();
 	_update_ssil();
-	_update_sdfgi();
+	_update_svogi();
 	_update_glow();
 	_update_fog();
 	_update_adjustment();

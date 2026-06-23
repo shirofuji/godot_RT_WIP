@@ -18,14 +18,14 @@ layout(constant_id = 0) const bool sc_half_res = false;
 layout(constant_id = 1) const bool sc_use_full_projection_matrix = false;
 layout(constant_id = 2) const bool sc_use_vrs = false;
 
-#define SDFGI_MAX_CASCADES 8
+#define SVOGI_MAX_CASCADES 8
 
-//set 0 for SDFGI and render buffers
+//set 0 for SVOGI and render buffers
 
-layout(set = 0, binding = 1) uniform texture3D sdf_cascades[SDFGI_MAX_CASCADES];
-layout(set = 0, binding = 2) uniform texture3D light_cascades[SDFGI_MAX_CASCADES];
-layout(set = 0, binding = 3) uniform texture3D aniso0_cascades[SDFGI_MAX_CASCADES];
-layout(set = 0, binding = 4) uniform texture3D aniso1_cascades[SDFGI_MAX_CASCADES];
+layout(set = 0, binding = 1) uniform texture3D sdf_cascades[SVOGI_MAX_CASCADES];
+layout(set = 0, binding = 2) uniform texture3D light_cascades[SVOGI_MAX_CASCADES];
+layout(set = 0, binding = 3) uniform texture3D aniso0_cascades[SVOGI_MAX_CASCADES];
+layout(set = 0, binding = 4) uniform texture3D aniso1_cascades[SVOGI_MAX_CASCADES];
 layout(set = 0, binding = 5) uniform texture3D occlusion_texture;
 
 layout(set = 0, binding = 6) uniform sampler linear_sampler;
@@ -49,7 +49,7 @@ layout(set = 0, binding = 12) uniform texture2D depth_buffer;
 layout(set = 0, binding = 13) uniform texture2D normal_roughness_buffer;
 layout(set = 0, binding = 14) uniform utexture2D voxel_gi_buffer;
 
-layout(set = 0, binding = 15, std140) uniform SDFGI {
+layout(set = 0, binding = 15, std140) uniform SVOGI {
 	vec3 grid_size;
 	uint max_cascades;
 
@@ -73,9 +73,9 @@ layout(set = 0, binding = 15, std140) uniform SDFGI {
 	vec3 cascade_probe_size;
 	uint pad5;
 
-	ProbeCascadeData cascades[SDFGI_MAX_CASCADES];
+	ProbeCascadeData cascades[SVOGI_MAX_CASCADES];
 }
-sdfgi;
+svogi;
 
 #define MAX_VOXEL_GI_INSTANCES 8
 
@@ -192,7 +192,7 @@ vec3 reconstruct_position(ivec2 screen_pos) {
 }
 
 void sdfvoxel_gi_process(uint cascade, vec3 cascade_pos, vec3 cam_pos, vec3 cam_normal, vec3 cam_specular_normal, float roughness, out vec3 diffuse_light, out vec3 specular_light) {
-	cascade_pos += cam_normal * sdfgi.normal_bias;
+	cascade_pos += cam_normal * svogi.normal_bias;
 
 	vec3 base_pos = floor(cascade_pos);
 	//cascade_pos += mix(vec3(0.0),vec3(0.01),lessThan(abs(cascade_pos-base_pos),vec3(0.01))) * cam_normal;
@@ -202,12 +202,12 @@ void sdfvoxel_gi_process(uint cascade, vec3 cascade_pos, vec3 cam_pos, vec3 cam_
 	vec3 specular_accum;
 
 	ivec3 tex_pos = ivec3(probe_base_pos.xy, int(cascade));
-	tex_pos.x += probe_base_pos.z * sdfgi.probe_axis_size;
-	tex_pos.xy = tex_pos.xy * (SDFGI_OCT_SIZE + 2) + ivec2(1);
+	tex_pos.x += probe_base_pos.z * svogi.probe_axis_size;
+	tex_pos.xy = tex_pos.xy * (SVOGI_OCT_SIZE + 2) + ivec2(1);
 
-	vec3 diffuse_posf = (vec3(tex_pos) + vec3(octahedron_encode(cam_normal) * float(SDFGI_OCT_SIZE), 0.0)) * sdfgi.lightprobe_tex_pixel_size;
+	vec3 diffuse_posf = (vec3(tex_pos) + vec3(octahedron_encode(cam_normal) * float(SVOGI_OCT_SIZE), 0.0)) * svogi.lightprobe_tex_pixel_size;
 
-	vec3 specular_posf = (vec3(tex_pos) + vec3(octahedron_encode(cam_specular_normal) * float(SDFGI_OCT_SIZE), 0.0)) * sdfgi.lightprobe_tex_pixel_size;
+	vec3 specular_posf = (vec3(tex_pos) + vec3(octahedron_encode(cam_specular_normal) * float(SVOGI_OCT_SIZE), 0.0)) * svogi.lightprobe_tex_pixel_size;
 
 	specular_accum = vec3(0.0);
 
@@ -230,17 +230,17 @@ void sdfvoxel_gi_process(uint cascade, vec3 cascade_pos, vec3 cam_pos, vec3 cam_
 
 		// Compute lightprobe occlusion
 
-		if (sdfgi.use_occlusion) {
-			ivec3 occ_indexv = abs((sdfgi.cascades[cascade].probe_world_offset + probe_posi) & ivec3(1, 1, 1)) * ivec3(1, 2, 4);
+		if (svogi.use_occlusion) {
+			ivec3 occ_indexv = abs((svogi.cascades[cascade].probe_world_offset + probe_posi) & ivec3(1, 1, 1)) * ivec3(1, 2, 4);
 			vec4 occ_mask = mix(vec4(0.0), vec4(1.0), equal(ivec4(occ_indexv.x | occ_indexv.y), ivec4(0, 1, 2, 3)));
 
-			vec3 occ_pos = clamp(cascade_pos, probe_pos - sdfgi.occlusion_clamp, probe_pos + sdfgi.occlusion_clamp) * sdfgi.probe_to_uvw;
+			vec3 occ_pos = clamp(cascade_pos, probe_pos - svogi.occlusion_clamp, probe_pos + svogi.occlusion_clamp) * svogi.probe_to_uvw;
 			occ_pos.z += float(cascade);
 			if (occ_indexv.z != 0) { //z bit is on, means index is >=4, so make it switch to the other half of textures
 				occ_pos.x += 1.0;
 			}
 
-			occ_pos *= sdfgi.occlusion_renormalize;
+			occ_pos *= svogi.occlusion_renormalize;
 			float occlusion = dot(textureLod(sampler3D(occlusion_texture, linear_sampler), occ_pos, 0.0), occ_mask);
 
 			weight *= max(occlusion, 0.01);
@@ -250,25 +250,25 @@ void sdfvoxel_gi_process(uint cascade, vec3 cascade_pos, vec3 cam_pos, vec3 cam_
 
 		vec3 diffuse;
 		vec3 pos_uvw = diffuse_posf;
-		pos_uvw.xy += vec2(offset.xy) * sdfgi.lightprobe_uv_offset.xy;
-		pos_uvw.x += float(offset.z) * sdfgi.lightprobe_uv_offset.z;
+		pos_uvw.xy += vec2(offset.xy) * svogi.lightprobe_uv_offset.xy;
+		pos_uvw.x += float(offset.z) * svogi.lightprobe_uv_offset.z;
 		diffuse = textureLod(sampler2DArray(lightprobe_texture, linear_sampler), pos_uvw, 0.0).rgb;
 
-		diffuse_accum += vec4(diffuse * weight * sdfgi.cascades[cascade].exposure_normalization, weight);
+		diffuse_accum += vec4(diffuse * weight * svogi.cascades[cascade].exposure_normalization, weight);
 
 		{
 			vec3 specular = vec3(0.0);
 			vec3 pos_uvw = specular_posf;
-			pos_uvw.xy += vec2(offset.xy) * sdfgi.lightprobe_uv_offset.xy;
-			pos_uvw.x += float(offset.z) * sdfgi.lightprobe_uv_offset.z;
+			pos_uvw.xy += vec2(offset.xy) * svogi.lightprobe_uv_offset.xy;
+			pos_uvw.x += float(offset.z) * svogi.lightprobe_uv_offset.z;
 			if (roughness < 0.99) {
-				specular = textureLod(sampler2DArray(lightprobe_texture, linear_sampler), pos_uvw + vec3(0, 0, float(sdfgi.max_cascades)), 0.0).rgb;
+				specular = textureLod(sampler2DArray(lightprobe_texture, linear_sampler), pos_uvw + vec3(0, 0, float(svogi.max_cascades)), 0.0).rgb;
 			}
 			if (roughness > 0.2) {
 				specular = mix(specular, textureLod(sampler2DArray(lightprobe_texture, linear_sampler), pos_uvw, 0.0).rgb, (roughness - 0.2) * 1.25);
 			}
 
-			specular_accum += specular * weight * sdfgi.cascades[cascade].exposure_normalization;
+			specular_accum += specular * weight * svogi.cascades[cascade].exposure_normalization;
 		}
 	}
 
@@ -285,11 +285,11 @@ void sdfvoxel_gi_process(uint cascade, vec3 cascade_pos, vec3 cam_pos, vec3 cam_
 	specular_light = specular_accum;
 }
 
-void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, out vec4 ambient_light, out vec4 reflection_light) {
+void svogi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, out vec4 ambient_light, out vec4 reflection_light) {
 	//make vertex orientation the world one, but still align to camera
-	vertex.y *= sdfgi.y_mult;
-	normal.y *= sdfgi.y_mult;
-	reflection.y *= sdfgi.y_mult;
+	vertex.y *= svogi.y_mult;
+	normal.y *= svogi.y_mult;
+	reflection.y *= svogi.y_mult;
 
 	//renormalize
 	normal = normalize(normal);
@@ -312,10 +312,10 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 	vec3 cascade_pos;
 	vec3 cascade_normal;
 
-	for (uint i = 0; i < sdfgi.max_cascades; i++) {
-		cascade_pos = (cam_pos - sdfgi.cascades[i].position) * sdfgi.cascades[i].to_probe;
+	for (uint i = 0; i < svogi.max_cascades; i++) {
+		cascade_pos = (cam_pos - svogi.cascades[i].position) * svogi.cascades[i].to_probe;
 
-		if (any(lessThan(cascade_pos, vec3(0.0))) || any(greaterThanEqual(cascade_pos, sdfgi.cascade_probe_size))) {
+		if (any(lessThan(cascade_pos, vec3(0.0))) || any(greaterThanEqual(cascade_pos, svogi.cascade_probe_size))) {
 			continue; //skip cascade
 		}
 
@@ -323,7 +323,7 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 		break;
 	}
 
-	if (cascade < SDFGI_MAX_CASCADES) {
+	if (cascade < SVOGI_MAX_CASCADES) {
 		ambient_light = vec4(0, 0, 0, 1);
 		reflection_light = vec4(0, 0, 0, 1);
 
@@ -333,10 +333,10 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 
 		{
 			//process blend
-			float blend_from = (float(sdfgi.probe_axis_size - 1) / 2.0) - 2.5;
+			float blend_from = (float(svogi.probe_axis_size - 1) / 2.0) - 2.5;
 			float blend_to = blend_from + 2.0;
 
-			vec3 inner_pos = cam_pos * sdfgi.cascades[cascade].to_probe;
+			vec3 inner_pos = cam_pos * svogi.cascades[cascade].to_probe;
 
 			float len = length(inner_pos);
 
@@ -352,13 +352,13 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 
 		if (blend > 0.0) {
 			//blend
-			if (cascade == sdfgi.max_cascades - 1) {
+			if (cascade == svogi.max_cascades - 1) {
 				ambient_light.a = 1.0 - blend;
 				reflection_light.a = 1.0 - blend;
 
 			} else {
 				vec3 diffuse2, specular2;
-				cascade_pos = (cam_pos - sdfgi.cascades[cascade + 1].position) * sdfgi.cascades[cascade + 1].to_probe;
+				cascade_pos = (cam_pos - svogi.cascades[cascade + 1].position) * svogi.cascades[cascade + 1].to_probe;
 				sdfvoxel_gi_process(cascade + 1, cascade_pos, cam_pos, cam_normal, reflection, roughness, diffuse2, specular2);
 				diffuse = mix(diffuse, diffuse2, blend);
 				specular = mix(specular, specular2, blend);
@@ -368,25 +368,25 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 		ambient_light.rgb = diffuse;
 
 		if (roughness < 0.2) {
-			vec3 pos_to_uvw = 1.0 / sdfgi.grid_size;
+			vec3 pos_to_uvw = 1.0 / svogi.grid_size;
 			vec4 light_accum = vec4(0.0);
 
-			float blend_size = (sdfgi.grid_size.x / float(sdfgi.probe_axis_size - 1)) * 0.5;
+			float blend_size = (svogi.grid_size.x / float(svogi.probe_axis_size - 1)) * 0.5;
 
-			float radius_sizes[SDFGI_MAX_CASCADES];
+			float radius_sizes[SVOGI_MAX_CASCADES];
 			cascade = 0xFFFF;
 
 			float base_distance = length(cam_pos);
-			for (uint i = 0; i < sdfgi.max_cascades; i++) {
-				radius_sizes[i] = (1.0 / sdfgi.cascades[i].to_cell) * (sdfgi.grid_size.x * 0.5 - blend_size);
+			for (uint i = 0; i < svogi.max_cascades; i++) {
+				radius_sizes[i] = (1.0 / svogi.cascades[i].to_cell) * (svogi.grid_size.x * 0.5 - blend_size);
 				if (cascade == 0xFFFF && base_distance < radius_sizes[i]) {
 					cascade = i;
 				}
 			}
 
-			cascade = min(cascade, sdfgi.max_cascades - 1);
+			cascade = min(cascade, svogi.max_cascades - 1);
 
-			float max_distance = radius_sizes[sdfgi.max_cascades - 1];
+			float max_distance = radius_sizes[svogi.max_cascades - 1];
 			vec3 ray_pos = cam_pos;
 			vec3 ray_dir = reflection;
 
@@ -395,8 +395,8 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 				float base_blend = (base_distance - prev_radius) / (radius_sizes[cascade] - prev_radius);
 				float bias = (1.0 + base_blend) * 1.1;
 				vec3 abs_ray_dir = abs(ray_dir);
-				//ray_pos += ray_dir * (bias / sdfgi.cascades[cascade].to_cell); //bias to avoid self occlusion
-				ray_pos += (ray_dir * 1.0 / max(abs_ray_dir.x, max(abs_ray_dir.y, abs_ray_dir.z)) + cam_normal * 1.4) * bias / sdfgi.cascades[cascade].to_cell;
+				//ray_pos += ray_dir * (bias / svogi.cascades[cascade].to_cell); //bias to avoid self occlusion
+				ray_pos += (ray_dir * 1.0 / max(abs_ray_dir.x, max(abs_ray_dir.y, abs_ray_dir.z)) + cam_normal * 1.4) * bias / svogi.cascades[cascade].to_cell;
 			}
 			float softness = 0.2 + min(1.0, roughness * 5.0) * 4.0; //approximation to roughness so it does not seem like a hard fade
 			uint i = 0;
@@ -406,11 +406,11 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 					break;
 				}
 				if (!found && i >= cascade && length(ray_pos) < radius_sizes[i]) {
-					uint next_i = min(i + 1, sdfgi.max_cascades - 1);
+					uint next_i = min(i + 1, svogi.max_cascades - 1);
 					cascade = max(i, cascade); //never go down
 
-					vec3 pos = ray_pos - sdfgi.cascades[i].position;
-					pos *= sdfgi.cascades[i].to_cell * pos_to_uvw;
+					vec3 pos = ray_pos - svogi.cascades[i].position;
+					pos *= svogi.cascades[i].to_cell * pos_to_uvw;
 
 					float fdistance = textureLod(sampler3D(sdf_cascades[i], linear_sampler), pos, 0.0).r * 255.0 - 1.1;
 
@@ -422,11 +422,11 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 						hit_light.rgb *= hit_light.a;
 					}
 
-					fdistance /= sdfgi.cascades[i].to_cell;
+					fdistance /= svogi.cascades[i].to_cell;
 
-					if (i < (sdfgi.max_cascades - 1)) {
-						pos = ray_pos - sdfgi.cascades[next_i].position;
-						pos *= sdfgi.cascades[next_i].to_cell * pos_to_uvw;
+					if (i < (svogi.max_cascades - 1)) {
+						pos = ray_pos - svogi.cascades[next_i].position;
+						pos *= svogi.cascades[next_i].to_cell * pos_to_uvw;
 
 						float fdistance2 = textureLod(sampler3D(sdf_cascades[next_i], linear_sampler), pos, 0.0).r * 255.0 - 1.1;
 
@@ -441,7 +441,7 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 						float prev_radius = i == 0 ? 0.0 : radius_sizes[max(0, i - 1)];
 						float blend = clamp((length(ray_pos) - prev_radius) / (radius_sizes[i] - prev_radius), 0.0, 1.0);
 
-						fdistance2 /= sdfgi.cascades[next_i].to_cell;
+						fdistance2 /= svogi.cascades[next_i].to_cell;
 
 						hit_light = mix(hit_light, hit_light2, blend);
 						fdistance = mix(fdistance, fdistance2, blend);
@@ -452,7 +452,7 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 					found = true;
 				}
 				i++;
-				if (i == sdfgi.max_cascades) {
+				if (i == svogi.max_cascades) {
 					i = 0;
 					found = false;
 				}
@@ -475,8 +475,8 @@ void sdfgi_process(vec3 vertex, vec3 normal, vec3 reflection, float roughness, o
 
 		reflection_light.rgb = specular;
 
-		ambient_light.rgb *= sdfgi.energy;
-		reflection_light.rgb *= sdfgi.energy;
+		ambient_light.rgb *= svogi.energy;
+		reflection_light.rgb *= svogi.energy;
 	} else {
 		ambient_light = vec4(0);
 		reflection_light = vec4(0);
@@ -630,8 +630,8 @@ void process_gi(ivec2 pos, vec3 vertex, inout vec4 ambient_light, inout vec4 ref
 		normal = normalize(mat3(scene_data.cam_transform) * normal);
 		vec3 reflection = normalize(reflect(-view, normal));
 
-#ifdef USE_SDFGI
-		sdfgi_process(vertex, normal, reflection, roughness, ambient_light, reflection_light);
+#ifdef USE_SVOGI
+		svogi_process(vertex, normal, reflection, roughness, ambient_light, reflection_light);
 #endif
 
 #ifdef USE_VOXEL_GI_INSTANCES
@@ -662,7 +662,7 @@ void process_gi(ivec2 pos, vec3 vertex, inout vec4 ambient_light, inout vec4 ref
 				spec_accum /= blend_accum;
 			}
 
-#ifdef USE_SDFGI
+#ifdef USE_SVOGI
 			reflection_light = blend_color(spec_accum, reflection_light);
 			ambient_light = blend_color(amb_accum, ambient_light);
 #else

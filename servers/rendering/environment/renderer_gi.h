@@ -88,5 +88,5 @@ public:
 
 	virtual uint32_t voxel_gi_get_version(RID p_probe) const = 0;
 
-	virtual void sdfgi_reset() = 0;
+	virtual void svogi_reset() = 0;
 };

@@ -65,12 +65,12 @@ public:
 	virtual void mesh_generate_pipelines(RID p_mesh, bool p_background_compilation) = 0;
 	virtual uint32_t get_pipeline_compilations(RSE::PipelineSource p_source) = 0;
 
-	/* SDFGI UPDATE */
+	/* SVOGI UPDATE */
 
-	virtual void sdfgi_update(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, const Vector3 &p_world_position) = 0;
-	virtual int sdfgi_get_pending_region_count(const Ref<RenderSceneBuffers> &p_render_buffers) const = 0;
-	virtual AABB sdfgi_get_pending_region_bounds(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const = 0;
-	virtual uint32_t sdfgi_get_pending_region_cascade(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const = 0;
+	virtual void svogi_update(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, const Vector3 &p_world_position) = 0;
+	virtual int svogi_get_pending_region_count(const Ref<RenderSceneBuffers> &p_render_buffers) const = 0;
+	virtual AABB svogi_get_pending_region_bounds(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const = 0;
+	virtual uint32_t svogi_get_pending_region_cascade(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const = 0;
 
 	/* SKY API */
 
@@ -236,22 +236,22 @@ public:
 
 	virtual void environment_set_ssil_quality(RSE::EnvironmentSSILQuality p_quality, bool p_half_size, float p_adaptive_target, int p_blur_passes, float p_fadeout_from, float p_fadeout_to) = 0;
 
-	// SDFGI
-	void environment_set_sdfgi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSDFGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias);
-	bool environment_get_sdfgi_enabled(RID p_env) const;
-	int environment_get_sdfgi_cascades(RID p_env) const;
-	float environment_get_sdfgi_min_cell_size(RID p_env) const;
-	bool environment_get_sdfgi_use_occlusion(RID p_env) const;
-	float environment_get_sdfgi_bounce_feedback(RID p_env) const;
-	bool environment_get_sdfgi_read_sky_light(RID p_env) const;
-	float environment_get_sdfgi_energy(RID p_env) const;
-	float environment_get_sdfgi_normal_bias(RID p_env) const;
-	float environment_get_sdfgi_probe_bias(RID p_env) const;
-	RSE::EnvironmentSDFGIYScale environment_get_sdfgi_y_scale(RID p_env) const;
+	// SVOGI
+	void environment_set_svogi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSVOGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias);
+	bool environment_get_svogi_enabled(RID p_env) const;
+	int environment_get_svogi_cascades(RID p_env) const;
+	float environment_get_svogi_min_cell_size(RID p_env) const;
+	bool environment_get_svogi_use_occlusion(RID p_env) const;
+	float environment_get_svogi_bounce_feedback(RID p_env) const;
+	bool environment_get_svogi_read_sky_light(RID p_env) const;
+	float environment_get_svogi_energy(RID p_env) const;
+	float environment_get_svogi_normal_bias(RID p_env) const;
+	float environment_get_svogi_probe_bias(RID p_env) const;
+	RSE::EnvironmentSVOGIYScale environment_get_svogi_y_scale(RID p_env) const;
 
-	virtual void environment_set_sdfgi_ray_count(RSE::EnvironmentSDFGIRayCount p_ray_count) = 0;
-	virtual void environment_set_sdfgi_frames_to_converge(RSE::EnvironmentSDFGIFramesToConverge p_frames) = 0;
-	virtual void environment_set_sdfgi_frames_to_update_light(RSE::EnvironmentSDFGIFramesToUpdateLight p_update) = 0;
+	virtual void environment_set_svogi_ray_count(RSE::EnvironmentSVOGIRayCount p_ray_count) = 0;
+	virtual void environment_set_svogi_frames_to_converge(RSE::EnvironmentSVOGIFramesToConverge p_frames) = 0;
+	virtual void environment_set_svogi_frames_to_update_light(RSE::EnvironmentSVOGIFramesToUpdateLight p_update) = 0;
 
 	// Adjustment
 	void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction);
@@ -286,12 +286,12 @@ public:
 		PagedArray<RenderGeometryInstance *> instances;
 	};
 
-	struct RenderSDFGIData {
+	struct RenderSVOGIData {
 		int region = 0;
 		PagedArray<RenderGeometryInstance *> instances;
 	};
 
-	struct RenderSDFGIUpdateData {
+	struct RenderSVOGIUpdateData {
 		bool update_static = false;
 		uint32_t static_cascade_count;
 		uint32_t *static_cascade_indices = nullptr;
@@ -322,7 +322,7 @@ public:
 		void set_multiview_camera(uint32_t p_view_count, const Transform3D *p_transforms, const Projection *p_projections, bool p_is_orthogonal, bool p_vaspect, uint32_t p_visible_layers = 0xFFFFFFFF);
 	};
 
-	virtual void render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data = nullptr, RenderingServerTypes::RenderInfo *r_render_info = nullptr) = 0;
+	virtual void render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSVOGIData *p_render_svogi_regions, int p_render_svogi_region_count, float p_window_output_max_value, const RenderSVOGIUpdateData *p_svogi_update_data = nullptr, RenderingServerTypes::RenderInfo *r_render_info = nullptr) = 0;
 
 	virtual void render_material(const Transform3D &p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region) = 0;
 	virtual void render_particle_collider_heightfield(RID p_collider, const Transform3D &p_transform, const PagedArray<RenderGeometryInstance *> &p_instances) = 0;
@@ -346,7 +346,7 @@ public:
 
 	virtual bool free(RID p_rid) = 0;
 
-	virtual void sdfgi_set_debug_probe_select(const Vector3 &p_position, const Vector3 &p_dir) = 0;
+	virtual void svogi_set_debug_probe_select(const Vector3 &p_position, const Vector3 &p_dir) = 0;
 
 	virtual void decals_set_filter(RSE::DecalFilter p_filter) = 0;
 	virtual void light_projectors_set_filter(RSE::LightProjectorFilter p_filter) = 0;

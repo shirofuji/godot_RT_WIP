@@ -321,7 +321,7 @@ public:
 	virtual void light_set_shadow_caster_mask(RID p_light, uint32_t p_caster_mask) = 0;
 
 	virtual void light_set_bake_mode(RID p_light, RSE::LightBakeMode p_bake_mode) = 0;
-	virtual void light_set_max_sdfgi_cascade(RID p_light, uint32_t p_cascade) = 0;
+	virtual void light_set_max_svogi_cascade(RID p_light, uint32_t p_cascade) = 0;
 
 	// Omni light
 
@@ -412,7 +412,7 @@ public:
 
 	virtual void voxel_gi_set_quality(RSE::VoxelGIQuality) = 0;
 
-	virtual void sdfgi_reset() = 0;
+	virtual void svogi_reset() = 0;
 
 	/* LIGHTMAP API */
 
@@ -681,13 +681,13 @@ public:
 
 	virtual void environment_set_ssil_quality(RSE::EnvironmentSSILQuality p_quality, bool p_half_size, float p_adaptive_target, int p_blur_passes, float p_fadeout_from, float p_fadeout_to) = 0;
 
-	virtual void environment_set_sdfgi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSDFGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias) = 0;
+	virtual void environment_set_svogi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSVOGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias) = 0;
 
-	virtual void environment_set_sdfgi_ray_count(RSE::EnvironmentSDFGIRayCount p_ray_count) = 0;
+	virtual void environment_set_svogi_ray_count(RSE::EnvironmentSVOGIRayCount p_ray_count) = 0;
 
-	virtual void environment_set_sdfgi_frames_to_converge(RSE::EnvironmentSDFGIFramesToConverge p_frames) = 0;
+	virtual void environment_set_svogi_frames_to_converge(RSE::EnvironmentSVOGIFramesToConverge p_frames) = 0;
 
-	virtual void environment_set_sdfgi_frames_to_update_light(RSE::EnvironmentSDFGIFramesToUpdateLight p_update) = 0;
+	virtual void environment_set_svogi_frames_to_update_light(RSE::EnvironmentSVOGIFramesToUpdateLight p_update) = 0;
 
 	virtual void environment_set_fog(RID p_env, bool p_enable, const Color &p_light_color, float p_light_energy, float p_sun_scatter, float p_density, float p_height, float p_height_density, float p_aerial_perspective, float p_sky_affect, RSE::EnvironmentFogMode p_mode = RSE::EnvironmentFogMode::ENV_FOG_MODE_EXPONENTIAL) = 0;
 	virtual void environment_set_fog_depth(RID p_env, float p_curve, float p_begin, float p_end) = 0;
@@ -999,7 +999,7 @@ public:
 	virtual RID get_test_texture();
 	virtual RID get_white_texture();
 
-	virtual void sdfgi_set_debug_probe_select(const Vector3 &p_position, const Vector3 &p_dir) = 0;
+	virtual void svogi_set_debug_probe_select(const Vector3 &p_position, const Vector3 &p_dir) = 0;
 
 	virtual RID make_sphere_mesh(int p_lats, int p_lons, real_t p_radius);
 
@@ -1146,10 +1146,10 @@ VARIANT_ENUM_CAST_EXT(RSE::EnvironmentToneMapper, RenderingServer::EnvironmentTo
 VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSSRRoughnessQuality, RenderingServer::EnvironmentSSRRoughnessQuality);
 VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSSAOQuality, RenderingServer::EnvironmentSSAOQuality);
 VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSSILQuality, RenderingServer::EnvironmentSSILQuality);
-VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSDFGIFramesToConverge, RenderingServer::EnvironmentSDFGIFramesToConverge);
-VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSDFGIRayCount, RenderingServer::EnvironmentSDFGIRayCount);
-VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSDFGIFramesToUpdateLight, RenderingServer::EnvironmentSDFGIFramesToUpdateLight);
-VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSDFGIYScale, RenderingServer::EnvironmentSDFGIYScale);
+VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSVOGIFramesToConverge, RenderingServer::EnvironmentSVOGIFramesToConverge);
+VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSVOGIRayCount, RenderingServer::EnvironmentSVOGIRayCount);
+VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSVOGIFramesToUpdateLight, RenderingServer::EnvironmentSVOGIFramesToUpdateLight);
+VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSVOGIYScale, RenderingServer::EnvironmentSVOGIYScale);
 VARIANT_ENUM_CAST_EXT(RSE::SubSurfaceScatteringQuality, RenderingServer::SubSurfaceScatteringQuality);
 VARIANT_ENUM_CAST_EXT(RSE::DOFBlurQuality, RenderingServer::DOFBlurQuality);
 VARIANT_ENUM_CAST_EXT(RSE::DOFBokehShape, RenderingServer::DOFBokehShape);

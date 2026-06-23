@@ -70,10 +70,10 @@ public:
 		TONE_MAPPER_AGX,
 	};
 
-	enum SDFGIYScale {
-		SDFGI_Y_SCALE_50_PERCENT,
-		SDFGI_Y_SCALE_75_PERCENT,
-		SDFGI_Y_SCALE_100_PERCENT,
+	enum SVOGIYScale {
+		SVOGI_Y_SCALE_50_PERCENT,
+		SVOGI_Y_SCALE_75_PERCENT,
+		SVOGI_Y_SCALE_100_PERCENT,
 	};
 
 	enum FogMode {
@@ -149,18 +149,18 @@ private:
 
 	void _update_ssil();
 
-	// SDFGI
-	bool sdfgi_enabled = false;
-	int sdfgi_cascades = 4;
-	float sdfgi_min_cell_size = 0.2;
-	SDFGIYScale sdfgi_y_scale = SDFGI_Y_SCALE_75_PERCENT;
-	bool sdfgi_use_occlusion = false;
-	float sdfgi_bounce_feedback = 0.5;
-	bool sdfgi_read_sky_light = true;
-	float sdfgi_energy = 1.0;
-	float sdfgi_normal_bias = 1.1;
-	float sdfgi_probe_bias = 1.1;
-	void _update_sdfgi();
+	// SVOGI
+	bool svogi_enabled = false;
+	int svogi_cascades = 4;
+	float svogi_min_cell_size = 0.2;
+	SVOGIYScale svogi_y_scale = SVOGI_Y_SCALE_75_PERCENT;
+	bool svogi_use_occlusion = false;
+	float svogi_bounce_feedback = 0.5;
+	bool svogi_read_sky_light = true;
+	float svogi_energy = 1.0;
+	float svogi_normal_bias = 1.1;
+	float svogi_probe_bias = 1.1;
+	void _update_svogi();
 
 	// Glow
 	bool glow_enabled = false;
@@ -323,31 +323,31 @@ public:
 	void set_ssil_normal_rejection(float p_normal_rejection);
 	float get_ssil_normal_rejection() const;
 
-	// SDFGI
-	void set_sdfgi_enabled(bool p_enabled);
-	bool is_sdfgi_enabled() const;
-	void set_sdfgi_cascades(int p_cascades);
-	int get_sdfgi_cascades() const;
-	void set_sdfgi_min_cell_size(float p_size);
-	float get_sdfgi_min_cell_size() const;
-	void set_sdfgi_max_distance(float p_distance);
-	float get_sdfgi_max_distance() const;
-	void set_sdfgi_cascade0_distance(float p_distance);
-	float get_sdfgi_cascade0_distance() const;
-	void set_sdfgi_y_scale(SDFGIYScale p_y_scale);
-	SDFGIYScale get_sdfgi_y_scale() const;
-	void set_sdfgi_use_occlusion(bool p_enabled);
-	bool is_sdfgi_using_occlusion() const;
-	void set_sdfgi_bounce_feedback(float p_amount);
-	float get_sdfgi_bounce_feedback() const;
-	void set_sdfgi_read_sky_light(bool p_enabled);
-	bool is_sdfgi_reading_sky_light() const;
-	void set_sdfgi_energy(float p_energy);
-	float get_sdfgi_energy() const;
-	void set_sdfgi_normal_bias(float p_bias);
-	float get_sdfgi_normal_bias() const;
-	void set_sdfgi_probe_bias(float p_bias);
-	float get_sdfgi_probe_bias() const;
+	// SVOGI
+	void set_svogi_enabled(bool p_enabled);
+	bool is_svogi_enabled() const;
+	void set_svogi_cascades(int p_cascades);
+	int get_svogi_cascades() const;
+	void set_svogi_min_cell_size(float p_size);
+	float get_svogi_min_cell_size() const;
+	void set_svogi_max_distance(float p_distance);
+	float get_svogi_max_distance() const;
+	void set_svogi_cascade0_distance(float p_distance);
+	float get_svogi_cascade0_distance() const;
+	void set_svogi_y_scale(SVOGIYScale p_y_scale);
+	SVOGIYScale get_svogi_y_scale() const;
+	void set_svogi_use_occlusion(bool p_enabled);
+	bool is_svogi_using_occlusion() const;
+	void set_svogi_bounce_feedback(float p_amount);
+	float get_svogi_bounce_feedback() const;
+	void set_svogi_read_sky_light(bool p_enabled);
+	bool is_svogi_reading_sky_light() const;
+	void set_svogi_energy(float p_energy);
+	float get_svogi_energy() const;
+	void set_svogi_normal_bias(float p_bias);
+	float get_svogi_normal_bias() const;
+	void set_svogi_probe_bias(float p_bias);
+	float get_svogi_probe_bias() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);
@@ -457,6 +457,6 @@ VARIANT_ENUM_CAST(Environment::BGMode)
 VARIANT_ENUM_CAST(Environment::AmbientSource)
 VARIANT_ENUM_CAST(Environment::ReflectionSource)
 VARIANT_ENUM_CAST(Environment::ToneMapper)
-VARIANT_ENUM_CAST(Environment::SDFGIYScale)
+VARIANT_ENUM_CAST(Environment::SVOGIYScale)
 VARIANT_ENUM_CAST(Environment::GlowBlendMode)
 VARIANT_ENUM_CAST(Environment::FogMode)

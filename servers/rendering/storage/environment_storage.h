@@ -160,17 +160,17 @@ private:
 		float ssil_sharpness = 0.98;
 		float ssil_normal_rejection = 1.0;
 
-		// SDFGI
-		bool sdfgi_enabled = false;
-		int sdfgi_cascades = 4;
-		float sdfgi_min_cell_size = 0.2;
-		bool sdfgi_use_occlusion = false;
-		float sdfgi_bounce_feedback = 0.5;
-		bool sdfgi_read_sky_light = true;
-		float sdfgi_energy = 1.0;
-		float sdfgi_normal_bias = 1.1;
-		float sdfgi_probe_bias = 1.1;
-		RSE::EnvironmentSDFGIYScale sdfgi_y_scale = RSE::ENV_SDFGI_Y_SCALE_75_PERCENT;
+		// SVOGI
+		bool svogi_enabled = false;
+		int svogi_cascades = 4;
+		float svogi_min_cell_size = 0.2;
+		bool svogi_use_occlusion = false;
+		float svogi_bounce_feedback = 0.5;
+		bool svogi_read_sky_light = true;
+		float svogi_energy = 1.0;
+		float svogi_normal_bias = 1.1;
+		float svogi_probe_bias = 1.1;
+		RSE::EnvironmentSVOGIYScale svogi_y_scale = RSE::ENV_SVOGI_Y_SCALE_75_PERCENT;
 
 		// Adjustments
 		bool adjustments_enabled = false;
@@ -311,18 +311,18 @@ public:
 	float environment_get_ssil_sharpness(RID p_env) const;
 	float environment_get_ssil_normal_rejection(RID p_env) const;
 
-	// SDFGI
-	void environment_set_sdfgi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSDFGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias);
-	bool environment_get_sdfgi_enabled(RID p_env) const;
-	int environment_get_sdfgi_cascades(RID p_env) const;
-	float environment_get_sdfgi_min_cell_size(RID p_env) const;
-	bool environment_get_sdfgi_use_occlusion(RID p_env) const;
-	float environment_get_sdfgi_bounce_feedback(RID p_env) const;
-	bool environment_get_sdfgi_read_sky_light(RID p_env) const;
-	float environment_get_sdfgi_energy(RID p_env) const;
-	float environment_get_sdfgi_normal_bias(RID p_env) const;
-	float environment_get_sdfgi_probe_bias(RID p_env) const;
-	RSE::EnvironmentSDFGIYScale environment_get_sdfgi_y_scale(RID p_env) const;
+	// SVOGI
+	void environment_set_svogi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSVOGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias);
+	bool environment_get_svogi_enabled(RID p_env) const;
+	int environment_get_svogi_cascades(RID p_env) const;
+	float environment_get_svogi_min_cell_size(RID p_env) const;
+	bool environment_get_svogi_use_occlusion(RID p_env) const;
+	float environment_get_svogi_bounce_feedback(RID p_env) const;
+	bool environment_get_svogi_read_sky_light(RID p_env) const;
+	float environment_get_svogi_energy(RID p_env) const;
+	float environment_get_svogi_normal_bias(RID p_env) const;
+	float environment_get_svogi_probe_bias(RID p_env) const;
+	RSE::EnvironmentSVOGIYScale environment_get_svogi_y_scale(RID p_env) const;
 
 	// Adjustment
 	void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction);

@@ -2963,7 +2963,7 @@ void Node3DEditor::_preview_settings_changed() {
 
 		environment->set_ssao_enabled(environ_ao_button->is_pressed());
 		environment->set_glow_enabled(environ_glow_button->is_pressed());
-		environment->set_sdfgi_enabled(environ_gi_button->is_pressed());
+		environment->set_svogi_enabled(environ_gi_button->is_pressed());
 		environment->set_tonemapper(environ_tonemap_button->is_pressed() ? Environment::TONE_MAPPER_FILMIC : Environment::TONE_MAPPER_LINEAR);
 	}
 }

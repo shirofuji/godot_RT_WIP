@@ -140,8 +140,8 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	}
 #endif
 
-	if (!render_sdfgi_uniform_set.is_null() && RD::get_singleton()->uniform_set_is_valid(render_sdfgi_uniform_set)) {
-		RD::get_singleton()->free_rid(render_sdfgi_uniform_set);
+	if (!render_svogi_uniform_set.is_null() && RD::get_singleton()->uniform_set_is_valid(render_svogi_uniform_set)) {
+		RD::get_singleton()->free_rid(render_svogi_uniform_set);
 	}
 }
 
@@ -922,7 +922,7 @@ _FORCE_INLINE_ static uint32_t _indices_to_primitives(RSE::PrimitiveType p_primi
 	static const uint32_t subtractor[RSE::PRIMITIVE_MAX] = { 0, 0, 1, 0, 2 };
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
-void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append) {
+void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_svogi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	uint64_t frame = RSG::rasterizer->get_frame_number();
 
@@ -1060,8 +1060,8 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 					flags |= INSTANCE_DATA_FLAG_USE_VOXEL_GI;
 					uses_gi = true;
 				} else {
-					if (p_using_sdfgi && inst->can_sdfgi) {
-						flags |= INSTANCE_DATA_FLAG_USE_SDFGI;
+					if (p_using_svogi && inst->can_svogi) {
+						flags |= INSTANCE_DATA_FLAG_USE_SVOGI;
 						uses_gi = true;
 					}
 					inst->gi_offset_cache = 0xFFFFFFFF;
@@ -1254,10 +1254,10 @@ void RenderForwardClustered::_setup_lightmaps(const RenderDataRD *p_render_data,
 	}
 }
 
-/* SDFGI */
+/* SVOGI */
 
-void RenderForwardClustered::_update_sdfgi(RenderDataRD *p_render_data) {
-	if (p_render_data->sdfgi_update_data == nullptr) {
+void RenderForwardClustered::_update_svogi(RenderDataRD *p_render_data) {
+	if (p_render_data->svogi_update_data == nullptr) {
 		return;
 	}
 
@@ -1266,19 +1266,19 @@ void RenderForwardClustered::_update_sdfgi(RenderDataRD *p_render_data) {
 		rb = p_render_data->render_buffers;
 	}
 
-	if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-		RENDER_TIMESTAMP("Render SDFGI");
-		Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
+	if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SVOGI)) {
+		RENDER_TIMESTAMP("Render SVOGI");
+		Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
 		float exposure_normalization = 1.0;
 
 		if (p_render_data->camera_attributes.is_valid()) {
 			exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 		}
-		for (int i = 0; i < p_render_data->render_sdfgi_region_count; i++) {
-			sdfgi->render_region(rb, p_render_data->render_sdfgi_regions[i].region, p_render_data->render_sdfgi_regions[i].instances, exposure_normalization);
+		for (int i = 0; i < p_render_data->render_svogi_region_count; i++) {
+			svogi->render_region(rb, p_render_data->render_svogi_regions[i].region, p_render_data->render_svogi_regions[i].instances, exposure_normalization);
 		}
-		if (p_render_data->sdfgi_update_data->update_static) {
-			sdfgi->render_static_lights(p_render_data, rb, p_render_data->sdfgi_update_data->static_cascade_count, p_render_data->sdfgi_update_data->static_cascade_indices, p_render_data->sdfgi_update_data->static_positional_lights);
+		if (p_render_data->svogi_update_data->update_static) {
+			svogi->render_static_lights(p_render_data, rb, p_render_data->svogi_update_data->static_cascade_count, p_render_data->svogi_update_data->static_cascade_indices, p_render_data->svogi_update_data->static_positional_lights);
 		}
 	}
 }
@@ -1327,9 +1327,9 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 	ERR_FAIL_COND(!p_render_buffers->has_custom_data(RB_SCOPE_GI));
 	Ref<RendererRD::GI::RenderBuffersGI> rbgi = p_render_buffers->get_custom_data(RB_SCOPE_GI);
 
-	Ref<RendererRD::GI::SDFGI> sdfgi;
-	if (p_render_buffers->has_custom_data(RB_SCOPE_SDFGI)) {
-		sdfgi = p_render_buffers->get_custom_data(RB_SCOPE_SDFGI);
+	Ref<RendererRD::GI::SVOGI> svogi;
+	if (p_render_buffers->has_custom_data(RB_SCOPE_SVOGI)) {
+		svogi = p_render_buffers->get_custom_data(RB_SCOPE_SVOGI);
 	}
 
 	Size2i size = p_render_buffers->get_internal_size();
@@ -1383,7 +1383,7 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 		settings.vfog = fog;
 		settings.cluster_builder = rb_data->cluster_builder;
 		settings.rbgi = rbgi;
-		settings.sdfgi = sdfgi;
+		settings.svogi = svogi;
 		settings.env = p_environment;
 		settings.sky = &sky;
 		settings.gi = &gi;
@@ -1533,9 +1533,9 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 	RENDER_TIMESTAMP("Setup Shadows");
 
-	if (rb.is_valid() && p_use_gi && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-		Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-		sdfgi->store_probes();
+	if (rb.is_valid() && p_use_gi && rb->has_custom_data(RB_SCOPE_SVOGI)) {
+		Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
+		svogi->store_probes();
 	}
 
 	Size2i viewport_size = Size2i(1, 1);
@@ -1838,7 +1838,7 @@ RID RenderForwardClustered::meshlet_lights_buffer_rid(const Vector<MeshletLightG
 	return meshlet_lights_buffer;
 }
 
-void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_data) {
+void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_data, RenderListType p_list_type) {
 	meshlet_scan_instance_transforms.clear();
 	meshlet_scan_material_ids.clear();
 	meshlet_scan_ranges.clear();
@@ -1849,15 +1849,12 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 	// (default true - meshlet replacement is the unconditional default for qualifying meshes once
 	// Phase B3 shipped). --meshlet-replace-default forces it on regardless of the project setting
 	// (useful for A/B comparison in a project that disabled it); --meshlet-disable forces it off
-	// regardless (useful for perf comparison even in a project that has it on by default) -
-	// neither flag *replaces* the project setting, they layer on top of it as developer overrides.
+	// entirely.
+	static bool initialized = false;
 	static bool overlay_enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-debug-overlay") != nullptr;
 	static bool force_enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-replace-default") != nullptr;
 	static bool force_disabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-disable") != nullptr;
 	bool replace_enabled = !force_disabled && (force_enabled || bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/enabled")));
-	if (!overlay_enabled && !replace_enabled) {
-		return;
-	}
 
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	if (!mesh_storage) {
@@ -1871,7 +1868,7 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 	// GeometryInstanceSurfaceDataCache); only RSE::INSTANCE_MESH instances with baked meshlets on
 	// that surface are included (multimesh/particles/skeleton-deformed meshes are out of scope
 	// for this first pass, same LOD0-only simplicity as every other phase so far).
-	for (GeometryInstanceSurfaceDataCache *sdcache : render_list[RENDER_LIST_OPAQUE].elements) {
+	for (GeometryInstanceSurfaceDataCache *sdcache : render_list[p_list_type].elements) {
 		GeometryInstanceForwardClustered *inst = sdcache->owner;
 		if (!inst || !inst->data || inst->data->base_type != RSE::INSTANCE_MESH) {
 			continue;
@@ -2010,11 +2007,11 @@ bool RenderForwardClustered::_meshlet_early_pass_should_engage(Ref<RenderSceneBu
 	}
 	if (p_depth_pass_mode != PASS_MODE_DEPTH) {
 		// PASS_MODE_DEPTH_NORMAL_ROUGHNESS(_VOXEL_GI): the real depth pre-pass framebuffer also
-		// has normal_roughness (and voxelgi) color attachments this frame (SSAO/SSIL/SDFGI/VOXELGI
+		// has normal_roughness (and voxelgi) color attachments this frame (SSAO/SSIL/SVOGI/VOXELGI
 		// or the normal-buffer debug view are active) that the depth-only meshlet pipeline doesn't
 		// populate at all - drawing into that framebuffer would leave those attachments
 		// unwritten/garbage wherever the early pass draws. Scoped out for this first cut; the
-		// common case (no SSAO/SSIL/SDFGI/VOXELGI active) hits PASS_MODE_DEPTH and is unaffected.
+		// common case (no SSAO/SSIL/SVOGI/VOXELGI active) hits PASS_MODE_DEPTH and is unaffected.
 		return false;
 	}
 	// Defensive: meshlet_hiz_history_valid is set true at the end of a frame that successfully
@@ -2191,8 +2188,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
 	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
 
-	// sdfgi first
-	_update_sdfgi(p_render_data);
+	// svogi first
+	_update_svogi(p_render_data);
 
 	// assign render indices to voxel_gi_instances
 	for (uint32_t i = 0; i < (uint32_t)p_render_data->voxel_gi_instances->size(); i++) {
@@ -2212,12 +2209,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		p_render_data->voxel_gi_count = 0;
 
-		if (rb->has_custom_data(RB_SCOPE_SDFGI)) {
-			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-			if (sdfgi.is_valid()) {
-				sdfgi->update_cascades();
-				sdfgi->pre_process_gi(p_render_data->scene_data->cam_transform, p_render_data);
-				sdfgi->update_light();
+		if (rb->has_custom_data(RB_SCOPE_SVOGI)) {
+			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
+			if (svogi.is_valid()) {
+				svogi->update_cascades();
+				svogi->pre_process_gi(p_render_data->scene_data->cam_transform, p_render_data);
+				svogi->update_light();
 			}
 		}
 
@@ -2294,7 +2291,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	Vector<Color> depth_pass_clear;
 	bool using_separate_specular = false;
 	bool using_ssr = false;
-	bool using_sdfgi = false;
+	bool using_svogi = false;
 	bool using_voxelgi = false;
 	bool reverse_cull = p_render_data->scene_data->cam_transform.basis.determinant() < 0;
 	bool using_ssil = !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssil_enabled(p_render_data->environment);
@@ -2334,8 +2331,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 
 		if (p_render_data->environment.is_valid()) {
-			if (environment_get_sdfgi_enabled(p_render_data->environment) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
-				using_sdfgi = true;
+			if (environment_get_svogi_enabled(p_render_data->environment) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
+				using_svogi = true;
 			}
 			if (environment_get_ssr_enabled(p_render_data->environment)) {
 				if (!p_render_data->transparent_bg) {
@@ -2371,7 +2368,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// May have changed due to the above (light buffer enlarged, as an example).
 	_update_render_base_uniform_set();
 
-	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_sdfgi, using_sdfgi || using_voxelgi, using_motion_pass);
+	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_svogi, using_svogi || using_voxelgi, using_motion_pass);
 	_meshlet_scan_render_list(p_render_data);
 	render_list[RENDER_LIST_OPAQUE].sort_by_key();
 	render_list[RENDER_LIST_MOTION].sort_by_key();
@@ -2389,7 +2386,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI;
 		} else if (p_render_data->environment.is_valid()) {
 			if (using_ssr ||
-					using_sdfgi ||
+					using_svogi ||
 					environment_get_ssao_enabled(p_render_data->environment) ||
 					using_ssil ||
 					ce_needs_normal_roughness ||
@@ -2570,7 +2567,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	bool ce_pre_transparent_resolved_depth = use_msaa && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_ACCESS_RESOLVED_DEPTH, RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT);
 
 	bool debug_voxelgis = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_ALBEDO || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_LIGHTING || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_EMISSION;
-	bool debug_sdfgi_probes = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SDFGI_PROBES;
+	bool debug_svogi_probes = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SVOGI_PROBES;
 	bool force_depth_pre_pass = scene_state.used_opaque_stencil;
 	bool depth_pre_pass = (force_depth_pre_pass || bool(GLOBAL_GET_CACHED(bool, "rendering/driver/depth_prepass/enable"))) && depth_framebuffer.is_valid();
 
@@ -2599,7 +2596,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	}
 
 	if (depth_pre_pass) { //depth pre pass
-		bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
+		bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_svogi || using_voxelgi);
 		if (needs_pre_resolve) {
 			RENDER_TIMESTAMP("GI + Render Depth Pre-Pass (Parallel)");
 		} else {
@@ -2612,14 +2609,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				RD::get_singleton()->draw_list_end();
 			} // else: the early pass already cleared+wrote depth_framebuffer this frame - clearing again here would discard its output.
 			//start compute processes here, so they run at the same time as depth pre-pass
-			_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
+			_post_prepass_render(p_render_data, using_svogi || using_voxelgi);
 		}
 
 		RD::get_singleton()->draw_command_begin_label("Render Depth Pre-Pass");
 
 		RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, nullptr, RID(), samplers, depth_prepass_uniform_buffer_index);
 
-		bool finish_depth = using_ssao || using_ssil || using_sdfgi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
+		bool finish_depth = using_ssao || using_ssil || using_svogi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
 
 		// When the early meshlet pass engaged this frame, it already cleared+wrote depth_framebuffer
 		// for meshlet-replaceable instances - skip them here (same meshlet_replace_skip_set filtering
@@ -2685,7 +2682,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			normal_roughness_views[v] = rb_data->get_normal_roughness(v);
 		}
 	}
-	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
+	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_svogi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
 
 	if (current_cluster_builder) {
 		base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
@@ -2813,14 +2810,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RD::get_singleton()->draw_list_end();
 	}
 
-	if (debug_sdfgi_probes) {
+	if (debug_svogi_probes) {
 		Projection dc;
 		dc.set_depth_correction(true);
 		Projection cms[RendererSceneRender::MAX_RENDER_VIEWS];
 		for (uint32_t v = 0; v < p_render_data->scene_data->view_count; v++) {
 			cms[v] = (dc * p_render_data->scene_data->view_projection[v]) * Projection(p_render_data->scene_data->cam_transform.affine_inverse());
 		}
-		_debug_sdfgi_probes(rb, color_only_framebuffer, p_render_data->scene_data->view_count, cms);
+		_debug_svogi_probes(rb, color_only_framebuffer, p_render_data->scene_data->view_count, cms);
 	}
 
 	if (draw_sky || draw_sky_fog_only) {
@@ -3083,18 +3080,18 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (rb_data.is_valid()) {
 		_render_buffers_debug_draw(p_render_data);
 
-		if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SDFGI && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
+		if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SVOGI && rb->has_custom_data(RB_SCOPE_SVOGI)) {
+			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
 			Vector<RID> view_rids;
 
-			// SDFGI renders at internal resolution, need to check if our debug correctly supports outputting upscaled.
+			// SVOGI renders at internal resolution, need to check if our debug correctly supports outputting upscaled.
 			Size2i size = rb->get_internal_size();
 			RID source_texture = rb->get_internal_texture();
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				view_rids.push_back(rb->get_internal_texture(v));
 			}
 
-			sdfgi->debug_draw(p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, size.x, size.y, rb->get_render_target(), source_texture, view_rids);
+			svogi->debug_draw(p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->cam_transform, size.x, size.y, rb->get_render_target(), source_texture, view_rids);
 		}
 	}
 }
@@ -3626,10 +3623,10 @@ void RenderForwardClustered::_render_uv2(const PagedArray<RenderGeometryInstance
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void RenderForwardClustered::_render_sdfgi(Ref<RenderSceneBuffersRD> p_render_buffers, const Vector3i &p_from, const Vector3i &p_size, const AABB &p_bounds, const PagedArray<RenderGeometryInstance *> &p_instances, const RID &p_albedo_texture, const RID &p_emission_texture, const RID &p_emission_aniso_texture, const RID &p_geom_facing_texture, float p_exposure_normalization) {
-	RENDER_TIMESTAMP("Render SDFGI");
+void RenderForwardClustered::_render_svogi(Ref<RenderSceneBuffersRD> p_render_buffers, const Vector3i &p_from, const Vector3i &p_size, const AABB &p_bounds, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_visible_meshlets, RID &r_transforms, uint32_t &r_max_visible) {
+	RENDER_TIMESTAMP("Render SVOGI");
 
-	RD::get_singleton()->draw_command_begin_label("Render SDFGI Voxel");
+	RD::get_singleton()->draw_command_begin_label("Render SVOGI Voxel");
 
 	RenderSceneDataRD scene_data;
 
@@ -3639,70 +3636,38 @@ void RenderForwardClustered::_render_sdfgi(Ref<RenderSceneBuffersRD> p_render_bu
 	render_data.cluster_max_elements = 32;
 	render_data.instances = &p_instances;
 
-	_update_render_base_uniform_set();
-
-	// Indicate pipelines for SDFGI are required.
-	global_pipeline_data_required.use_sdfgi = true;
-
 	PassMode pass_mode = PASS_MODE_SDF;
 	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode);
-	render_list[RENDER_LIST_SECONDARY].sort_by_key();
-	_fill_instance_data(RENDER_LIST_SECONDARY);
+	
+	// Scan the instances and collect meshlets in the SVOGI bounds.
+	_meshlet_scan_render_list(&render_data, RENDER_LIST_SECONDARY);
 
-	Vector3 half_size = p_bounds.size * 0.5;
-	Vector3 center = p_bounds.position + half_size;
+	RendererRD::MeshletCuller *meshlet_culler = RendererRD::MeshletCuller::get_singleton();
+	if (meshlet_culler && meshlet_scan_ranges.size() > 0) {
+		RID transforms_buffer = meshlet_scan_transforms_buffer();
 
-	//print_line("re-render " + p_from + " - " + p_size + " bounds " + p_bounds);
-	for (int i = 0; i < 3; i++) {
-		scene_state.ubo.sdf_offset[i] = p_from[i];
-		scene_state.ubo.sdf_size[i] = p_size[i];
-	}
+		Vector<Plane> planes;
+		Vector3 center = p_bounds.get_center();
+		Vector3 half_extents = p_bounds.size * 0.5;
 
-	for (int i = 0; i < 3; i++) {
-		Vector3 axis;
-		axis[i] = 1.0;
-		Vector3 up, right;
-		int right_axis = (i + 1) % 3;
-		int up_axis = (i + 2) % 3;
-		up[up_axis] = 1.0;
-		right[right_axis] = 1.0;
+		planes.push_back(Plane(Vector3(1, 0, 0), center.x + half_extents.x));
+		planes.push_back(Plane(Vector3(-1, 0, 0), -(center.x - half_extents.x)));
+		planes.push_back(Plane(Vector3(0, 1, 0), center.y + half_extents.y));
+		planes.push_back(Plane(Vector3(0, -1, 0), -(center.y - half_extents.y)));
+		planes.push_back(Plane(Vector3(0, 0, 1), center.z + half_extents.z));
+		planes.push_back(Plane(Vector3(0, 0, -1), -(center.z - half_extents.z)));
 
-		Size2i fb_size;
-		fb_size.x = p_size[right_axis];
-		fb_size.y = p_size[up_axis];
-
-		scene_data.cam_transform.origin = center + axis * half_size;
-		scene_data.cam_transform.basis.set_column(0, right);
-		scene_data.cam_transform.basis.set_column(1, up);
-		scene_data.cam_transform.basis.set_column(2, axis);
-
-		//print_line("pass: " + itos(i) + " xform " + scene_data.cam_transform);
-
-		float h_size = half_size[right_axis];
-		float v_size = half_size[up_axis];
-		float d_size = half_size[i] * 2.0;
-		scene_data.cam_projection.set_orthogonal(-h_size, h_size, -v_size, v_size, 0, d_size);
-		//print_line("pass: " + itos(i) + " cam hsize: " + rtos(h_size) + " vsize: " + rtos(v_size) + " dsize " + rtos(d_size));
-
-		Transform3D to_bounds;
-		to_bounds.origin = p_bounds.position;
-		to_bounds.basis.scale(p_bounds.size);
-
-		RendererRD::MaterialStorage::store_transform(to_bounds.affine_inverse() * scene_data.cam_transform, scene_state.ubo.sdf_to_bounds);
-
-		scene_data.emissive_exposure_normalization = p_exposure_normalization;
-		uint32_t uniform_buffer_index = _setup_environment(&render_data, true, fb_size, fb_size, Color());
-
-		RID rp_uniform_set = _setup_sdfgi_render_pass_uniform_set(p_albedo_texture, p_emission_texture, p_emission_aniso_texture, p_geom_facing_texture, RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default(), uniform_buffer_index);
-
-		HashMap<Size2i, RID>::Iterator E = sdfgi_framebuffer_size_cache.find(fb_size);
-		if (!E) {
-			RID fb = RD::get_singleton()->framebuffer_create_empty(fb_size);
-			E = sdfgi_framebuffer_size_cache.insert(fb_size, fb);
-		}
-
-		RenderListParameters render_list_params(render_list[RENDER_LIST_SECONDARY].elements.ptr(), render_list[RENDER_LIST_SECONDARY].element_info.ptr(), render_list[RENDER_LIST_SECONDARY].elements.size(), true, pass_mode, 0, true, false, rp_uniform_set, false);
-		_render_list_with_draw_list(&render_list_params, E->value);
+		// Ensure an adequate live capacity. SVOGI cascades might cover large areas.
+		uint32_t MESHLET_LIVE_CAPACITY = 100000; 
+		RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, p_bounds.get_center(), MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY);
+		
+		r_visible_meshlets = frustum_result.visible_buffer;
+		r_transforms = transforms_buffer;
+		r_max_visible = MESHLET_LIVE_CAPACITY;
+	} else {
+		r_visible_meshlets = RID();
+		r_transforms = RID();
+		r_max_visible = 0;
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -3821,7 +3786,7 @@ void RenderForwardClustered::_update_render_base_uniform_set() {
 			RD::Uniform u;
 			u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
 			u.binding = 14;
-			u.append_id(sdfgi_get_ubo());
+			u.append_id(svogi_get_ubo());
 			uniforms.push_back(u);
 		}
 
@@ -4196,9 +4161,9 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		u.binding = 30;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		RID t;
-		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-			t = sdfgi->lightprobe_texture;
+		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SVOGI)) {
+			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
+			t = svogi->lightprobe_texture;
 		}
 		if (t.is_null()) {
 			t = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE);
@@ -4211,9 +4176,9 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		u.binding = 31;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		RID t;
-		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-			t = sdfgi->occlusion_texture;
+		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SVOGI)) {
+			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
+			t = svogi->occlusion_texture;
 		}
 		if (t.is_null()) {
 			t = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
@@ -4295,7 +4260,7 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_rd, RENDER_PASS_UNIFORM_SET, uniforms);
 }
 
-RID RenderForwardClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_texture, RID p_emission_texture, RID p_emission_aniso_texture, RID p_geom_facing_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index) {
+RID RenderForwardClustered::_setup_svogi_render_pass_uniform_set(RID p_albedo_texture, RID p_emission_texture, RID p_emission_aniso_texture, RID p_geom_facing_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	thread_local LocalVector<RD::Uniform> uniforms;
 	uniforms.clear();
@@ -4467,7 +4432,7 @@ RID RenderForwardClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_te
 
 	p_samplers.append_uniforms(uniforms, 12);
 
-	// actual sdfgi stuff
+	// actual svogi stuff
 
 	{
 		RD::Uniform u;
@@ -4498,15 +4463,15 @@ RID RenderForwardClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_te
 		uniforms.push_back(u);
 	}
 
-	if (scene_shader.default_shader_sdfgi_rd.is_null()) {
-		// The variant for SDF from the default material should only be retrieved when SDFGI is required.
+	if (scene_shader.default_shader_svogi_rd.is_null()) {
+		// The variant for SDF from the default material should only be retrieved when SVOGI is required.
 		ERR_FAIL_NULL_V(scene_shader.default_material_shader_ptr, RID());
 		scene_shader.enable_advanced_shader_group();
-		scene_shader.default_shader_sdfgi_rd = scene_shader.default_material_shader_ptr->get_shader_variant(SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_SDF, 0, true);
-		ERR_FAIL_COND_V(scene_shader.default_shader_sdfgi_rd.is_null(), RID());
+		scene_shader.default_shader_svogi_rd = scene_shader.default_material_shader_ptr->get_shader_variant(SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_SDF, 0, true);
+		ERR_FAIL_COND_V(scene_shader.default_shader_svogi_rd.is_null(), RID());
 	}
 
-	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_sdfgi_rd, RENDER_PASS_UNIFORM_SET, uniforms);
+	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_svogi_rd, RENDER_PASS_UNIFORM_SET, uniforms);
 }
 
 RID RenderForwardClustered::_render_buffers_get_normal_texture(Ref<RenderSceneBuffersRD> p_render_buffers) {
@@ -4553,64 +4518,64 @@ void RenderForwardClustered::sub_surface_scattering_set_scale(float p_scale, flo
 
 RenderForwardClustered *RenderForwardClustered::singleton = nullptr;
 
-void RenderForwardClustered::sdfgi_update(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, const Vector3 &p_world_position) {
+void RenderForwardClustered::svogi_update(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, const Vector3 &p_world_position) {
 	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
 	ERR_FAIL_COND(rb.is_null());
-	Ref<RendererRD::GI::SDFGI> sdfgi;
-	if (rb->has_custom_data(RB_SCOPE_SDFGI)) {
-		sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
+	Ref<RendererRD::GI::SVOGI> svogi;
+	if (rb->has_custom_data(RB_SCOPE_SVOGI)) {
+		svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
 	}
 
-	bool needs_sdfgi = p_environment.is_valid() && environment_get_sdfgi_enabled(p_environment);
-	bool needs_reset = sdfgi.is_valid() ? sdfgi->version != gi.sdfgi_current_version : false;
+	bool needs_svogi = p_environment.is_valid() && environment_get_svogi_enabled(p_environment);
+	bool needs_reset = svogi.is_valid() ? svogi->version != gi.svogi_current_version : false;
 
-	if (!needs_sdfgi || needs_reset) {
-		if (sdfgi.is_valid()) {
+	if (!needs_svogi || needs_reset) {
+		if (svogi.is_valid()) {
 			// delete it
-			sdfgi.unref();
-			rb->set_custom_data(RB_SCOPE_SDFGI, sdfgi);
+			svogi.unref();
+			rb->set_custom_data(RB_SCOPE_SVOGI, svogi);
 		}
 
-		if (!needs_sdfgi) {
+		if (!needs_svogi) {
 			return;
 		}
 	}
 
-	// Ensure advanced shaders are available if SDFGI is used.
-	// Call here as this is the first entry point for SDFGI.
+	// Ensure advanced shaders are available if SVOGI is used.
+	// Call here as this is the first entry point for SVOGI.
 	scene_shader.enable_advanced_shader_group();
 
-	static const uint32_t history_frames_to_converge[RSE::ENV_SDFGI_CONVERGE_MAX] = { 5, 10, 15, 20, 25, 30 };
-	uint32_t requested_history_size = history_frames_to_converge[gi.sdfgi_frames_to_converge];
+	static const uint32_t history_frames_to_converge[RSE::ENV_SVOGI_CONVERGE_MAX] = { 5, 10, 15, 20, 25, 30 };
+	uint32_t requested_history_size = history_frames_to_converge[gi.svogi_frames_to_converge];
 
-	if (sdfgi.is_valid() && (sdfgi->num_cascades != environment_get_sdfgi_cascades(p_environment) || sdfgi->min_cell_size != environment_get_sdfgi_min_cell_size(p_environment) || requested_history_size != sdfgi->history_size || sdfgi->uses_occlusion != environment_get_sdfgi_use_occlusion(p_environment) || sdfgi->y_scale_mode != environment_get_sdfgi_y_scale(p_environment))) {
+	if (svogi.is_valid() && (svogi->num_cascades != environment_get_svogi_cascades(p_environment) || svogi->min_cell_size != environment_get_svogi_min_cell_size(p_environment) || requested_history_size != svogi->history_size || svogi->uses_occlusion != environment_get_svogi_use_occlusion(p_environment) || svogi->y_scale_mode != environment_get_svogi_y_scale(p_environment))) {
 		//configuration changed, erase
-		sdfgi.unref();
-		rb->set_custom_data(RB_SCOPE_SDFGI, sdfgi);
+		svogi.unref();
+		rb->set_custom_data(RB_SCOPE_SVOGI, svogi);
 	}
 
-	if (sdfgi.is_null()) {
+	if (svogi.is_null()) {
 		// re-create
-		sdfgi = gi.create_sdfgi(p_environment, p_world_position, requested_history_size);
-		rb->set_custom_data(RB_SCOPE_SDFGI, sdfgi);
+		svogi = gi.create_svogi(p_environment, p_world_position, requested_history_size);
+		rb->set_custom_data(RB_SCOPE_SVOGI, svogi);
 	} else {
 		//check for updates
-		sdfgi->update(p_environment, p_world_position);
+		svogi->update(p_environment, p_world_position);
 	}
 }
 
-int RenderForwardClustered::sdfgi_get_pending_region_count(const Ref<RenderSceneBuffers> &p_render_buffers) const {
+int RenderForwardClustered::svogi_get_pending_region_count(const Ref<RenderSceneBuffers> &p_render_buffers) const {
 	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
 	ERR_FAIL_COND_V(rb.is_null(), 0);
 
-	if (!rb->has_custom_data(RB_SCOPE_SDFGI)) {
+	if (!rb->has_custom_data(RB_SCOPE_SVOGI)) {
 		return 0;
 	}
-	Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
+	Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
 
 	int dirty_count = 0;
-	for (const RendererRD::GI::SDFGI::Cascade &c : sdfgi->cascades) {
-		if (c.dirty_regions == RendererRD::GI::SDFGI::Cascade::DIRTY_ALL) {
+	for (const RendererRD::GI::SVOGI::Cascade &c : svogi->cascades) {
+		if (c.dirty_regions == RendererRD::GI::SVOGI::Cascade::DIRTY_ALL) {
 			dirty_count++;
 		} else {
 			for (int j = 0; j < 3; j++) {
@@ -4624,32 +4589,32 @@ int RenderForwardClustered::sdfgi_get_pending_region_count(const Ref<RenderScene
 	return dirty_count;
 }
 
-AABB RenderForwardClustered::sdfgi_get_pending_region_bounds(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const {
+AABB RenderForwardClustered::svogi_get_pending_region_bounds(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const {
 	AABB bounds;
 	Vector3i from;
 	Vector3i size;
 
 	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
 	ERR_FAIL_COND_V(rb.is_null(), AABB());
-	Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-	ERR_FAIL_COND_V(sdfgi.is_null(), AABB());
+	Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
+	ERR_FAIL_COND_V(svogi.is_null(), AABB());
 
-	int c = sdfgi->get_pending_region_data(p_region, from, size, bounds);
+	int c = svogi->get_pending_region_data(p_region, from, size, bounds);
 	ERR_FAIL_COND_V(c == -1, AABB());
 	return bounds;
 }
 
-uint32_t RenderForwardClustered::sdfgi_get_pending_region_cascade(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const {
+uint32_t RenderForwardClustered::svogi_get_pending_region_cascade(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const {
 	AABB bounds;
 	Vector3i from;
 	Vector3i size;
 
 	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
 	ERR_FAIL_COND_V(rb.is_null(), -1);
-	Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
-	ERR_FAIL_COND_V(sdfgi.is_null(), -1);
+	Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
+	ERR_FAIL_COND_V(svogi.is_null(), -1);
 
-	return sdfgi->get_pending_region_data(p_region, from, size, bounds);
+	return svogi->get_pending_region_data(p_region, from, size, bounds);
 }
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_dirty() {
@@ -4799,7 +4764,7 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->sort.material_id_lo = (p_material_id & 0x00FFFFFF);
 	sdcache->sort.shader_id = p_shader_id;
 	sdcache->sort.geometry_id = p_mesh.get_local_index(); //only meshes can repeat anyway
-	sdcache->sort.uses_forward_gi = ginstance->can_sdfgi;
+	sdcache->sort.uses_forward_gi = ginstance->can_svogi;
 	sdcache->sort.priority = p_material->priority;
 	sdcache->sort.uses_projector = ginstance->using_projectors;
 	sdcache->sort.uses_softshadow = ginstance->using_softshadows;
@@ -5027,11 +4992,11 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 	}
 
 	ginstance->store_transform_cache = store_transform;
-	ginstance->can_sdfgi = false;
+	ginstance->can_svogi = false;
 
 	if (!RendererRD::LightStorage::get_singleton()->lightmap_instance_is_valid(ginstance->lightmap_instance)) {
 		if (ginstance->voxel_gi_instances[0].is_null() && (ginstance->data->use_baked_light || ginstance->data->use_dynamic_gi)) {
-			ginstance->can_sdfgi = true;
+			ginstance->can_svogi = true;
 		}
 	}
 
@@ -5296,13 +5261,13 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 
-	if (p_global.use_sdfgi) {
-		// Depth pass with SDFGI support.
+	if (p_global.use_svogi) {
+		// Depth pass with SVOGI support.
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_SDF;
 		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), false, false);
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 
-		// Depth pass with SDFGI support for an empty framebuffer.
+		// Depth pass with SVOGI support for an empty framebuffer.
 		pipeline_key.framebuffer_format_id = RD::get_singleton()->framebuffer_format_create_empty();
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
@@ -5641,7 +5606,7 @@ RenderForwardClustered::RenderForwardClustered() {
 		if (is_using_radiance_octmap_array()) {
 			defines += "\n#define USE_RADIANCE_OCTMAP_ARRAY \n";
 		}
-		defines += "\n#define SDFGI_OCT_SIZE " + itos(gi.sdfgi_get_lightprobe_octahedron_size()) + "\n";
+		defines += "\n#define SVOGI_OCT_SIZE " + itos(gi.svogi_get_lightprobe_octahedron_size()) + "\n";
 		defines += "\n#define MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS " + itos(MAX_DIRECTIONAL_LIGHTS) + "\n";
 
 		bool force_vertex_shading = GLOBAL_GET("rendering/shading/overrides/force_vertex_shading");
@@ -5840,8 +5805,8 @@ RenderForwardClustered::~RenderForwardClustered() {
 		memdelete_arr(scene_state.lightmap_captures);
 	}
 
-	while (sdfgi_framebuffer_size_cache.begin()) {
-		RD::get_singleton()->free_rid(sdfgi_framebuffer_size_cache.begin()->value);
-		sdfgi_framebuffer_size_cache.remove(sdfgi_framebuffer_size_cache.begin());
+	while (svogi_framebuffer_size_cache.begin()) {
+		RD::get_singleton()->free_rid(svogi_framebuffer_size_cache.begin()->value);
+		svogi_framebuffer_size_cache.remove(svogi_framebuffer_size_cache.begin());
 	}
 }

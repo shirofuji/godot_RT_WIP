@@ -92,9 +92,9 @@ public:
 	LocalVector<int> directional_shadows;
 
 	/* GI info */
-	const RendererSceneRender::RenderSDFGIData *render_sdfgi_regions = nullptr;
-	int render_sdfgi_region_count = 0;
-	const RendererSceneRender::RenderSDFGIUpdateData *sdfgi_update_data = nullptr;
+	const RendererSceneRender::RenderSVOGIData *render_svogi_regions = nullptr;
+	int render_svogi_region_count = 0;
+	const RendererSceneRender::RenderSVOGIUpdateData *svogi_update_data = nullptr;
 
 	uint32_t voxel_gi_count = 0;
 };

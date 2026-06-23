@@ -167,7 +167,7 @@ layout(constant_id = 2) const bool sc_emulate_point_size = false;
 
 #define REFLECTION_MULTIPLIER 1.0
 
-#define SDFGI_MAX_CASCADES 8
+#define SVOGI_MAX_CASCADES 8
 
 /* Set 0: Base Pass (never changes) */
 
@@ -178,7 +178,7 @@ layout(set = 0, binding = 2) uniform sampler shadow_sampler;
 #define INSTANCE_FLAGS_DYNAMIC (1 << 3)
 #define INSTANCE_FLAGS_NON_UNIFORM_SCALE (1 << 4)
 #define INSTANCE_FLAGS_USE_GI_BUFFERS (1 << 5)
-#define INSTANCE_FLAGS_USE_SDFGI (1 << 6)
+#define INSTANCE_FLAGS_USE_SVOGI (1 << 6)
 #define INSTANCE_FLAGS_USE_LIGHTMAP_CAPTURE (1 << 7)
 #define INSTANCE_FLAGS_USE_LIGHTMAP (1 << 8)
 #define INSTANCE_FLAGS_USE_SH_LIGHTMAP (1 << 9)
@@ -270,7 +270,7 @@ struct SDFVoxelGICascadeData {
 	float exposure_normalization;
 };
 
-layout(set = 0, binding = 14, std140) uniform SDFGI {
+layout(set = 0, binding = 14, std140) uniform SVOGI {
 	vec3 grid_size;
 	uint max_cascades;
 
@@ -294,9 +294,9 @@ layout(set = 0, binding = 14, std140) uniform SDFGI {
 	vec3 cascade_probe_size;
 	uint pad5;
 
-	SDFVoxelGICascadeData cascades[SDFGI_MAX_CASCADES];
+	SDFVoxelGICascadeData cascades[SVOGI_MAX_CASCADES];
 }
-sdfgi;
+svogi;
 
 layout(set = 0, binding = 15) uniform sampler DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP;
 
@@ -445,8 +445,8 @@ layout(set = 1, binding = 28) uniform texture2D ambient_buffer;
 layout(set = 1, binding = 29) uniform texture2D reflection_buffer;
 #define multiviewSampler sampler2D
 #endif
-layout(set = 1, binding = 30) uniform texture2DArray sdfgi_lightprobe_texture;
-layout(set = 1, binding = 31) uniform texture3D sdfgi_occlusion_cascades;
+layout(set = 1, binding = 30) uniform texture2DArray svogi_lightprobe_texture;
+layout(set = 1, binding = 31) uniform texture3D svogi_occlusion_cascades;
 
 struct VoxelGIData {
 	mat4 xform; // 64 - 64

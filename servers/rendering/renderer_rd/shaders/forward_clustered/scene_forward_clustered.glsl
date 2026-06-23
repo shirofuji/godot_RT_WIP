@@ -1678,7 +1678,7 @@ void fragment_shader(in SceneData scene_data) {
 	vec3 diffuse_light = vec3(0.0, 0.0, 0.0);
 	vec3 ambient_light = vec3(0.0, 0.0, 0.0);
 #ifndef MODE_UNSHADED
-	// Used in regular draw pass and when drawing SDFs for SDFGI and materials for VoxelGI.
+	// Used in regular draw pass and when drawing SDFs for SVOGI and materials for VoxelGI.
 	emission *= scene_data.emissive_exposure_normalization;
 #endif
 
@@ -1872,7 +1872,7 @@ void fragment_shader(in SceneData scene_data) {
 	}
 #else
 
-	if (sc_use_forward_gi() && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_SDFGI)) { //has lightmap capture
+	if (sc_use_forward_gi() && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_SVOGI)) { //has lightmap capture
 
 		//make vertex orientation the world one, but still align to camera
 		vec3 cam_pos = mat3(inv_view_matrix) * vertex;
@@ -1880,10 +1880,10 @@ void fragment_shader(in SceneData scene_data) {
 		vec3 cam_reflection = mat3(inv_view_matrix) * reflect(-view, indirect_normal);
 
 		//apply y-mult
-		cam_pos.y *= sdfgi.y_mult;
-		cam_normal.y *= sdfgi.y_mult;
+		cam_pos.y *= svogi.y_mult;
+		cam_normal.y *= svogi.y_mult;
 		cam_normal = normalize(cam_normal);
-		cam_reflection.y *= sdfgi.y_mult;
+		cam_reflection.y *= svogi.y_mult;
 		cam_normal = normalize(cam_normal);
 		cam_reflection = normalize(cam_reflection);
 
@@ -1901,10 +1901,10 @@ void fragment_shader(in SceneData scene_data) {
 		vec3 cascade_pos;
 		vec3 cascade_normal;
 
-		for (uint i = 0; i < sdfgi.max_cascades; i++) {
-			cascade_pos = (cam_pos - sdfgi.cascades[i].position) * sdfgi.cascades[i].to_probe;
+		for (uint i = 0; i < svogi.max_cascades; i++) {
+			cascade_pos = (cam_pos - svogi.cascades[i].position) * svogi.cascades[i].to_probe;
 
-			if (any(lessThan(cascade_pos, vec3(0.0))) || any(greaterThanEqual(cascade_pos, sdfgi.cascade_probe_size))) {
+			if (any(lessThan(cascade_pos, vec3(0.0))) || any(greaterThanEqual(cascade_pos, svogi.cascade_probe_size))) {
 				continue; //skip cascade
 			}
 
@@ -1912,15 +1912,15 @@ void fragment_shader(in SceneData scene_data) {
 			break;
 		}
 
-		if (cascade < SDFGI_MAX_CASCADES) {
+		if (cascade < SVOGI_MAX_CASCADES) {
 			bool use_specular = true;
 			float blend;
 			vec3 diffuse, specular;
-			sdfgi_process(cascade, cascade_pos, cam_pos, cam_normal, cam_reflection, use_specular, roughness, diffuse, specular, blend);
+			svogi_process(cascade, cascade_pos, cam_pos, cam_normal, cam_reflection, use_specular, roughness, diffuse, specular, blend);
 
 			if (blend > 0.0) {
 				//blend
-				if (cascade == sdfgi.max_cascades - 1) {
+				if (cascade == svogi.max_cascades - 1) {
 					diffuse = mix(diffuse, ambient_light, blend);
 					if (use_specular) {
 						indirect_specular_light = mix(specular, indirect_specular_light, blend);
@@ -1928,8 +1928,8 @@ void fragment_shader(in SceneData scene_data) {
 				} else {
 					vec3 diffuse2, specular2;
 					float blend2;
-					cascade_pos = (cam_pos - sdfgi.cascades[cascade + 1].position) * sdfgi.cascades[cascade + 1].to_probe;
-					sdfgi_process(cascade + 1, cascade_pos, cam_pos, cam_normal, cam_reflection, use_specular, roughness, diffuse2, specular2, blend2);
+					cascade_pos = (cam_pos - svogi.cascades[cascade + 1].position) * svogi.cascades[cascade + 1].to_probe;
+					svogi_process(cascade + 1, cascade_pos, cam_pos, cam_normal, cam_reflection, use_specular, roughness, diffuse2, specular2, blend2);
 					diffuse = mix(diffuse, diffuse2, blend);
 					if (use_specular) {
 						specular = mix(specular, specular2, blend);

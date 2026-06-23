@@ -37,11 +37,14 @@
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/pipeline_deferred_rd.h"
 #include "servers/rendering/renderer_rd/shaders/environment/gi.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/environment/sdfgi_debug.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/environment/sdfgi_debug_probes.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/environment/sdfgi_direct_light.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/environment/sdfgi_integrate.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/environment/sdfgi_preprocess.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_debug.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_debug_probes.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_direct_light.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_integrate.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_preprocess.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_voxelize.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_build.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_mipmap.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/voxel_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/voxel_gi_debug.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
@@ -50,7 +53,7 @@
 #include "servers/rendering/storage/utilities.h"
 
 #define RB_SCOPE_GI SNAME("rbgi")
-#define RB_SCOPE_SDFGI SNAME("sdfgi")
+#define RB_SCOPE_SVOGI SNAME("svogi")
 
 #define RB_TEX_AMBIENT SNAME("ambient")
 #define RB_TEX_REFLECTION SNAME("reflection")
@@ -263,10 +266,10 @@ private:
 	PipelineCacheRD voxel_gi_debug_shader_version_pipelines[VOXEL_GI_DEBUG_MAX];
 	RID voxel_gi_debug_uniform_set;
 
-	/* SDFGI */
+	/* SVOGI */
 
-	struct SDFGIShader {
-		enum SDFGIPreprocessShaderVersion {
+	struct SVOGIShader {
+		enum SVOGIPreprocessShaderVersion {
 			PRE_PROCESS_SCROLL,
 			PRE_PROCESS_SCROLL_OCCLUSION,
 			PRE_PROCESS_JUMP_FLOOD_INITIALIZE,
@@ -287,12 +290,33 @@ private:
 			int32_t step_size;
 
 			int32_t half_size;
+			uint32_t use_occlusion;
+			uint32_t is_first;
+			uint32_t is_half;
+
+			uint32_t occlusion_index;
+			int32_t cascade;
+			uint32_t pad[2];
+		};
+
+		struct VoxelizePushConstant {
+			float bounds_center[3];
+			float bounds_half_size;
+			uint32_t max_nodes;
+			uint32_t pad[3];
+		};
+
+		struct ProbeOffsetPushConstant {
+			int32_t probe_offset[3];
+			int32_t step_size;
+
+			int32_t half_size;
 			uint32_t occlusion_index;
 			int32_t cascade;
 			uint32_t pad;
 		};
 
-		SdfgiPreprocessShaderRD preprocess;
+		SvogiPreprocessShaderRD preprocess;
 		RID preprocess_shader;
 		PipelineDeferredRD preprocess_pipeline[PRE_PROCESS_MAX];
 
@@ -310,7 +334,7 @@ private:
 			float cam_origin[3];
 		};
 
-		SdfgiDebugShaderRD debug;
+		SvogiDebugShaderRD debug;
 		RID debug_shader;
 		RID debug_shader_version;
 		PipelineDeferredRD debug_pipeline;
@@ -342,7 +366,7 @@ private:
 			int32_t probe_axis_size;
 		};
 
-		SdfgiDebugProbesShaderRD debug_probes;
+		SvogiDebugProbesShaderRD debug_probes;
 		RID debug_probes_shader;
 		RID debug_probes_shader_version;
 
@@ -388,7 +412,7 @@ private:
 			DIRECT_LIGHT_MODE_DYNAMIC,
 			DIRECT_LIGHT_MODE_MAX
 		};
-		SdfgiDirectLightShaderRD direct_light;
+		SvogiDirectLightShaderRD direct_light;
 		RID direct_light_shader;
 		PipelineDeferredRD direct_light_pipeline[DIRECT_LIGHT_MODE_MAX];
 
@@ -432,13 +456,26 @@ private:
 			uint32_t pad;
 		};
 
-		SdfgiIntegrateShaderRD integrate;
+		SvogiIntegrateShaderRD integrate;
 		RID integrate_shader;
 		PipelineDeferredRD integrate_pipeline[INTEGRATE_MODE_MAX];
 
 		RID integrate_default_sky_uniform_set;
 
-	} sdfgi_shader;
+		SvogiVoxelizeShaderRD voxelize;
+		RID voxelize_shader;
+		PipelineDeferredRD voxelize_pipeline_clear;
+		PipelineDeferredRD voxelize_pipeline;
+
+		SvogiBuildShaderRD build;
+		RID build_shader;
+		PipelineDeferredRD build_pipeline;
+
+		SvogiMipmapShaderRD mipmap;
+		RID mipmap_shader;
+		PipelineDeferredRD mipmap_pipeline;
+
+	} svogi_shader;
 
 public:
 	static GI *get_singleton() { return singleton; }
@@ -551,10 +588,10 @@ public:
 
 	RSE::VoxelGIQuality voxel_gi_quality = RSE::VOXEL_GI_QUALITY_LOW;
 
-	/* SDFGI */
+	/* SVOGI */
 
-	class SDFGI : public RenderBufferCustomDataRD {
-		GDCLASS(SDFGI, RenderBufferCustomDataRD)
+	class SVOGI : public RenderBufferCustomDataRD {
+		GDCLASS(SVOGI, RenderBufferCustomDataRD)
 
 	public:
 		enum {
@@ -565,7 +602,8 @@ public:
 			MAX_DYNAMIC_LIGHTS = 128,
 			MAX_STATIC_LIGHTS = 1024,
 			LIGHTPROBE_OCT_SIZE = 6,
-			SH_SIZE = 16
+			SH_SIZE = 16,
+			MAX_NODES = 16777216 // 16M nodes
 		};
 
 		struct Cascade {
@@ -675,19 +713,30 @@ public:
 		float energy = 1.0;
 		float normal_bias = 1.1;
 		float probe_bias = 1.1;
-		RSE::EnvironmentSDFGIYScale y_scale_mode = RSE::ENV_SDFGI_Y_SCALE_75_PERCENT;
+		RSE::EnvironmentSVOGIYScale y_scale_mode = RSE::ENV_SVOGI_Y_SCALE_75_PERCENT;
 
 		float y_mult = 1.0;
 
 		uint32_t version = 0;
 		uint32_t render_pass = 0;
 
-		int32_t cascade_dynamic_light_count[SDFGI::MAX_CASCADES]; //used dynamically
+		int32_t cascade_dynamic_light_count[SVOGI::MAX_CASCADES]; //used dynamically
 		RID integrate_sky_uniform_set;
+
+		// SVOGI specific Octree SSBOs
+		RID octree_nodes_buffer;
+		RID octree_bricks_buffer;
+		RID atomic_counter_buffer;
+		RID octree_uniform_set;
+
+		// Uniforms for SVOGI Compute Passes
+		RID svogi_voxelize_uniform_set;
+		RID svogi_build_uniform_set;
+		RID svogi_mipmap_uniform_set;
 
 		virtual void configure(RenderSceneBuffersRD *p_render_buffers) override {}
 		virtual void free_data() override;
-		~SDFGI();
+		~SVOGI();
 
 		void create(RID p_env, const Vector3 &p_world_position, uint32_t p_requested_history_size, GI *p_gi);
 		void update(RID p_env, const Vector3 &p_world_position);
@@ -705,24 +754,24 @@ public:
 		void render_static_lights(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_cascade_count, const uint32_t *p_cascade_indices, const PagedArray<RID> *p_positional_light_cull_result);
 	};
 
-	RSE::EnvironmentSDFGIRayCount sdfgi_ray_count = RSE::ENV_SDFGI_RAY_COUNT_16;
-	RSE::EnvironmentSDFGIFramesToConverge sdfgi_frames_to_converge = RSE::ENV_SDFGI_CONVERGE_IN_30_FRAMES;
-	RSE::EnvironmentSDFGIFramesToUpdateLight sdfgi_frames_to_update_light = RSE::ENV_SDFGI_UPDATE_LIGHT_IN_4_FRAMES;
+	RSE::EnvironmentSVOGIRayCount svogi_ray_count = RSE::ENV_SVOGI_RAY_COUNT_16;
+	RSE::EnvironmentSVOGIFramesToConverge svogi_frames_to_converge = RSE::ENV_SVOGI_CONVERGE_IN_30_FRAMES;
+	RSE::EnvironmentSVOGIFramesToUpdateLight svogi_frames_to_update_light = RSE::ENV_SVOGI_UPDATE_LIGHT_IN_4_FRAMES;
 
-	float sdfgi_solid_cell_ratio = 0.25;
-	Vector3 sdfgi_debug_probe_pos;
-	Vector3 sdfgi_debug_probe_dir;
-	bool sdfgi_debug_probe_enabled = false;
-	Vector3i sdfgi_debug_probe_index;
-	uint32_t sdfgi_current_version = 0;
+	float svogi_solid_cell_ratio = 0.25;
+	Vector3 svogi_debug_probe_pos;
+	Vector3 svogi_debug_probe_dir;
+	bool svogi_debug_probe_enabled = false;
+	Vector3i svogi_debug_probe_index;
+	uint32_t svogi_current_version = 0;
 
-	/* SDFGI UPDATE */
+	/* SVOGI UPDATE */
 
-	int sdfgi_get_lightprobe_octahedron_size() const { return SDFGI::LIGHTPROBE_OCT_SIZE; }
+	int svogi_get_lightprobe_octahedron_size() const { return SVOGI::LIGHTPROBE_OCT_SIZE; }
 
-	virtual void sdfgi_reset() override;
+	virtual void svogi_reset() override;
 
-	struct SDFGIData {
+	struct SVOGIData {
 		float grid_size[3];
 		uint32_t max_cascades;
 
@@ -755,7 +804,7 @@ public:
 			float exposure_normalization;
 		};
 
-		ProbeCascadeData cascades[SDFGI::MAX_CASCADES];
+		ProbeCascadeData cascades[SVOGI::MAX_CASCADES];
 	};
 
 	struct VoxelGIData {
@@ -797,7 +846,7 @@ public:
 		float pad3;
 	};
 
-	RID sdfgi_ubo;
+	RID svogi_ubo;
 
 	enum Group {
 		GROUP_NORMAL,
@@ -807,7 +856,7 @@ public:
 	enum Mode {
 		MODE_VOXEL_GI,
 		MODE_VOXEL_GI_WITHOUT_SAMPLER,
-		MODE_SDFGI,
+		MODE_SVOGI,
 		MODE_COMBINED,
 		MODE_COMBINED_WITHOUT_SAMPLER,
 		MODE_MAX
@@ -833,7 +882,7 @@ public:
 	void init(RendererRD::SkyRD *p_sky);
 	void free();
 
-	Ref<SDFGI> create_sdfgi(RID p_env, const Vector3 &p_world_position, uint32_t p_requested_history_size);
+	Ref<SVOGI> create_svogi(RID p_env, const Vector3 &p_world_position, uint32_t p_requested_history_size);
 
 	void setup_voxel_gi_instances(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, const Transform3D &p_transform, const PagedArray<RID> &p_voxel_gi_instances, uint32_t &r_voxel_gi_instances_used);
 	void process_gi(Ref<RenderSceneBuffersRD> p_render_buffers, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer, RID p_environment, uint32_t p_view_count, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_cam_transform, const PagedArray<RID> &p_voxel_gi_instances);

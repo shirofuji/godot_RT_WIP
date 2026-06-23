@@ -812,86 +812,86 @@ float RendererEnvironmentStorage::environment_get_ssil_normal_rejection(RID p_en
 	return env->ssil_normal_rejection;
 }
 
-// SDFGI
+// SVOGI
 
-void RendererEnvironmentStorage::environment_set_sdfgi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSDFGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias) {
+void RendererEnvironmentStorage::environment_set_svogi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSVOGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias) {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL(env);
 #ifdef DEBUG_ENABLED
 	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus" && p_enable) {
-		WARN_PRINT_ONCE_ED("SDFGI is only available when using the Forward+ renderer.");
+		WARN_PRINT_ONCE_ED("SVOGI is only available when using the Forward+ renderer.");
 	}
 #endif
-	env->sdfgi_enabled = p_enable;
-	env->sdfgi_cascades = p_cascades;
-	env->sdfgi_min_cell_size = p_min_cell_size;
-	env->sdfgi_use_occlusion = p_use_occlusion;
-	env->sdfgi_bounce_feedback = p_bounce_feedback;
-	env->sdfgi_read_sky_light = p_read_sky;
-	env->sdfgi_energy = p_energy;
-	env->sdfgi_normal_bias = p_normal_bias;
-	env->sdfgi_probe_bias = p_probe_bias;
-	env->sdfgi_y_scale = p_y_scale;
+	env->svogi_enabled = p_enable;
+	env->svogi_cascades = p_cascades;
+	env->svogi_min_cell_size = p_min_cell_size;
+	env->svogi_use_occlusion = p_use_occlusion;
+	env->svogi_bounce_feedback = p_bounce_feedback;
+	env->svogi_read_sky_light = p_read_sky;
+	env->svogi_energy = p_energy;
+	env->svogi_normal_bias = p_normal_bias;
+	env->svogi_probe_bias = p_probe_bias;
+	env->svogi_y_scale = p_y_scale;
 }
 
-bool RendererEnvironmentStorage::environment_get_sdfgi_enabled(RID p_env) const {
+bool RendererEnvironmentStorage::environment_get_svogi_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
-	return env->sdfgi_enabled;
+	return env->svogi_enabled;
 }
 
-int RendererEnvironmentStorage::environment_get_sdfgi_cascades(RID p_env) const {
+int RendererEnvironmentStorage::environment_get_svogi_cascades(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 4);
-	return env->sdfgi_cascades;
+	return env->svogi_cascades;
 }
 
-float RendererEnvironmentStorage::environment_get_sdfgi_min_cell_size(RID p_env) const {
+float RendererEnvironmentStorage::environment_get_svogi_min_cell_size(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 0.2);
-	return env->sdfgi_min_cell_size;
+	return env->svogi_min_cell_size;
 }
 
-bool RendererEnvironmentStorage::environment_get_sdfgi_use_occlusion(RID p_env) const {
+bool RendererEnvironmentStorage::environment_get_svogi_use_occlusion(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
-	return env->sdfgi_use_occlusion;
+	return env->svogi_use_occlusion;
 }
 
-float RendererEnvironmentStorage::environment_get_sdfgi_bounce_feedback(RID p_env) const {
+float RendererEnvironmentStorage::environment_get_svogi_bounce_feedback(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 0.5);
-	return env->sdfgi_bounce_feedback;
+	return env->svogi_bounce_feedback;
 }
 
-bool RendererEnvironmentStorage::environment_get_sdfgi_read_sky_light(RID p_env) const {
+bool RendererEnvironmentStorage::environment_get_svogi_read_sky_light(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, true);
-	return env->sdfgi_read_sky_light;
+	return env->svogi_read_sky_light;
 }
 
-float RendererEnvironmentStorage::environment_get_sdfgi_energy(RID p_env) const {
+float RendererEnvironmentStorage::environment_get_svogi_energy(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 1.0);
-	return env->sdfgi_energy;
+	return env->svogi_energy;
 }
 
-float RendererEnvironmentStorage::environment_get_sdfgi_normal_bias(RID p_env) const {
+float RendererEnvironmentStorage::environment_get_svogi_normal_bias(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 1.1);
-	return env->sdfgi_normal_bias;
+	return env->svogi_normal_bias;
 }
 
-float RendererEnvironmentStorage::environment_get_sdfgi_probe_bias(RID p_env) const {
+float RendererEnvironmentStorage::environment_get_svogi_probe_bias(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 1.1);
-	return env->sdfgi_probe_bias;
+	return env->svogi_probe_bias;
 }
 
-RSE::EnvironmentSDFGIYScale RendererEnvironmentStorage::environment_get_sdfgi_y_scale(RID p_env) const {
+RSE::EnvironmentSVOGIYScale RendererEnvironmentStorage::environment_get_svogi_y_scale(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
-	ERR_FAIL_NULL_V(env, RSE::ENV_SDFGI_Y_SCALE_75_PERCENT);
-	return env->sdfgi_y_scale;
+	ERR_FAIL_NULL_V(env, RSE::ENV_SVOGI_Y_SCALE_75_PERCENT);
+	return env->svogi_y_scale;
 }
 
 // Adjustments

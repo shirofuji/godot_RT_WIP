@@ -498,7 +498,7 @@ public:
 	FUNC2(light_set_reverse_cull_face_mode, RID, bool)
 	FUNC2(light_set_shadow_caster_mask, RID, uint32_t)
 	FUNC2(light_set_bake_mode, RID, RSE::LightBakeMode)
-	FUNC2(light_set_max_sdfgi_cascade, RID, uint32_t)
+	FUNC2(light_set_max_svogi_cascade, RID, uint32_t)
 
 	FUNC2(light_omni_set_shadow_mode, RID, RSE::LightOmniShadowMode)
 
@@ -607,7 +607,7 @@ public:
 	FUNC2(voxel_gi_set_interior, RID, bool)
 	FUNC2(voxel_gi_set_use_two_bounces, RID, bool)
 
-	FUNC0(sdfgi_reset)
+	FUNC0(svogi_reset)
 
 	/* PARTICLES */
 
@@ -886,10 +886,10 @@ public:
 	FUNC2(environment_set_volumetric_fog_volume_size, int, int)
 	FUNC1(environment_set_volumetric_fog_filter_active, bool)
 
-	FUNC11(environment_set_sdfgi, RID, bool, int, float, RSE::EnvironmentSDFGIYScale, bool, float, bool, float, float, float)
-	FUNC1(environment_set_sdfgi_ray_count, RSE::EnvironmentSDFGIRayCount)
-	FUNC1(environment_set_sdfgi_frames_to_converge, RSE::EnvironmentSDFGIFramesToConverge)
-	FUNC1(environment_set_sdfgi_frames_to_update_light, RSE::EnvironmentSDFGIFramesToUpdateLight)
+	FUNC11(environment_set_svogi, RID, bool, int, float, RSE::EnvironmentSVOGIYScale, bool, float, bool, float, float, float)
+	FUNC1(environment_set_svogi_ray_count, RSE::EnvironmentSVOGIRayCount)
+	FUNC1(environment_set_svogi_frames_to_converge, RSE::EnvironmentSVOGIFramesToConverge)
+	FUNC1(environment_set_svogi_frames_to_update_light, RSE::EnvironmentSVOGIFramesToUpdateLight)
 
 	FUNC3R(Ref<Image>, environment_bake_panorama, RID, bool, const Size2i &)
 
@@ -1243,7 +1243,7 @@ public:
 
 	virtual bool is_low_end() const override;
 
-	virtual void sdfgi_set_debug_probe_select(const Vector3 &p_position, const Vector3 &p_dir) override;
+	virtual void svogi_set_debug_probe_select(const Vector3 &p_position, const Vector3 &p_dir) override;
 
 	virtual void set_print_gpu_profile(bool p_enable) override;
 
