@@ -32,13 +32,14 @@ void main() {
 	if (idx == 0u) {
 		// Reset node allocator (0 is root)
 		alloc_counter = 1u;
-		
+
 		// Clear root node
 		nodes[0].children_base_index = 0u;
 		nodes[0].child_mask = 0u;
 		nodes[0].albedo = 0u;
 		nodes[0].normal = 0u;
 		nodes[0].emission = 0u;
+		nodes[0].pad[0] = 0u; // depth
 	}
 }
 #endif
@@ -89,6 +90,35 @@ layout(set = 1, binding = 5, std430) restrict readonly buffer VertexPositions {
 layout(set = 1, binding = 6, std430) restrict readonly buffer VertexAttributes {
 	vec4 data[];
 } vertex_attributes;
+
+// Per-instance material slot (mirrors meshlet_render.glsl's InstanceMaterialIds binding exactly -
+// same resolution-at-scan-time data, see RenderForwardClustered::_meshlet_scan_render_list()).
+layout(set = 1, binding = 7, std430) restrict readonly buffer InstanceMaterialIds {
+	uint data[];
+} instance_material_ids;
+
+// Mirrors MeshletStorage::MeshletMaterialGPU's std430 layout exactly (see meshlet_render.glsl's
+// own MeshletMaterial struct) - only albedo/emission are used here; texture indices are ignored
+// since this voxelization pass has no UVs to sample with.
+struct MeshletMaterial {
+	vec4 albedo;
+	vec3 emission;
+	float metallic;
+	float roughness;
+	float specular;
+	uint albedo_texture_index;
+	uint normal_texture_index;
+	uint orm_texture_index;
+	uint emission_texture_index;
+	uint flags;
+	float alpha_scissor_threshold;
+	vec2 uv1_scale;
+	vec2 uv1_offset;
+};
+
+layout(set = 1, binding = 8, std430) restrict readonly buffer MeshletMaterials {
+	MeshletMaterial data[];
+} meshlet_materials;
 
 layout(push_constant, std430) uniform Params {
 	vec3 bounds_center;
@@ -154,9 +184,28 @@ void main() {
 				if (new_base >= params.max_nodes - 8u) {
 					break; // Out of memory
 				}
+				// Zero the 8 new children and stamp their depth (depth+1, since these are this
+				// node's children) BEFORE publishing children_base_index below - nothing else can
+				// reach these slots via the tree until the atomicCompSwap succeeds, so this
+				// ordering is race-free. The buffer isn't cleared between region-update cycles
+				// beyond the root node (see MODE_CLEAR), so these slots may hold stale data from a
+				// previous cycle that allocated the same index range for a differently-shaped tree
+				// - without this, a stale child_mask/children_base_index could make the cone-trace
+				// traversal follow a dangling pointer into garbage data, or a stale depth value
+				// could make the mipmap pass skip/misprocess this node entirely.
+				for (uint c = 0u; c < 8u; c++) {
+					nodes[new_base + c].children_base_index = 0u;
+					nodes[new_base + c].child_mask = 0u;
+					nodes[new_base + c].albedo = 0u;
+					nodes[new_base + c].normal = 0u;
+					nodes[new_base + c].emission = 0u;
+					nodes[new_base + c].pad[0] = depth + 1u;
+				}
 				uint old_val = atomicCompSwap(nodes[node_idx].children_base_index, 0u, new_base);
 				if (old_val != 0u) {
-					// Another thread allocated first, use theirs
+					// Another thread allocated first, use theirs - our own new_base allocation
+					// above is now wasted/leaked space for this clear cycle, which is acceptable
+					// given MAX_NODES' ample headroom for this prototype's scale.
 					base_idx = old_val;
 				} else {
 					base_idx = new_base;
@@ -167,11 +216,21 @@ void main() {
 			node_idx = base_idx + child_idx;
 		}
 		
-		// Leaf node insertion
-		// Simple encoding for albedo (e.g., solid white for prototype if we don't have texture mapping here)
-		uint packed_color = 0xFFFFFFFFu; // R8G8B8A8 white
+		// Leaf node insertion - real material albedo/emission (same per-instance resolution the
+		// meshlet renderer itself uses, see InstanceMaterialIds/MeshletMaterials above), replacing
+		// the original hardcoded-white placeholder. Without this, SVOGI could only ever bounce
+		// flat white light regardless of the actual surface's color.
+		uint material_id = instance_material_ids.data[item.instance_index];
+		vec4 albedo = meshlet_materials.data[material_id].albedo;
+		uvec4 albedo_bytes = uvec4(clamp(albedo, vec4(0.0), vec4(1.0)) * 255.0 + 0.5);
+		uint packed_color = (albedo_bytes.r << 24u) | (albedo_bytes.g << 16u) | (albedo_bytes.b << 8u) | albedo_bytes.a;
 		atomicMax(nodes[node_idx].albedo, packed_color); // Use atomicMax to ensure it writes if 0
-		
+
+		vec3 emission = meshlet_materials.data[material_id].emission;
+		uvec3 emission_bytes = uvec3(clamp(emission, vec3(0.0), vec3(1.0)) * 255.0 + 0.5);
+		uint packed_emission = (emission_bytes.r << 16u) | (emission_bytes.g << 8u) | emission_bytes.b;
+		atomicMax(nodes[node_idx].emission, packed_emission);
+
 		// Pack normal: 8-bit xyz mapped to 0-255
 		vec3 n = normal * 0.5 + 0.5;
 		uint nx = uint(n.x * 255.0) & 0xFFu;

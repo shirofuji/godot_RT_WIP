@@ -1157,6 +1157,12 @@ void GI::SVOGI::create(RID p_env, const Vector3 &p_world_position, uint32_t p_re
 			uniforms.push_back(u);
 		}
 		octree_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.voxelize.version_get_shader(gi->svogi_shader.voxelize_shader, 0), 0);
+		// Same set 0 (OctreeNodes + AtomicCounter), validated against the mipmap shader instead of
+		// voxelize - RD validates a uniform set against the specific shader version it's created
+		// for, so a set created for one shader can't safely be assumed bound-compatible with a
+		// different shader even when the binding layouts are identical (see the voxelize dispatch
+		// fix elsewhere in this file for what happens when that assumption is wrong).
+		svogi_mipmap_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.mipmap.version_get_shader(gi->svogi_shader.mipmap_shader, 0), 0);
 	}
 }
 
@@ -2119,11 +2125,12 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 
 	RID visible_meshlets;
 	RID transforms;
+	RID material_ids;
 	uint32_t max_visible = 0;
 
-	RendererSceneRenderRD::get_singleton()->_render_svogi(p_render_buffers, from, size, bounds, p_instances, visible_meshlets, transforms, max_visible);
+	RendererSceneRenderRD::get_singleton()->_render_svogi(p_render_buffers, from, size, bounds, p_instances, visible_meshlets, transforms, material_ids, max_visible);
 
-	if (visible_meshlets.is_valid() && transforms.is_valid() && max_visible > 0) {
+	if (visible_meshlets.is_valid() && transforms.is_valid() && material_ids.is_valid() && max_visible > 0) {
 		RD::get_singleton()->draw_command_begin_label("SVOGI Voxelize Compute");
 
 		RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
@@ -2178,6 +2185,20 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 			u.append_id(meshlet_storage->get_vertex_attribute_buffer_rid());
 			uniforms.push_back(u);
 		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 7;
+			u.append_id(material_ids);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 8;
+			u.append_id(meshlet_storage->get_meshlet_material_buffer_rid());
+			uniforms.push_back(u);
+		}
 
 		// version index 1 = MODE_VOXELIZE (the variant that actually declares set 1's meshlet data
 		// bindings, per voxelize_modes' push_back order below) - version 0 (MODE_CLEAR) doesn't
@@ -2208,6 +2229,41 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 		
 		RD::get_singleton()->compute_list_end();
 
+		RD::get_singleton()->draw_command_end_label();
+
+		// Mipmap (aggregation) pass: walk the octree from the deepest leaf level up to the root,
+		// one dispatch per level, averaging each internal node's existing children into itself.
+		// Must run strictly bottom-up in separate dispatches (not a single pass) - a parent can
+		// only aggregate correct values once its own children (which may themselves be internal,
+		// already-aggregated nodes) hold their final data for this update. Without this, internal
+		// nodes keep the all-zero albedo/normal/emission they were allocated with, which is why
+		// the cone-trace function previously had to be hacked to always force leaf-depth sampling
+		// regardless of cone width.
+		RD::get_singleton()->draw_command_begin_label("SVOGI Mipmap Octree");
+		RENDER_TIMESTAMP("SVOGI Mipmap Octree");
+		// Dispatch size: a fixed, generous upper bound on possibly-allocated node slots rather than
+		// the full MAX_NODES (16M) - reading the real alloc_counter back to the CPU to size this
+		// precisely would require a GPU->CPU sync between voxelize and this pass; the shader itself
+		// already checks idx against the real alloc_counter and early-returns past it, so this is
+		// just a conservative ceiling on wasted, immediately-returning threads, not a correctness
+		// bound. Revisit with an indirect dispatch (reading alloc_counter as a workgroup count
+		// directly on the GPU) if this prototype-scale cap proves too small or too wasteful.
+		const uint32_t mipmap_dispatch_node_cap = 1 << 20; // ~1M.
+		for (int32_t target_depth = 5; target_depth >= 0; target_depth--) {
+			RD::ComputeListID mipmap_compute_list = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(mipmap_compute_list, gi->svogi_shader.mipmap_pipeline.get_rid());
+			RD::get_singleton()->compute_list_bind_uniform_set(mipmap_compute_list, svogi_mipmap_uniform_set, 0);
+
+			SVOGIShader::MipmapPushConstant mipmap_push_constant;
+			mipmap_push_constant.target_depth = (uint32_t)target_depth;
+
+			RD::get_singleton()->compute_list_set_push_constant(mipmap_compute_list, &mipmap_push_constant, sizeof(SVOGIShader::MipmapPushConstant));
+
+			uint32_t mipmap_dispatch_x = (mipmap_dispatch_node_cap + 63) / 64;
+			RD::get_singleton()->compute_list_dispatch_threads(mipmap_compute_list, mipmap_dispatch_x, 1, 1);
+
+			RD::get_singleton()->compute_list_end();
+		}
 		RD::get_singleton()->draw_command_end_label();
 	}
 

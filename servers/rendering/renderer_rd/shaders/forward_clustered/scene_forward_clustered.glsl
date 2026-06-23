@@ -1897,20 +1897,20 @@ void fragment_shader(in SceneData scene_data) {
 
 		// helper constants, compute once
 
-		uint cascade = 0xFFFFFFFF;
-		vec3 cascade_pos;
+		// Always cascade 0 for this prototype - svogi_cone_trace() does its own bounds check
+		// against the octree's real cascade-0 bounds (bounds_half_extents/bounds_center, derived
+		// from svogi.cascades[0] in scene_forward_gi_inc.glsl) and returns an empty/zero-alpha
+		// result when sample_pos falls outside them, so there's no need to gate the call here too.
+		// The old cascade-selection loop this replaced used svogi.cascades[i].to_probe/
+		// cascade_probe_size - the old SDFGI lightprobe-grid's own coordinate system, unrelated to
+		// the new octree - and never found a valid cascade for this prototype (to_probe/
+		// cascade_probe_size aren't populated/meaningful for the octree path), silently skipping
+		// svogi_process() (and therefore svogi_cone_trace()) entirely regardless of whether the
+		// octree itself had any data - this was the final reason SVOGI never produced any visible
+		// light even after every other part of the pipeline was confirmed working.
+		uint cascade = 0u;
+		vec3 cascade_pos = vec3(0.0);
 		vec3 cascade_normal;
-
-		for (uint i = 0; i < svogi.max_cascades; i++) {
-			cascade_pos = (cam_pos - svogi.cascades[i].position) * svogi.cascades[i].to_probe;
-
-			if (any(lessThan(cascade_pos, vec3(0.0))) || any(greaterThanEqual(cascade_pos, svogi.cascade_probe_size))) {
-				continue; //skip cascade
-			}
-
-			cascade = i;
-			break;
-		}
 
 		if (cascade < SVOGI_MAX_CASCADES) {
 			bool use_specular = true;

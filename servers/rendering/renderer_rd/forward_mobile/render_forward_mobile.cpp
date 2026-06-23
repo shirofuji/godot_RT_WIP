@@ -1827,7 +1827,7 @@ void RenderForwardMobile::_render_uv2(const PagedArray<RenderGeometryInstance *>
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void RenderForwardMobile::_render_svogi(Ref<RenderSceneBuffersRD> p_render_buffers, const Vector3i &p_from, const Vector3i &p_size, const AABB &p_bounds, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_visible_meshlets, RID &r_transforms, uint32_t &r_max_visible) {
+void RenderForwardMobile::_render_svogi(Ref<RenderSceneBuffersRD> p_render_buffers, const Vector3i &p_from, const Vector3i &p_size, const AABB &p_bounds, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_visible_meshlets, RID &r_transforms, RID &r_material_ids, uint32_t &r_max_visible) {
 	// we don't do SVOGI in low end..
 }
 

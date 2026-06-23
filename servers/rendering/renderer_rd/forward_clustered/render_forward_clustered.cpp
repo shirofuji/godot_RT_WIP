@@ -1147,6 +1147,17 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 				if (!force_alpha && (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
 					rl->add_element(surf);
+					// Without this, uses_forward_gi stays at the reset value (0, see this
+					// function's top) for every opaque surface - it was previously only ever set
+					// for the RENDER_LIST_ALPHA (transparent) branch below, meaning
+					// sc_use_forward_gi()/INSTANCE_FLAGS_USE_SVOGI's pipeline specialization was
+					// always false for opaque geometry (the common case for most scenes), and the
+					// entire forward-GI/SVOGI application block in the fragment shader silently
+					// never executed regardless of how correctly the rest of the SVOGI pipeline
+					// (octree population, mipmap aggregation, cascade selection) worked.
+					if (uses_gi) {
+						surf->sort.uses_forward_gi = 1;
+					}
 				}
 
 				if (force_alpha || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
@@ -3623,7 +3634,7 @@ void RenderForwardClustered::_render_uv2(const PagedArray<RenderGeometryInstance
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void RenderForwardClustered::_render_svogi(Ref<RenderSceneBuffersRD> p_render_buffers, const Vector3i &p_from, const Vector3i &p_size, const AABB &p_bounds, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_visible_meshlets, RID &r_transforms, uint32_t &r_max_visible) {
+void RenderForwardClustered::_render_svogi(Ref<RenderSceneBuffersRD> p_render_buffers, const Vector3i &p_from, const Vector3i &p_size, const AABB &p_bounds, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_visible_meshlets, RID &r_transforms, RID &r_material_ids, uint32_t &r_max_visible) {
 	RENDER_TIMESTAMP("Render SVOGI");
 
 	RD::get_singleton()->draw_command_begin_label("Render SVOGI Voxel");
@@ -3663,10 +3674,17 @@ void RenderForwardClustered::_render_svogi(Ref<RenderSceneBuffersRD> p_render_bu
 		
 		r_visible_meshlets = frustum_result.visible_buffer;
 		r_transforms = transforms_buffer;
+		// meshlet_scan_material_ids was already populated by the _meshlet_scan_render_list() call
+		// above (same per-instance material resolution the normal meshlet render path uses, via
+		// MeshletStorage::upload_material()/MeshletMaterialGPU) - reuse it here instead of
+		// hardcoding a flat color in the voxelize shader, so SVOGI's indirect light actually
+		// carries each surface's real albedo.
+		r_material_ids = meshlet_scan_material_ids_buffer();
 		r_max_visible = MESHLET_LIVE_CAPACITY;
 	} else {
 		r_visible_meshlets = RID();
 		r_transforms = RID();
+		r_material_ids = RID();
 		r_max_visible = 0;
 	}
 
@@ -4999,7 +5017,6 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 			ginstance->can_svogi = true;
 		}
 	}
-
 	if (ginstance->data->dirty_dependencies) {
 		ginstance->data->dependency_tracker.update_end();
 		ginstance->data->dirty_dependencies = false;

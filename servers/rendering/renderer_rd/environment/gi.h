@@ -302,6 +302,11 @@ private:
 			uint32_t pad[3];
 		};
 
+		struct MipmapPushConstant {
+			uint32_t target_depth;
+			uint32_t pad[3];
+		};
+
 		struct ProbeOffsetPushConstant {
 			int32_t probe_offset[3];
 			int32_t step_size;
