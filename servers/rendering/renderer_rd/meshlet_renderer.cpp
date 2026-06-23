@@ -105,15 +105,37 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	// the scene's own depth convention on every inter-object comparison.
 	ds.depth_compare_operator = RD::COMPARE_OP_GREATER_OR_EQUAL;
 
-	// Backface culling left disabled (the RD default) - both front and back faces of every
-	// meshlet are rasterized, with the depth test alone deciding the winner. Re-tested with
-	// POLYGON_CULL_BACK + CW front_face after the depth-bias fix landed (in case the earlier test
-	// was confounded by the missing bias) - confirmed it's a genuine, separate bug: the exact same
-	// hole reappears even with the bias in place. Meshlet triangle winding likely isn't reliably
-	// consistent across all meshlets from this pipeline (SurfaceTool::build_meshlets/meshoptimizer
-	// may not guarantee uniform winding when repartitioning a source index buffer into clusters).
-	// Worth investigating directly - fixing it would roughly halve this pipeline's fill-rate cost,
-	// real performance work given Phase 6's whole point is hundreds-of-millions-of-polygon scenes.
+	// Backface culling: POLYGON_CULL_FRONT. History: originally disabled outright because meshlet
+	// triangle winding isn't reliably consistent across all meshlets from this pipeline
+	// (SurfaceTool::build_meshlets/meshoptimizer doesn't guarantee uniform winding when
+	// repartitioning a source index buffer into clusters) - CULL_BACK/CULL_FRONT both reproduced
+	// the same "holes" bug for that reason at the time. A later fix switched to this
+	// (POLYGON_CULL_FRONT), which empirically eliminated the holes for the scenes tested.
+	//
+	// A real, separate bug surfaced once a *negative-scale* (mirrored) instance was tested:
+	// mirroring reverses every triangle's effective winding for that one instance, so this single,
+	// pipeline-wide cull state - correct for the rest of the scene - becomes backwards specifically
+	// for that instance, producing visibly broken/jagged geometry. POLYGON_CULL_DISABLED (rendering
+	// both winding orders, letting depth testing alone decide) was tried as a fix - this pipeline
+	// batches many instances with potentially different transforms into one indirect multi-draw, so
+	// there's no way to pick a different static cull mode per-instance within a single draw call,
+	// and disabling culling entirely seemed like the only option correct regardless of per-instance
+	// handedness. That was reverted: rendering both front and back triangles of the same surface
+	// caused severe, widespread Z-fighting between them (confirmed even with the depth bias below
+	// removed entirely, ruling out bias tuning as a fix) - strictly worse than the negative-scale
+	// bug it was meant to solve, since it broke every instance, not just mirrored ones.
+	//
+	// Excluding negative-scale instances from the meshlet scan entirely (see
+	// RenderForwardClustered::_meshlet_scan_render_list's comment) was also tried and reverted -
+	// it surfaced a second, not-fully-understood bug where the excluded instance's own separate
+	// Forward+ draw would silently fail to write color whenever another qualifying instance
+	// engaged the late meshlet pass that frame. Net result: negative-scale instances currently
+	// still render with the known, localized jagged-geometry bug described above - a real,
+	// pre-existing limitation, not a regression from this investigation. The original inconsistent-
+	// meshlet-winding problem this cull mode works around is still worth fixing at the source
+	// eventually (in SurfaceTool::build_meshlets or the meshoptimizer call site, to use Godot's
+	// standard CCW-front convention) - that would remove the need for this cull-mode workaround
+	// and its negative-scale blind spot entirely - but that's a separate, larger undertaking.
 	RD::PipelineRasterizationState rs;
 	rs.cull_mode = RD::POLYGON_CULL_FRONT;
 

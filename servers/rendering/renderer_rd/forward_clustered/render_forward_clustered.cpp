@@ -1880,6 +1880,28 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		if (range.count == 0) {
 			continue;
 		}
+		// KNOWN LIMITATION: negative-determinant (mirrored/negative-scale) instance transforms
+		// reverse this instance's effective triangle winding, and MeshletRenderer's render pipeline
+		// uses a single, pipeline-wide static POLYGON_CULL_FRONT (see its _ensure_pipeline()
+		// comment) that's only correct for instances preserving handedness - a mirrored instance
+		// renders with visibly broken/jagged geometry through this path. Excluding such instances
+		// from meshlet_scan_ranges entirely (not just meshlet_replace_skip_set) was tried as a fix,
+		// falling back to normal Forward+ rendering - but this surfaced a second, not-yet-
+		// understood bug: with the exclusion in place, when at least one *other* qualifying meshlet
+		// instance is also present (engaging the late meshlet pass that frame), the excluded
+		// instance's own Forward+-drawn color silently fails to write (its correct depth still
+		// gets written, confirmed by background/sky correctly failing to redraw over it, but the
+		// color buffer keeps a flat near-background-gray clear value instead of the instance's real
+		// material/lighting) - reproduced with a fully isolated, non-overlapping test position, so
+		// it isn't a screen-space overlap issue; disappears entirely whenever meshlet_scan_ranges is
+		// empty (the late pass never runs). Root cause not yet found (checked: shared vs. unique
+		// material made no difference; depth clear values are correct; reverse_cull/depth_pre_pass
+		// aren't meshlet-flag-dependent) - reverted this exclusion rather than ship an only-partially
+		// -understood fix. Net effect: mirrored instances still go through the known, localized
+		// jagged-geometry path for now. Revisit by checking whether p_color_only_framebuffer and the
+		// opaque pass's own framebuffer object are the exact same RID/attachment set, and whether the
+		// late pass's two mid-frame Hi-Z rebuilds (hiz_builder->build_into(), which dispatch compute
+		// work) insert a correct barrier before the following sky/color-load-bearing draws.
 		uint32_t instance_index = (uint32_t)meshlet_scan_instance_transforms.size();
 		meshlet_scan_instance_transforms.push_back(inst->transform);
 		// material_override (if set) replaces every surface's material - same precedence Godot's
@@ -1894,10 +1916,10 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		meshlet_scan_ranges.push_back(r);
 
 		// B6: only skip the normal color draw (i.e. actually replace it with the meshlet path) for
-		// qualifying materials - a non-qualifying instance is still scanned (so --meshlet-debug-
-		// overlay can still show it, approximated with default material values, which is harmless
-		// for a debug visualization) but keeps rendering normally via Forward+ instead of replacing
-		// it with a wrong-looking default-white meshlet draw.
+		// a qualifying material - a non-qualifying-material instance is still scanned (so
+		// --meshlet-debug-overlay can still show it, approximated with default material values,
+		// which is harmless for a debug visualization) but keeps rendering normally via Forward+
+		// instead of replacing it with a wrong-looking default-white meshlet draw.
 		if (replace_enabled && material_qualifies) {
 			meshlet_replace_skip_set.insert(sdcache);
 		}

@@ -113,22 +113,31 @@ void main() {
 	vec3 world_pos = (transform * vec4(local_pos.xyz, 1.0)).xyz;
 	gl_Position = params.view_projection * vec4(world_pos, 1.0);
 
-	// Flip the *local* (object-space, pre-transform) Z component of the decoded normal, not the
-	// final world-space normal - this pipeline's render pipeline uses POLYGON_CULL_FRONT (see
-	// MeshletRenderer::_ensure_pipeline()'s comment - meshoptimizer/SurfaceTool::build_meshlets()
-	// produces triangles wound opposite to Godot's normal front-facing convention, and CULL_FRONT
-	// is the established fix for that). A first attempt at this fix negated the *entire* world-
-	// space normal post-transform, reasoning that CULL_FRONT causes a closed surface's
-	// geometrically-far side to be what's actually rasterized, whose own outward normal points
-	// away from the camera - that fix was validated only with a degenerate test (a light pointed
-	// exactly along the view axis, where the tested point's normal has zero X/Y components,
-	// making "flip all 3 axes" and "flip Z only" produce identical results and therefore
-	// indistinguishable). A live comparison against real Forward+ rendering the same scene (same
-	// DirectionalLight3D, same camera) caught the real bug: full-vector negation put the lit/dark
-	// sides on the wrong side relative to Forward+'s own rendering (correct on the view axis,
-	// backwards on the other two) - flipping only the local Z component (the octahedral encoding's
-	// own "pole" axis, before mat3(transform) is applied) is what actually matches Forward+'s
-	// orientation, confirmed via direct side-by-side screenshot comparison.
+	// Flip the *local* (object-space, pre-transform) Z component of the decoded normal - this
+	// pipeline's render pipeline uses POLYGON_CULL_FRONT (see MeshletRenderer::_ensure_pipeline()'s
+	// comment - meshoptimizer/SurfaceTool::build_meshlets() produces triangles wound opposite to
+	// Godot's normal front-facing convention, and CULL_FRONT is the established fix for that). For
+	// a closed surface, culling what Godot considers "front-facing" and keeping only "back-facing"
+	// triangles means the *actual visible* triangles are the geometrically-far side of the surface
+	// as seen from the camera, whose own outward normal naturally points away from the camera -
+	// flipping the local Z axis (the octahedral encoding's own "pole" axis, before mat3(transform)
+	// is applied) compensates for that, confirmed via direct side-by-side screenshot comparison
+	// against real Forward+ rendering the same scene.
+	//
+	// KNOWN LIMITATION: negative/mirrored-scale instances reverse their own effective winding,
+	// which this single, pipeline-wide static cull mode can't handle correctly within one batched
+	// indirect multi-draw spanning many instances - such an instance renders with visibly broken/
+	// jagged geometry through this path (pre-existing, not introduced by this comment's fix).
+	// POLYGON_CULL_DISABLED (rendering both front and back triangles, letting the depth test alone
+	// pick the near one) was tried as a fix and reverted: it caused severe, widespread Z-fighting
+	// between the two sides (confirmed even with the depth bias below removed entirely, ruling out
+	// bias tuning as a fix), strictly worse than the problem it was meant to solve. Excluding such
+	// instances from the meshlet scan entirely (see _meshlet_scan_render_list's comment) was also
+	// tried and reverted - it surfaced a second, not-fully-understood bug where the excluded
+	// instance's own separate Forward+ draw would silently fail to write color whenever another
+	// qualifying instance engaged the late meshlet pass that frame. Revisit by fixing meshlet
+	// winding at the source (SurfaceTool::build_meshlets()/meshoptimizer) rather than working
+	// around it with cull-mode tricks - that would remove this whole class of bug.
 	vec3 local_normal = oct_decode_normal(attrib.xy);
 	local_normal.z = -local_normal.z;
 	// Normals need the inverse-transpose of the model matrix, not the model matrix itself, to
