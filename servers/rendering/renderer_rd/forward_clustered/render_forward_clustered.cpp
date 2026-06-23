@@ -4159,31 +4159,31 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 	{
 		RD::Uniform u;
 		u.binding = 30;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID t;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		RID b;
 		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SVOGI)) {
 			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
-			t = svogi->lightprobe_texture;
+			b = svogi->octree_nodes_buffer;
 		}
-		if (t.is_null()) {
-			t = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE);
+		if (b.is_null()) {
+			b = scene_shader.default_vec4_xform_buffer; // Fallback SSBO
 		}
-		u.append_id(t);
+		u.append_id(b);
 		uniforms.push_back(u);
 	}
 	{
 		RD::Uniform u;
 		u.binding = 31;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		RID t;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		RID b;
 		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SVOGI)) {
 			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
-			t = svogi->occlusion_texture;
+			b = svogi->octree_bricks_buffer;
 		}
-		if (t.is_null()) {
-			t = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
+		if (b.is_null()) {
+			b = scene_shader.default_vec4_xform_buffer; // Fallback SSBO
 		}
-		u.append_id(t);
+		u.append_id(b);
 		uniforms.push_back(u);
 	}
 	{

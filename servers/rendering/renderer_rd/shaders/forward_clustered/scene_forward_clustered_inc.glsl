@@ -445,8 +445,21 @@ layout(set = 1, binding = 28) uniform texture2D ambient_buffer;
 layout(set = 1, binding = 29) uniform texture2D reflection_buffer;
 #define multiviewSampler sampler2D
 #endif
-layout(set = 1, binding = 30) uniform texture2DArray svogi_lightprobe_texture;
-layout(set = 1, binding = 31) uniform texture3D svogi_occlusion_cascades;
+struct SVOGIOctreeNode {
+	uint children_base_index;
+	uint child_mask;
+	uint albedo;
+	uint normal;
+	uint emission;
+	uint pad[3];
+};
+
+layout(set = 1, binding = 30, std430) restrict readonly buffer SVOGIOctreeNodes {
+	SVOGIOctreeNode svogi_nodes[];
+};
+layout(set = 1, binding = 31, std430) restrict readonly buffer SVOGIOctreeBricks {
+	uint svogi_bricks[];
+};
 
 struct VoxelGIData {
 	mat4 xform; // 64 - 64
