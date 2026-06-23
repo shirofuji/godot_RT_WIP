@@ -142,7 +142,7 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 		}
 		
 		// Traverse Octree (Top-Down)
-		uint node_idx = 0;
+		uint node_idx = 0u;
 		vec3 current_center = bounds_center;
 		float current_half_size = bounds_half_extents.x;
 		
@@ -152,7 +152,7 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 		// 6 levels total. Root is level 0 (size = bounds). Level 6 is leaf (size = bounds / 64).
 		float target_size = max(diameter, current_half_size / 64.0);
 		
-		for (uint depth = 0; depth < 6; depth++) {
+		for (uint depth = 0u; depth < 6u; depth++) {
 			bvec3 is_pos = greaterThan(sample_pos, current_center);
 			uint child_idx = (is_pos.x ? 1u : 0u) | ((is_pos.y ? 1u : 0u) << 1) | ((is_pos.z ? 1u : 0u) << 2);
 			
@@ -173,14 +173,14 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 			current_center += offset * current_half_size;
 			
 			// If we reached the target voxel size, stop and sample
-			if (current_half_size * 2.0 <= target_size || depth == 5) {
+			if (current_half_size * 2.0 <= target_size || depth == 5u) {
 				uint albedo_packed = svogi_nodes[node_idx].albedo;
-				if (albedo_packed != 0) {
+				if (albedo_packed != 0u) {
 					// Unpack R8G8B8A8
 					vec3 albedo = vec3(
-						float((albedo_packed >> 24) & 0xFFu) / 255.0,
-						float((albedo_packed >> 16) & 0xFFu) / 255.0,
-						float((albedo_packed >> 8) & 0xFFu) / 255.0
+						float((albedo_packed >> 24u) & 0xFFu) / 255.0,
+						float((albedo_packed >> 16u) & 0xFFu) / 255.0,
+						float((albedo_packed >> 8u) & 0xFFu) / 255.0
 					);
 					// Boost energy slightly for the prototype
 					voxel_color = vec4(albedo * svogi.energy * 0.5, 0.5); 

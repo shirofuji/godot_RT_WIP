@@ -29,16 +29,16 @@ layout(set = 0, binding = 1, std430) restrict buffer AtomicCounter {
 #ifdef MODE_CLEAR
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
-	if (idx == 0) {
+	if (idx == 0u) {
 		// Reset node allocator (0 is root)
-		alloc_counter = 1;
+		alloc_counter = 1u;
 		
 		// Clear root node
-		nodes[0].children_base_index = 0;
-		nodes[0].child_mask = 0;
-		nodes[0].albedo = 0;
-		nodes[0].normal = 0;
-		nodes[0].emission = 0;
+		nodes[0].children_base_index = 0u;
+		nodes[0].child_mask = 0u;
+		nodes[0].albedo = 0u;
+		nodes[0].normal = 0u;
+		nodes[0].emission = 0u;
 	}
 }
 #endif
@@ -98,8 +98,8 @@ layout(push_constant, std430) uniform Params {
 } params;
 
 uint fetch_triangle_local_vertex(uint p_byte_index) {
-	uint word = meshlet_triangles.data[p_byte_index / 4];
-	return (word >> ((p_byte_index % 4) * 8)) & 0xFFu;
+	uint word = meshlet_triangles.data[p_byte_index / 4u];
+	return (word >> ((p_byte_index % 4u) * 8u)) & 0xFFu;
 }
 
 void main() {
@@ -112,10 +112,10 @@ void main() {
 	mat4 transform = transforms.data[item.instance_index];
 	MeshletDescriptor d = meshlet_descriptors.data[item.meshlet_index];
 
-	for (uint i = 0; i < d.triangle_count; i++) {
-		uint i0 = fetch_triangle_local_vertex(d.triangle_offset + i * 3 + 0);
-		uint i1 = fetch_triangle_local_vertex(d.triangle_offset + i * 3 + 1);
-		uint i2 = fetch_triangle_local_vertex(d.triangle_offset + i * 3 + 2);
+	for (uint i = 0u; i < d.triangle_count; i++) {
+		uint i0 = fetch_triangle_local_vertex(d.triangle_offset + i * 3u + 0u);
+		uint i1 = fetch_triangle_local_vertex(d.triangle_offset + i * 3u + 1u);
+		uint i2 = fetch_triangle_local_vertex(d.triangle_offset + i * 3u + 2u);
 		
 		uint g0 = meshlet_vertex_remap.data[d.vertex_remap_offset + i0];
 		uint g1 = meshlet_vertex_remap.data[d.vertex_remap_offset + i1];
@@ -126,22 +126,22 @@ void main() {
 		vec3 v2 = (transform * vec4(vertex_positions.data[g2].xyz, 1.0)).xyz;
 		
 		// Approximate voxel insertion with the centroid of the triangle
-		vec3 centroid = (v0 + v1 + v2) / 3.0;
+		vec3 tri_centroid = (v0 + v1 + v2) / 3.0;
 		vec3 normal = normalize(cross(v1 - v0, v2 - v0));
 		
 		// Skip if outside bounds
-		vec3 diff = abs(centroid - params.bounds_center);
+		vec3 diff = abs(tri_centroid - params.bounds_center);
 		if (diff.x > params.bounds_half_size || diff.y > params.bounds_half_size || diff.z > params.bounds_half_size) {
 			continue;
 		}
 		
-		uint node_idx = 0;
+		uint node_idx = 0u;
 		vec3 current_center = params.bounds_center;
 		float current_half_size = params.bounds_half_size;
 		
 		// Traverse and build up to 7 levels deep (root + 6)
-		for (uint depth = 0; depth < 6; depth++) {
-			bvec3 is_pos = greaterThan(centroid, current_center);
+		for (uint depth = 0u; depth < 6u; depth++) {
+			bvec3 is_pos = greaterThan(tri_centroid, current_center);
 			uint child_idx = (is_pos.x ? 1u : 0u) | ((is_pos.y ? 1u : 0u) << 1) | ((is_pos.z ? 1u : 0u) << 2);
 			
 			vec3 offset = vec3(is_pos.x ? 1.0 : -1.0, is_pos.y ? 1.0 : -1.0, is_pos.z ? 1.0 : -1.0);
@@ -177,7 +177,7 @@ void main() {
 		uint nx = uint(n.x * 255.0) & 0xFFu;
 		uint ny = uint(n.y * 255.0) & 0xFFu;
 		uint nz = uint(n.z * 255.0) & 0xFFu;
-		uint packed_normal = (nx << 16) | (ny << 8) | nz;
+		uint packed_normal = (nx << 16u) | (ny << 8u) | nz;
 		atomicMax(nodes[node_idx].normal, packed_normal);
 	}
 }
