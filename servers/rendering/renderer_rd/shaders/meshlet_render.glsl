@@ -113,23 +113,22 @@ void main() {
 	vec3 world_pos = (transform * vec4(local_pos.xyz, 1.0)).xyz;
 	gl_Position = params.view_projection * vec4(world_pos, 1.0);
 
-	// Flip the *local* (object-space, pre-transform) Z component of the decoded normal - this
-	// pipeline's render pipeline uses POLYGON_CULL_FRONT (see MeshletRenderer::_ensure_pipeline()'s
-	// comment - meshoptimizer/SurfaceTool::build_meshlets() produces triangles wound opposite to
-	// Godot's normal front-facing convention, and CULL_FRONT is the established fix for that). For
-	// a closed surface, culling what Godot considers "front-facing" and keeping only "back-facing"
-	// triangles means the *actual visible* triangles are the geometrically-far side of the surface
-	// as seen from the camera, whose own outward normal naturally points away from the camera -
-	// flipping the local Z axis (the octahedral encoding's own "pole" axis, before mat3(transform)
-	// is applied) compensates for that. A later edit removed this flip on the theory that CULL_FRONT
-	// already renders the front (not far) face, so no compensation should be needed - that's
-	// contradicted by direct measurement: meshlet_selftest.cpp's synthetic test sphere (vertex
-	// normals built directly from position - normals.write[i] = vertices[i].normalized(), so they
-	// are unambiguously correct, outward-pointing, and have nothing to do with mesh winding) renders
-	// fully black without this flip, confirming the rasterized fragment's own normal really is
-	// backward without it, exactly as originally found via systematic diagnostic bisection. Restored.
+	// No local-Z flip here. History: this pipeline used to flip the local-Z axis of the decoded
+	// normal to compensate for POLYGON_CULL_FRONT, on the theory that culling what Godot considers
+	// "front-facing" leaves only the geometrically-far side of a closed surface visible. That
+	// theory predicted (and a direct screenshot comparison against meshlet_selftest.cpp's synthetic
+	// test sphere - whose normals are built directly from vertex position, unrelated to mesh
+	// winding - seemed to confirm) that the flip was required. A real-scene regression proved that
+	// reasoning wrong: removing the flip (matching CULL_FRONT actually rendering the front, not far,
+	// face) fixed a real, user-reported inconsistent-shadow-direction bug across many differently-
+	// transformed instances, and restoring the flip to satisfy the synthetic test brought that real
+	// bug straight back. The synthetic test's own disagreement is not yet root-caused - it's most
+	// likely the test's hand-built triangle winding not matching what
+	// SurfaceTool::build_meshlets()/meshoptimizer actually produces for real meshes, making the
+	// test require a compensation real geometry doesn't need - but until that's confirmed, trust
+	// the real-scene result over the synthetic one. Do not reintroduce this flip without first
+	// fixing whatever's actually wrong in the synthetic test's winding.
 	vec3 local_normal = oct_decode_normal(attrib.xy);
-	local_normal.z = -local_normal.z;
 	// Normals need the inverse-transpose of the model matrix, not the model matrix itself, to
 	// transform correctly under non-uniform scale (a uniformly-scaled or unscaled transform would
 	// be fine with mat3(transform) directly, but this pipeline has no per-instance "is this

@@ -2179,7 +2179,13 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 			uniforms.push_back(u);
 		}
 
-		RID uniform_set_1 = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.voxelize.version_get_shader(gi->svogi_shader.voxelize_shader, 0), 1);
+		// version index 1 = MODE_VOXELIZE (the variant that actually declares set 1's meshlet data
+		// bindings, per voxelize_modes' push_back order below) - version 0 (MODE_CLEAR) doesn't
+		// declare set 1 at all, so creating this uniform set against it fails outright
+		// ("Desired set (1) not used by shader") and the whole voxelize compute dispatch never
+		// actually runs, leaving the octree permanently empty regardless of anything else - this
+		// was the primary cause of SVOGI never producing any visible light at all.
+		RID uniform_set_1 = RD::get_singleton()->uniform_set_create(uniforms, gi->svogi_shader.voxelize.version_get_shader(gi->svogi_shader.voxelize_shader, 1), 1);
 
 		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, gi->svogi_shader.voxelize_pipeline.get_rid());
