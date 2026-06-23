@@ -144,7 +144,7 @@ void main() {
 			bvec3 is_pos = greaterThan(centroid, current_center);
 			uint child_idx = (is_pos.x ? 1u : 0u) | ((is_pos.y ? 1u : 0u) << 1) | ((is_pos.z ? 1u : 0u) << 2);
 			
-			vec3 offset = vec3(is_pos) * 2.0 - 1.0;
+			vec3 offset = vec3(is_pos.x ? 1.0 : -1.0, is_pos.y ? 1.0 : -1.0, is_pos.z ? 1.0 : -1.0);
 			current_half_size *= 0.5;
 			current_center += offset * current_half_size;
 			

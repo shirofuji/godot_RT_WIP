@@ -168,7 +168,7 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 			}
 			node_idx = base_idx + child_idx;
 			
-			vec3 offset = vec3(is_pos) * 2.0 - 1.0;
+			vec3 offset = vec3(is_pos.x ? 1.0 : -1.0, is_pos.y ? 1.0 : -1.0, is_pos.z ? 1.0 : -1.0);
 			current_half_size *= 0.5;
 			current_center += offset * current_half_size;
 			
