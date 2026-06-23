@@ -99,7 +99,15 @@ void main() {
 	// only a thin ring of silhouette-adjacent meshlets visible (the same shader-level bug class as
 	// meshlet_render.glsl's per-vertex normal fix, just earlier in the pipeline - in the cull pass,
 	// not the render pass).
-	vec3 world_cone_axis = normalize(transpose(inverse(mat3(transform))) * d.cone_axis);
+	// Inverse-transpose of the model matrix via the cofactor-matrix identity, not a literal
+	// transpose(inverse()) - see meshlet_render.glsl's vertex-shader normal computation for the
+	// full derivation. normalize(cofactor * axis) * sign(det) is identical to
+	// normalize(transpose(inverse(M)) * axis) for every transform, without the matrix inverse.
+	mat3 cone_m = mat3(transform);
+	vec3 cone_cofactor0 = cross(cone_m[1], cone_m[2]);
+	mat3 cone_normal_matrix = mat3(cone_cofactor0, cross(cone_m[2], cone_m[0]), cross(cone_m[0], cone_m[1]));
+	float cone_det_sign = sign(dot(cone_m[0], cone_cofactor0));
+	vec3 world_cone_axis = normalize(cone_normal_matrix * d.cone_axis) * cone_det_sign;
 	vec3 to_meshlet = world_center - params.camera_position;
 	float dist = length(to_meshlet);
 	if (dist > 0.0001) {

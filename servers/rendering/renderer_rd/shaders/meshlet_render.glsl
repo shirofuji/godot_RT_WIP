@@ -130,16 +130,23 @@ void main() {
 	// the real-scene result over the synthetic one. Do not reintroduce this flip without first
 	// fixing whatever's actually wrong in the synthetic test's winding.
 	vec3 local_normal = oct_decode_normal(attrib.xy);
-	// Normals need the inverse-transpose of the model matrix, not the model matrix itself, to
-	// transform correctly under non-uniform scale (a uniformly-scaled or unscaled transform would
-	// be fine with mat3(transform) directly, but this pipeline has no per-instance "is this
-	// uniform scale" flag to take that cheaper path conditionally like Forward+'s own
-	// model_normal_matrix does - scene_forward_clustered.glsl checks
-	// INSTANCE_FLAGS_NON_UNIFORM_SCALE per-instance and only pays for the inverse when needed).
-	// Always paying for it here is correct for every transform and cheap enough at this pipeline's
-	// vertex-shader scale not to matter.
-	mat3 normal_matrix = transpose(inverse(mat3(transform)));
-	vec3 world_normal = normalize(normal_matrix * local_normal);
+	// Normals need the inverse-transpose of the model matrix (not the model matrix itself) to
+	// transform correctly under non-uniform scale. Computed here via the cofactor-matrix identity
+	// rather than a literal transpose(inverse(mat3(transform))): the cofactor matrix (cross
+	// products of the model matrix's columns) equals det(M)*transpose(inverse(M)), so
+	// normalize(cofactor * n) * sign(det) gives the exact same normalized direction as
+	// normalize(transpose(inverse(M)) * n) for every transform - but it avoids the full 3x3 matrix
+	// inverse(), which a literal inverse() would recompute redundantly for every vertex invocation
+	// (3x per triangle, across hundreds of millions of polygons - this is the hottest shader in the
+	// pipeline, so a per-vertex inverse is a real, measurable cost). Pure optimization: identical
+	// output, strictly cheaper. (A per-instance precomputed normal matrix would be cheaper still,
+	// but needs a new buffer threaded through every transforms-buffer consumer - this in-shader
+	// form captures the bulk of the win with a one-line, zero-new-state change.)
+	mat3 m = mat3(transform);
+	vec3 cofactor0 = cross(m[1], m[2]);
+	mat3 normal_matrix = mat3(cofactor0, cross(m[2], m[0]), cross(m[0], m[1]));
+	float det_sign = sign(dot(m[0], cofactor0));
+	vec3 world_normal = normalize(normal_matrix * local_normal) * det_sign;
 
 	world_normal_interp = world_normal;
 	world_pos_interp = world_pos;
