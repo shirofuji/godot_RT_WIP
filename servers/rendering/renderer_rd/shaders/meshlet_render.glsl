@@ -456,6 +456,54 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 	return color;
 }
 
+// Branchless orthonormal basis from a unit normal (Duff et al. 2017), giving tangent/bitangent
+// perpendicular to n - used to orient the diffuse cone set into the surface's hemisphere.
+void svogi_basis(vec3 n, out vec3 t, out vec3 b) {
+	float s = n.z >= 0.0 ? 1.0 : -1.0;
+	float a = -1.0 / (s + n.z);
+	float bb = n.x * n.y * a;
+	t = vec3(1.0 + s * n.x * n.x * a, s * bb, -s * n.x);
+	b = vec3(bb, s + n.y * n.y * a, -n.y);
+}
+
+// Cosine-weighted multi-cone hemisphere gather: 6 diffuse cones - one along the surface normal plus
+// five tilted 60 deg off it and spread at 72 deg azimuthal increments - sample the octree across the
+// whole upper hemisphere instead of a single direction. Directions are in tangent space (z = the
+// surface normal); weights bias toward the normal (cosine-weighted, summing to 1) so the result
+// approximates the Lambert diffuse irradiance integral. This is what turns the single-cone trace's
+// weak, self-bleed-prone result into strong, smooth, directionally-correct indirect diffuse. ~6x
+// the single-cone cost, but it's a per-pixel screen cost (bounded by resolution, independent of
+// scene polygon count). Each cone is 60 deg aperture (tan_half_angle = tan(30) ~= 0.577).
+vec3 svogi_hemisphere_gather(vec3 pos, vec3 normal, float surface_offset, float max_distance, vec3 bounds_center, float bounds_half, float energy) {
+	vec3 t, b;
+	svogi_basis(normal, t, b);
+
+	const vec3 CONE_DIRS[6] = vec3[](
+			vec3(0.0, 0.0, 1.0),
+			vec3(0.0, 0.866025, 0.5),
+			vec3(0.823639, 0.267617, 0.5),
+			vec3(0.509037, -0.700629, 0.5),
+			vec3(-0.509037, -0.700629, 0.5),
+			vec3(-0.823639, 0.267617, 0.5));
+	const float CONE_WEIGHTS[6] = float[](0.25, 0.15, 0.15, 0.15, 0.15, 0.15);
+
+	// Push the shared cone origin off the surface ALONG THE NORMAL before tracing. Without this,
+	// the 60-deg-tilted cones graze straight back into a convex surface's own geometry in a
+	// direction-dependent way, producing the characteristic dark-petal / pinwheel artifact (one
+	// dark streak per tilted cone). Offsetting along the normal clears the local curvature for all
+	// cones uniformly; the cones then only need a tiny additional start bias for their own first
+	// step. Trade-off: too large an offset starts skipping genuine near-field contact bleed, so
+	// this is kept to a couple of leaf voxels.
+	vec3 start = pos + normal * surface_offset;
+
+	vec3 acc = vec3(0.0);
+	for (int i = 0; i < 6; i++) {
+		vec3 dir = normalize(t * CONE_DIRS[i].x + b * CONE_DIRS[i].y + normal * CONE_DIRS[i].z);
+		acc += CONE_WEIGHTS[i] * svogi_cone_trace(start, dir, 0.577, max_distance, surface_offset * 0.5, bounds_center, bounds_half, energy).rgb;
+	}
+	return acc;
+}
+
 #endif
 
 void main() {
@@ -483,20 +531,14 @@ void main() {
 	// SVOGI indirect-diffuse bounce (params.svogi_bounds.w > 0 means the octree has data this
 	// frame - see svogi_bounds' push-constant comment). A single wide diffuse cone along the
 	// surface normal: a coarse, cheap first-cut "is there bounced light arriving roughly from the
-	// hemisphere I face" - not a full multi-cone hemisphere integration. Folded into diffuse_light
-	// so it picks up the same albedo*(1-metallic) modulation as direct/ambient diffuse below.
-	// Cone params are a deliberate self-bleed-vs-reach tradeoff: a single normal-aligned cone on a
-	// convex surface will sample the surface's OWN adjacent lit voxels unless the cone is narrow
-	// enough and started far enough off the surface to clear its local curvature. tan_half_angle
-	// 0.5 (~53 deg full cone, not the full 90 deg hemisphere) plus a start bias of several leaf
-	// voxels keeps self-bleed from saturating everything while still letting the cone reach a
-	// nearby neighbor for actual inter-object color bleed. Still crude (one cone, no occlusion-
-	// aware weighting) - a proper multi-cone cosine-weighted hemisphere is the real quality step.
+	// SVOGI indirect-diffuse bounce via a cosine-weighted multi-cone hemisphere gather (see
+	// svogi_hemisphere_gather()). Folded into diffuse_light so it picks up the same
+	// albedo*(1-metallic) modulation as direct/ambient diffuse below. Start bias of a couple leaf
+	// voxels steps the cones off the surface so they clear its own local curvature before sampling.
 	vec3 gi_diffuse = vec3(0.0);
 	if (params.svogi_bounds.w > 0.0) {
 		float voxel_size = params.svogi_bounds.w / 32.0; // root half-size / 32 ~= leaf diameter.
-		vec4 gi = svogi_cone_trace(world_pos_interp, N, 0.5, params.svogi_bounds.w * 2.0, voxel_size * 3.0, params.svogi_bounds.xyz, params.svogi_bounds.w, params.svogi_params.x);
-		gi_diffuse = gi.rgb;
+		gi_diffuse = svogi_hemisphere_gather(world_pos_interp, N, voxel_size * 3.0, params.svogi_bounds.w * 2.0, params.svogi_bounds.xyz, params.svogi_bounds.w, params.svogi_params.x);
 	}
 
 	vec3 color = albedo * (1.0 - mat.metallic) * (diffuse_light + params.ambient_color.rgb + gi_diffuse) + specular_light + mat.emission;
