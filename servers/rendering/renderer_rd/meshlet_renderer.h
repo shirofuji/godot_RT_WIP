@@ -30,7 +30,6 @@
 
 #pragma once
 
-#include "core/math/color.h"
 #include "core/math/projection.h"
 #include "core/math/transform_3d.h"
 #include "servers/rendering/renderer_rd/meshlet_culler.h"
@@ -92,11 +91,13 @@ public:
 	// p_depth_only: targets a framebuffer with zero color attachments (e.g. Forward+'s real depth
 	// pre-pass framebuffer) using a fragment shader variant that writes no color at all - used by
 	// the temporal early pass (see project plan); when false, p_framebuffer must have a depth
-	// attachment plus exactly one color attachment, and p_light_direction/p_light_color are used
-	// for the per-vertex lighting (B2 milestone) - p_light_color should already be energy-
-	// premultiplied (see RenderForwardClustered::_meshlet_get_directional_light()). Both are
-	// ignored when p_depth_only is true.
-	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector3 &p_light_direction, const Color &p_light_color, bool p_clear = true, bool p_depth_only = false);
+	// attachment plus exactly one color attachment, and p_lights_buffer/p_light_count are used for
+	// real per-fragment PBR lighting (B3 milestone) - p_lights_buffer is an SSBO of
+	// RenderForwardClustered::MeshletLightGPU (real scene lights, energy-premultiplied colors,
+	// see _meshlet_collect_lights()'s comment for why there's no real cluster-buffer spatial
+	// culling), p_light_count how many entries it holds. Both ignored when p_depth_only is true
+	// (p_lights_buffer may be an invalid RID and p_light_count 0 in that case).
+	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear = true, bool p_depth_only = false);
 
 	MeshletRenderer();
 	~MeshletRenderer();

@@ -173,6 +173,15 @@ MeshletStorage::~MeshletStorage() {
 	singleton = nullptr;
 }
 
+MeshletStorage::MeshletMaterialGPU MeshletStorage::debug_get_material(uint32_t p_material_id) const {
+	MeshletMaterialGPU material;
+	Vector<uint8_t> data = meshlet_material_buffer.read_back(p_material_id, 1);
+	if ((uint32_t)data.size() >= sizeof(MeshletMaterialGPU)) {
+		memcpy(&material, data.ptr(), sizeof(MeshletMaterialGPU));
+	}
+	return material;
+}
+
 uint32_t MeshletStorage::upload_material(const RID &p_material_rid, const MeshletMaterialGPU &p_material_data) {
 	HashMap<RID, uint32_t>::Iterator it = material_rid_to_slot.find(p_material_rid);
 	uint32_t slot;

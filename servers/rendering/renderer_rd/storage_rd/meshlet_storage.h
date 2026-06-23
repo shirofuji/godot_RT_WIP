@@ -196,6 +196,7 @@ public:
 	uint32_t debug_get_meshlet_vertex_remap(uint32_t p_global_remap_index) const;
 	uint8_t debug_get_meshlet_triangle_index(uint32_t p_global_byte_index) const;
 	Vector3 debug_get_vertex_position(uint32_t p_global_vertex_index) const;
+	MeshletMaterialGPU debug_get_material(uint32_t p_material_id) const;
 
 	MeshletStorage();
 	~MeshletStorage();

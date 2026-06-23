@@ -4,19 +4,15 @@
 
 #VERSION_DEFINES
 
-layout(location = 0) out vec3 normal_interp;
+layout(location = 0) out vec3 world_normal_interp;
 layout(location = 1) out flat uint meshlet_index_interp;
 layout(location = 2) out flat uint material_id_interp;
-layout(location = 3) out vec3 vertex_light_interp;
+layout(location = 3) out vec3 world_pos_interp;
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
-	vec3 light_direction;
-	float pad0;
-	vec3 light_color; // Already includes energy (premultiplied on the C++ side).
-	float pad1;
 	vec3 camera_position;
-	float pad2;
+	uint light_count;
 }
 params;
 
@@ -83,34 +79,6 @@ layout(set = 0, binding = 7, std430) restrict readonly buffer InstanceMaterialId
 }
 instance_material_ids;
 
-#ifndef MESHLET_DEPTH_ONLY
-// Mirrors MeshletStorage::MeshletMaterialGPU exactly (std430 layout) - see the fragment stage's
-// copy of this struct for the full field-by-field rationale. Declared in the vertex stage too
-// (B2: vertex-lit milestone) since the per-vertex lighting calculation below needs
-// roughness/metallic/specular; the depth-only shader variant skips this entirely (no color
-// output at all, so no need for material data in its vertex stage either).
-struct MeshletMaterial {
-	vec4 albedo;
-	vec3 emission;
-	float metallic;
-	float roughness;
-	float specular;
-	uint albedo_texture_index;
-	uint normal_texture_index;
-	uint orm_texture_index;
-	uint emission_texture_index;
-	uint flags;
-	float alpha_scissor_threshold;
-	vec2 uv1_scale;
-	vec2 uv1_offset;
-};
-
-layout(set = 0, binding = 8, std430) restrict readonly buffer MeshletMaterials {
-	MeshletMaterial data[];
-}
-meshlet_materials;
-#endif
-
 vec3 oct_decode_normal(vec2 e) {
 	vec3 v = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
 	float t = clamp(-v.z, 0.0, 1.0);
@@ -145,63 +113,30 @@ void main() {
 	vec3 world_pos = (transform * vec4(local_pos.xyz, 1.0)).xyz;
 	gl_Position = params.view_projection * vec4(world_pos, 1.0);
 
-	// Negated: this pipeline's render pipeline uses POLYGON_CULL_FRONT (see
+	// Flip the *local* (object-space, pre-transform) Z component of the decoded normal, not the
+	// final world-space normal - this pipeline's render pipeline uses POLYGON_CULL_FRONT (see
 	// MeshletRenderer::_ensure_pipeline()'s comment - meshoptimizer/SurfaceTool::build_meshlets()
 	// produces triangles wound opposite to Godot's normal front-facing convention, and CULL_FRONT
-	// is the established fix for that, empirically verified to eliminate the original "holes"
-	// bug). One consequence never previously surfaced: for a closed surface, culling what Godot
-	// considers "front-facing" and keeping only "back-facing" triangles means the *actual visible*
-	// triangles are the geometrically-far side of the surface as seen from the camera (there's
-	// nothing left to occlude them, so they pass the depth test and get drawn at their own,
-	// correct position) - and that far side's own correctly-computed outward normal naturally
-	// points away from the camera, not toward it. Confirmed directly: a synthetic sphere's
-	// vertex-shader-computed N.z was negative at the camera-facing point and positive only near
-	// the silhouette - exactly inverted from the expected gradient - until this negation was
-	// added. B1's flat per-meshlet debug coloring and the original N.L-based debug shading never
-	// surfaced this, since "looks like a smoothly shaded blob" doesn't distinguish a correct
-	// gradient from a geometrically-backward one - this is the first shading in this pipeline that
-	// actually depends on the *absolute* direction of N, not just its smoothness.
-	vec3 world_normal = -normalize(mat3(transform) * oct_decode_normal(attrib.xy));
+	// is the established fix for that). A first attempt at this fix negated the *entire* world-
+	// space normal post-transform, reasoning that CULL_FRONT causes a closed surface's
+	// geometrically-far side to be what's actually rasterized, whose own outward normal points
+	// away from the camera - that fix was validated only with a degenerate test (a light pointed
+	// exactly along the view axis, where the tested point's normal has zero X/Y components,
+	// making "flip all 3 axes" and "flip Z only" produce identical results and therefore
+	// indistinguishable). A live comparison against real Forward+ rendering the same scene (same
+	// DirectionalLight3D, same camera) caught the real bug: full-vector negation put the lit/dark
+	// sides on the wrong side relative to Forward+'s own rendering (correct on the view axis,
+	// backwards on the other two) - flipping only the local Z component (the octahedral encoding's
+	// own "pole" axis, before mat3(transform) is applied) is what actually matches Forward+'s
+	// orientation, confirmed via direct side-by-side screenshot comparison.
+	vec3 local_normal = oct_decode_normal(attrib.xy);
+	local_normal.z = -local_normal.z;
+	vec3 world_normal = normalize(mat3(transform) * local_normal);
 
-	normal_interp = world_normal;
+	world_normal_interp = world_normal;
+	world_pos_interp = world_pos;
 	meshlet_index_interp = item.meshlet_index;
-	uint material_id = instance_material_ids.data[item.instance_index];
-	material_id_interp = material_id;
-
-#ifndef MESHLET_DEPTH_ONLY
-	// B2 (vertex-lit milestone): a simplified, per-vertex Lambertian-diffuse + Blinn-Phong-
-	// specular response to the scene's real directional light (color/energy/direction resolved
-	// CPU-side via LightStorage, not Forward+'s real DirectionalLights UBO - see
-	// _meshlet_get_directional_light()'s comment for why that's deferred to B3). Deliberately not
-	// a literal reuse of scene_forward_lights_inc.glsl's light_compute() (that function has
-	// transitive dependencies - shadow sampling, the real light/shadow-atlas bindings - which
-	// would need the full SCENE_UNIFORM_SET integration B3 is scoped to do anyway); this is "close
-	// enough to be visually comparable" by design, not bit-for-bit identical to Forward+'s own
-	// lighting, matching this milestone's explicitly scoped intent.
-	MeshletMaterial mat = meshlet_materials.data[material_id];
-	vec3 N = world_normal;
-	vec3 L = normalize(-params.light_direction);
-	vec3 V = normalize(params.camera_position - world_pos);
-	vec3 H = normalize(L + V);
-	float ndotl = max(dot(N, L), 0.0);
-	float ndoth = max(dot(N, H), 0.0);
-
-	// Real metals have ~no diffuse response; non-metals keep their full albedo as diffuse color.
-	vec3 diffuse_color = mat.albedo.rgb * (1.0 - mat.metallic);
-	vec3 diffuse = diffuse_color * params.light_color * ndotl;
-
-	// Rough Blinn-Phong stand-in for a real GGX specular lobe - roughness controls the shininess
-	// exponent (rougher = lower exponent = wider, dimmer highlight), metallic blends the highlight
-	// color from white (dielectric) toward the albedo (metals tint their specular reflections).
-	float shininess = mix(128.0, 2.0, mat.roughness);
-	float spec_power = ndotl > 0.0 ? pow(ndoth, shininess) : 0.0;
-	vec3 specular_color = mix(vec3(mat.specular), mat.albedo.rgb, mat.metallic);
-	vec3 specular = specular_color * params.light_color * spec_power;
-
-	vertex_light_interp = diffuse + specular;
-#else
-	vertex_light_interp = vec3(0.0);
-#endif
+	material_id_interp = instance_material_ids.data[item.instance_index];
 
 	// Manual depth bias toward "nearer" (reversed-Z: larger device-Z = nearer - see
 	// meshlet_occlusion_test.glsl's comment). This pipeline frequently draws on top of real depth
@@ -231,19 +166,15 @@ void main() {
 
 #VERSION_DEFINES
 
-layout(location = 0) in vec3 normal_interp;
+layout(location = 0) in vec3 world_normal_interp;
 layout(location = 1) in flat uint meshlet_index_interp;
 layout(location = 2) in flat uint material_id_interp;
-layout(location = 3) in vec3 vertex_light_interp;
+layout(location = 3) in vec3 world_pos_interp;
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
-	vec3 light_direction;
-	float pad0;
-	vec3 light_color;
-	float pad1;
 	vec3 camera_position;
-	float pad2;
+	uint light_count;
 }
 params;
 
@@ -252,7 +183,8 @@ layout(location = 0) out vec4 frag_color;
 
 // Mirrors MeshletStorage::MeshletMaterialGPU exactly (std430 layout) - a flattened snapshot of
 // the subset of StandardMaterial3D/ORMMaterial3D parameters this pipeline reads; texture indices
-// are uploaded but not sampled yet (B3 - per-fragment, where texture detail actually matters).
+// are uploaded but not sampled yet (deferred - bindless/array texture sampling is its own,
+// separate scope from the lighting model added in this milestone).
 struct MeshletMaterial {
 	vec4 albedo;
 	vec3 emission;
@@ -273,15 +205,163 @@ layout(set = 0, binding = 8, std430) restrict readonly buffer MeshletMaterials {
 	MeshletMaterial data[];
 }
 meshlet_materials;
+
+// Mirrors RenderForwardClustered::MeshletLightGPU exactly (std430 layout, 64 bytes) - real scene
+// lights (directional/omni/spot), extracted CPU-side via LightStorage's public getters rather
+// than binding Forward+'s real omni_lights/spot_lights/cluster_buffer (see
+// RenderForwardClustered::_meshlet_collect_lights()'s comment for the full reasoning - binding
+// those would need ~25 matching descriptor declarations across two uniform sets in this
+// standalone shader, plus separate work for shadow/GI sampling, for marginal benefit at this
+// stage). No spatial culling: every light up to MESHLET_MAX_LIGHTS is evaluated for every
+// fragment unconditionally.
+struct MeshletLight {
+	vec3 position;
+	float inv_radius;
+	vec3 direction;
+	float attenuation;
+	vec3 color; // Energy-premultiplied.
+	float size;
+	float cone_angle; // cos(angle) - spot lights only.
+	float cone_attenuation;
+	uint is_directional;
+	uint pad0;
+};
+
+layout(set = 0, binding = 9, std430) restrict readonly buffer Lights {
+	MeshletLight data[];
+}
+lights;
+
+const float M_PI = 3.14159265358979323846;
+
+// The following are a deliberately trimmed extraction of scene_forward_lights_inc.glsl's
+// light_compute()/D_GGX()/V_GGX()/SchlickFresnel()/F0()/get_omni_attenuation() - confirmed during
+// research that light_compute() itself takes only explicit scalar/vector parameters (no buffer
+// access) as long as none of its optional feature blocks (backlight/transmittance/rim/clearcoat/
+// anisotropy/LIGHT_CODE_USED) are compiled in, which this file doesn't define. The wrapper
+// functions that *do* need real buffer access (light_process_omni/light_process_spot - they read
+// omni_lights.data[]/spot_lights.data[]/scene_data_block directly for shadow sampling even when
+// shadows are nominally disabled) are NOT reusable here and are not used - this is why lights are
+// looked up from this file's own flat array instead. Uses plain float/vec3 throughout rather than
+// Forward+'s half/hvec3 (those only matter for explicit fp16 performance on supporting hardware,
+// not correctness) - this is the non-fp16 path's exact behavior (half_inc.glsl's "#else" branch:
+// half=float, hvec3=vec3, saturateHalf(x)=x, a no-op). Lambert diffuse (not Burley) + Schlick-GGX
+// specular - Forward+'s own most common default combination for opaque PBR materials.
+
+float D_GGX(float NoH, float roughness) {
+	float a = NoH * roughness;
+	float k = roughness / (1.0 - NoH * NoH + a * a);
+	return k * k * (1.0 / M_PI);
+}
+
+float V_GGX(float NdotL, float NdotV, float alpha) {
+	return 0.5 / mix(2.0 * NdotL * NdotV, NdotL + NdotV, alpha);
+}
+
+float SchlickFresnel(float u) {
+	float m = 1.0 - u;
+	float m2 = m * m;
+	return m2 * m2 * m; // pow(m, 5).
+}
+
+vec3 F0(float metallic, float specular, vec3 albedo) {
+	float dielectric = 0.16 * specular * specular;
+	return mix(vec3(dielectric), albedo, metallic);
+}
+
+float get_omni_attenuation(float distance, float inv_range, float decay) {
+	float nd = distance * inv_range;
+	nd *= nd;
+	nd *= nd; // nd^4.
+	nd = max(1.0 - nd, 0.0);
+	nd *= nd; // nd^2.
+	return nd * pow(max(distance, 0.0001), -decay);
+}
+
+// Trimmed light_compute(): no backlight/transmittance/rim/clearcoat/anisotropy, no shadows (the
+// real shadow atlas isn't bound here - see this file's top-level comment), no LIGHT_CODE_USED
+// (custom ShaderMaterial light() functions aren't representable in MeshletMaterial's flattened
+// schema and fall back to normal Forward+ rendering well before reaching this shader).
+void light_compute(vec3 N, vec3 L, vec3 V, vec3 light_color, bool is_directional, float attenuation, vec3 f0, float roughness, float metallic, float specular_amount, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
+	float NdotL = min(dot(N, L), 1.0);
+	float cNdotV = max(dot(N, V), 1e-4);
+
+	if (is_directional || attenuation > 1.175494351e-38) {
+		float cNdotL = max(NdotL, 0.0);
+
+		if (metallic < 1.0) {
+			float diffuse_brdf_NL = cNdotL * (1.0 / M_PI); // Lambert.
+			diffuse_light += light_color * diffuse_brdf_NL * attenuation;
+		}
+
+		if (roughness > 0.0) {
+			vec3 H = normalize(V + L);
+			float cNdotH = clamp(dot(N, H), 0.0, 1.0);
+			float cLdotH = clamp(dot(L, H), 0.0, 1.0);
+
+			float alpha_ggx = roughness * roughness;
+			float D = D_GGX(cNdotH, alpha_ggx);
+			float G = V_GGX(cNdotL, cNdotV, alpha_ggx);
+			float cLdotH5 = SchlickFresnel(cLdotH);
+			float f90 = clamp(dot(f0, vec3(50.0 * 0.33)), metallic, 1.0);
+			vec3 F = f0 + (f90 - f0) * cLdotH5;
+			vec3 specular_brdf_NL = vec3(cNdotL * D * G) * F;
+			specular_light += specular_brdf_NL * light_color * attenuation * specular_amount;
+		}
+	}
+}
+
+void light_process_directional(uint idx, vec3 N, vec3 V, vec3 f0, float roughness, float metallic, float specular_amount, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
+	vec3 L = normalize(-lights.data[idx].direction);
+	light_compute(N, L, V, lights.data[idx].color, true, 1.0, f0, roughness, metallic, specular_amount, albedo, diffuse_light, specular_light);
+}
+
+void light_process_omni(uint idx, vec3 vertex, vec3 N, vec3 V, vec3 f0, float roughness, float metallic, float specular_amount, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
+	vec3 light_rel_vec = lights.data[idx].position - vertex;
+	float light_length = length(light_rel_vec);
+	float attenuation = get_omni_attenuation(light_length, lights.data[idx].inv_radius, lights.data[idx].attenuation);
+	vec3 L = normalize(light_rel_vec);
+	light_compute(N, L, V, lights.data[idx].color, false, attenuation, f0, roughness, metallic, specular_amount, albedo, diffuse_light, specular_light);
+}
+
+void light_process_spot(uint idx, vec3 vertex, vec3 N, vec3 V, vec3 f0, float roughness, float metallic, float specular_amount, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
+	vec3 light_rel_vec = lights.data[idx].position - vertex;
+	float light_length = length(light_rel_vec);
+	vec3 light_rel_vec_norm = light_rel_vec / light_length;
+	float attenuation = get_omni_attenuation(light_length, lights.data[idx].inv_radius, lights.data[idx].attenuation);
+	float cone_angle = lights.data[idx].cone_angle;
+	float scos = max(dot(-light_rel_vec_norm, lights.data[idx].direction), cone_angle);
+	float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - cone_angle));
+	attenuation *= 1.0 - pow(spot_rim, lights.data[idx].cone_attenuation);
+	vec3 L = light_rel_vec_norm;
+	light_compute(N, L, V, lights.data[idx].color, false, attenuation, f0, roughness, metallic, specular_amount, albedo, diffuse_light, specular_light);
+}
+
 #endif
 
 void main() {
 #ifndef MESHLET_DEPTH_ONLY
 	MeshletMaterial mat = meshlet_materials.data[material_id_interp];
-	// B2 (vertex-lit milestone): the lighting contribution (diffuse+specular against the scene's
-	// real directional light) was already computed per-vertex and interpolated in - just add
-	// emission here. No per-fragment light_compute() yet (that's B3).
-	vec3 color = vertex_light_interp + mat.emission;
+	vec3 N = normalize(world_normal_interp);
+	vec3 V = normalize(params.camera_position - world_pos_interp);
+	vec3 albedo = mat.albedo.rgb;
+	vec3 f0 = F0(mat.metallic, mat.specular, albedo);
+
+	vec3 diffuse_light = vec3(0.0);
+	vec3 specular_light = vec3(0.0);
+	for (uint i = 0; i < params.light_count; i++) {
+		if (lights.data[i].is_directional != 0u) {
+			light_process_directional(i, N, V, f0, mat.roughness, mat.metallic, mat.specular, albedo, diffuse_light, specular_light);
+		} else if (lights.data[i].cone_angle < 1.0) {
+			// cone_angle defaults to 1.0 (cos(0)) for omni lights, where it's meaningless - real
+			// spot lights always have a smaller cone_angle than that default.
+			light_process_spot(i, world_pos_interp, N, V, f0, mat.roughness, mat.metallic, mat.specular, albedo, diffuse_light, specular_light);
+		} else {
+			light_process_omni(i, world_pos_interp, N, V, f0, mat.roughness, mat.metallic, mat.specular, albedo, diffuse_light, specular_light);
+		}
+	}
+
+	vec3 color = albedo * (1.0 - mat.metallic) * diffuse_light + specular_light + mat.emission;
 	frag_color = vec4(color, mat.albedo.a);
 #endif
 	// MESHLET_DEPTH_ONLY: no color output at all - this variant targets a depth-only

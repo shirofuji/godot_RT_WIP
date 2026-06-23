@@ -784,13 +784,34 @@ void test_meshlet_render_visual_proof() {
 	RID framebuffer = RD::get_singleton()->framebuffer_create(attachments);
 	RD::FramebufferFormatID framebuffer_format = RD::get_singleton()->framebuffer_get_format(framebuffer);
 
-	// Light pointed straight at the camera-facing side (not the old debug-shading
-	// Vector3(-0.5,-1,-0.5)) - since B2 (vertex-lit milestone) introduced real light/dark sides,
-	// the center-pixel-brightness assertion below needs the front-facing point to be guaranteed
-	// brightly lit (N.L == 1.0 exactly) regardless of any minor pixel-center-vs-sphere-center
-	// alignment nuance, rather than relying on a specific angled direction that happened to light
-	// the whole shape uniformly back when shading was flat per-meshlet debug color.
-	renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, framebuffer, framebuffer_format, Rect2i(0, 0, render_size, render_size), projection, camera_xform, Vector3(0.0f, 0.0f, -1.0f), Color(1, 1, 1));
+	// One directional light, pointed straight at the camera-facing side (not the old debug-shading
+	// Vector3(-0.5,-1,-0.5)) - since B2 introduced real light/dark sides, the center-pixel-
+	// brightness assertion below needs the front-facing point to be guaranteed brightly lit
+	// (N.L == 1.0 exactly) regardless of any minor pixel-center-vs-sphere-center alignment nuance.
+	// Mirrors RenderForwardClustered::MeshletLightGPU's layout exactly (64 bytes: see
+	// meshlet_render.glsl's MeshletLight struct) without depending on that type directly - this
+	// file deliberately doesn't include render_forward_clustered.h.
+	struct {
+		float position[3] = { 0, 0, 0 };
+		float inv_radius = 0;
+		float direction[3] = { 0, 0, -1 };
+		float attenuation = 1;
+		// Energy-premultiplied including the *PI compensation RenderForwardClustered::
+		// _meshlet_collect_lights() applies for real scene lights (matches LightStorage's own
+		// light data setup, compensating for light_compute()'s Lambert 1/PI normalization) - a
+		// flat color[3]={1,1,1} without this would render visibly dimmer than a real energy=1.0
+		// light actually produces.
+		float color[3] = { (float)Math::PI, (float)Math::PI, (float)Math::PI };
+		float size = 0;
+		float cone_angle = 1;
+		float cone_attenuation = 1;
+		uint32_t is_directional = 1;
+		uint32_t pad0 = 0;
+	} light_data;
+	RID lights_buffer = RD::get_singleton()->storage_buffer_create(sizeof(light_data));
+	RD::get_singleton()->buffer_update(lights_buffer, 0, sizeof(light_data), &light_data);
+
+	renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, framebuffer, framebuffer_format, Rect2i(0, 0, render_size, render_size), projection, camera_xform, lights_buffer, 1);
 
 	Vector<uint8_t> pixels = RD::get_singleton()->texture_get_data(color_texture, 0);
 	check((int)pixels.size() == render_size * render_size * 4, "Color texture readback has the expected byte size");
@@ -824,6 +845,7 @@ void test_meshlet_render_visual_proof() {
 	storage->free_mesh_meshlets(upload);
 	RD::get_singleton()->free_rid(transforms_buffer);
 	RD::get_singleton()->free_rid(material_ids_buffer);
+	RD::get_singleton()->free_rid(lights_buffer);
 	RD::get_singleton()->free_rid(far_depth_texture);
 	// Free the framebuffer before the textures it attaches - freeing an attached texture first
 	// cascades to free the framebuffer too (same dependency-tracking behavior as vertex
@@ -831,6 +853,104 @@ void test_meshlet_render_visual_proof() {
 	RD::get_singleton()->free_rid(framebuffer);
 	RD::get_singleton()->free_rid(color_texture);
 	RD::get_singleton()->free_rid(depth_texture);
+}
+
+// B5 (PBR verification milestone): proves MeshletStorage::upload_material()'s RID-keyed dedup and
+// MeshletMaterialGPU round-tripping work correctly across *multiple distinct real materials* -
+// the explicitly-flagged-as-missing check from this project's research (every earlier render test
+// only ever exercised a single material). Mirrors the established CPU-reference pattern used for
+// culling/occlusion: build known data, upload it, read it back via the GPU, and assert it matches
+// exactly - not a render/visual check (that's covered separately by the live multi-material
+// .selftest_project scene, see meshlet_overlay_test.tscn's two differently-colored spheres).
+void test_meshlet_material_lookup_vs_cpu_reference() {
+	RendererRD::MeshletStorage *storage = RendererRD::MeshletStorage::get_singleton();
+	if (!storage) {
+		return;
+	}
+
+	// Three distinct materials, distinguished by albedo color (and, for the third, also
+	// metallic/roughness) - enough to catch both "wrong slot" and "fields swapped/overwritten"
+	// bugs, not just "is some material found at all".
+	Vector<RendererRD::MeshletStorage::MeshletMaterialGPU> expected_materials;
+	{
+		RendererRD::MeshletStorage::MeshletMaterialGPU m;
+		m.albedo[0] = 0.8f;
+		m.albedo[1] = 0.1f;
+		m.albedo[2] = 0.1f;
+		m.albedo[3] = 1.0f;
+		expected_materials.push_back(m);
+	}
+	{
+		RendererRD::MeshletStorage::MeshletMaterialGPU m;
+		m.albedo[0] = 0.1f;
+		m.albedo[1] = 0.8f;
+		m.albedo[2] = 0.1f;
+		m.albedo[3] = 1.0f;
+		expected_materials.push_back(m);
+	}
+	{
+		RendererRD::MeshletStorage::MeshletMaterialGPU m;
+		m.albedo[0] = 0.1f;
+		m.albedo[1] = 0.1f;
+		m.albedo[2] = 0.8f;
+		m.albedo[3] = 1.0f;
+		m.metallic = 1.0f;
+		m.roughness = 0.2f;
+		expected_materials.push_back(m);
+	}
+
+	// Distinct dummy RIDs as dedup keys - tiny real textures are a convenient way to get distinct,
+	// valid RID values that don't collide with each other or with RID() (used elsewhere for "no
+	// material") - their texture format is otherwise irrelevant, they're never sampled.
+	RD::TextureFormat dummy_format;
+	dummy_format.format = RD::DATA_FORMAT_R8_UNORM;
+	dummy_format.width = 1;
+	dummy_format.height = 1;
+	dummy_format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT;
+	Vector<RID> material_rids;
+	for (int i = 0; i < expected_materials.size(); i++) {
+		material_rids.push_back(RD::get_singleton()->texture_create(dummy_format, RD::TextureView()));
+	}
+
+	Vector<uint32_t> slots;
+	for (int i = 0; i < expected_materials.size(); i++) {
+		slots.push_back(storage->upload_material(material_rids[i], expected_materials[i]));
+	}
+
+	bool slots_distinct = true;
+	for (int i = 0; i < slots.size(); i++) {
+		for (int j = i + 1; j < slots.size(); j++) {
+			if (slots[i] == slots[j]) {
+				slots_distinct = false;
+			}
+		}
+	}
+	check(slots_distinct, "upload_material() returned distinct slots for distinct material RIDs");
+
+	bool all_round_trip_correctly = true;
+	for (int i = 0; i < slots.size(); i++) {
+		RendererRD::MeshletStorage::MeshletMaterialGPU readback = storage->debug_get_material(slots[i]);
+		const RendererRD::MeshletStorage::MeshletMaterialGPU &expected = expected_materials[i];
+		bool matches = readback.albedo[0] == expected.albedo[0] && readback.albedo[1] == expected.albedo[1] &&
+				readback.albedo[2] == expected.albedo[2] && readback.albedo[3] == expected.albedo[3] &&
+				readback.metallic == expected.metallic && readback.roughness == expected.roughness;
+		if (!matches) {
+			all_round_trip_correctly = false;
+		}
+	}
+	check(all_round_trip_correctly, "Every uploaded material's albedo/metallic/roughness round-trips correctly through real GPU buffers, in the correct distinct slot");
+
+	// Re-uploading the same RID (e.g. simulating the same instance re-scanned next frame) must
+	// dedup to the *same* slot, not allocate a new one - this is what keeps material upload cheap
+	// for the common case of many instances sharing one material.
+	uint32_t re_upload_slot = storage->upload_material(material_rids[0], expected_materials[0]);
+	check(re_upload_slot == slots[0], "Re-uploading the same material RID dedups to the same slot, not a new one");
+
+	for (int i = 0; i < material_rids.size(); i++) {
+		if (material_rids[i].is_valid()) {
+			RD::get_singleton()->free_rid(material_rids[i]);
+		}
+	}
 }
 
 } // namespace
@@ -847,6 +967,7 @@ void run_meshlet_selftest_if_requested() {
 	test_hiz_occlusion_vs_cpu_reference();
 	test_temporal_hiz_two_pass_disocclusion_recovery();
 	test_meshlet_render_visual_proof();
+	test_meshlet_material_lookup_vs_cpu_reference();
 	if (g_failures == 0) {
 		print_line("MESHLET_SELFTEST: all checks passed");
 	} else {

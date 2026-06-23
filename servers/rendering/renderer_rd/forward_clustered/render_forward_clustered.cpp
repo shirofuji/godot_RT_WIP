@@ -1704,7 +1704,8 @@ static void _meshlet_debug_transform_to_mat4_columns(const Transform3D &p_transf
 	r_out[15] = 1.0f;
 }
 
-uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_material_rid) {
+uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_material_rid, bool &r_qualifies) {
+	r_qualifies = true; // No material assigned at all is a normal, qualifying case (default white).
 	RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
 	if (!meshlet_storage) {
 		return 0;
@@ -1716,6 +1717,12 @@ uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_mater
 		RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 
 		Variant albedo_v = material_storage->material_get_param(material_rid, "albedo");
+		// B6 (qualifying-mesh milestone): a material with no "albedo" param at all isn't
+		// BaseMaterial3D/ORMMaterial3D-shaped (custom ShaderMaterials use arbitrary uniform names
+		// that can't be flattened into MeshletMaterialGPU's fixed schema) - the caller uses this to
+		// exclude such instances from meshlet-replace-default (they fall back to normal Forward+
+		// rendering instead of getting a wrong-looking default-white material).
+		r_qualifies = albedo_v.get_type() != Variant::NIL;
 		if (albedo_v.get_type() != Variant::NIL) {
 			Color albedo = albedo_v.operator Color();
 			data.albedo[0] = albedo.r;
@@ -1750,23 +1757,85 @@ uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_mater
 	return meshlet_storage->upload_material(material_rid, data);
 }
 
-bool RenderForwardClustered::_meshlet_get_directional_light(RenderDataRD *p_render_data, Color &r_color, float &r_energy, Vector3 &r_direction) {
-	if (!p_render_data->lights || p_render_data->directional_light_count == 0) {
-		return false;
+Vector<RenderForwardClustered::MeshletLightGPU> RenderForwardClustered::_meshlet_collect_lights(RenderDataRD *p_render_data) {
+	Vector<MeshletLightGPU> result;
+	if (!p_render_data->lights) {
+		return result;
 	}
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	if (!light_storage) {
-		return false;
+		return result;
 	}
-	// directional_light_count describes how many of the *first* entries in p_render_data->lights
-	// are directional - the same ordering convention Forward+'s own _setup_lights() relies on.
-	RID light_instance = (*p_render_data->lights)[0];
-	RID base_light = light_storage->light_instance_get_base_light(light_instance);
-	r_color = light_storage->light_get_color(base_light);
-	r_energy = light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_ENERGY);
-	Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
-	r_direction = light_transform.basis.xform(Vector3(0, 0, -1)).normalized();
-	return true;
+
+	uint32_t count = MIN((uint32_t)p_render_data->lights->size(), MESHLET_MAX_LIGHTS);
+	for (uint32_t i = 0; i < count; i++) {
+		RID light_instance = (*p_render_data->lights)[i];
+		RID base_light = light_storage->light_instance_get_base_light(light_instance);
+		Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
+		RSE::LightType type = light_storage->light_get_type(base_light);
+
+		MeshletLightGPU light;
+		Color color = light_storage->light_get_color(base_light);
+		float energy = light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_ENERGY);
+		// Matches LightStorage's own light data setup (light_storage.cpp, both the directional and
+		// omni/spot paths) - non-physical-light-units energy gets multiplied by PI to compensate
+		// for the Lambert diffuse BRDF's own 1/PI normalization in light_compute(), so a default
+		// energy=1.0 light produces full-brightness diffuse response instead of a dim ~1/PI
+		// fraction of it. This pipeline doesn't support physical light units (energy*intensity,
+		// LIGHT_PARAM_INTENSITY) - out of scope for this milestone.
+		energy *= Math::PI;
+		light.color[0] = color.r * energy;
+		light.color[1] = color.g * energy;
+		light.color[2] = color.b * energy;
+
+		if (type == RSE::LIGHT_DIRECTIONAL) {
+			light.is_directional = 1;
+			Vector3 direction = light_transform.basis.xform(Vector3(0, 0, -1)).normalized();
+			light.direction[0] = direction.x;
+			light.direction[1] = direction.y;
+			light.direction[2] = direction.z;
+		} else {
+			// Omni and spot share position/range/attenuation/size; spot additionally has a real
+			// direction and cone params (omni's direction/cone fields are left at their harmless
+			// defaults - the shader only reads them when is_directional/is_spot says to).
+			light.is_directional = 0;
+			Vector3 position = light_transform.origin;
+			light.position[0] = position.x;
+			light.position[1] = position.y;
+			light.position[2] = position.z;
+			float radius = MAX(0.001f, light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_RANGE));
+			light.inv_radius = 1.0f / radius;
+			light.attenuation = light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_ATTENUATION);
+			light.size = light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_SIZE);
+
+			if (type == RSE::LIGHT_SPOT) {
+				Vector3 direction = light_transform.basis.xform(Vector3(0, 0, -1)).normalized();
+				light.direction[0] = direction.x;
+				light.direction[1] = direction.y;
+				light.direction[2] = direction.z;
+				float spot_angle = light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_SPOT_ANGLE);
+				light.cone_angle = Math::cos(Math::deg_to_rad(spot_angle));
+				light.cone_attenuation = light_storage->light_get_param(base_light, RSE::LIGHT_PARAM_SPOT_ATTENUATION);
+			}
+		}
+		result.push_back(light);
+	}
+	return result;
+}
+
+RID RenderForwardClustered::meshlet_lights_buffer_rid(const Vector<MeshletLightGPU> &p_lights) {
+	uint32_t needed_capacity = MAX(1, p_lights.size());
+	if (needed_capacity > meshlet_lights_buffer_capacity) {
+		if (meshlet_lights_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(meshlet_lights_buffer);
+		}
+		meshlet_lights_buffer = RD::get_singleton()->storage_buffer_create(needed_capacity * sizeof(MeshletLightGPU));
+		meshlet_lights_buffer_capacity = needed_capacity;
+	}
+	if (!p_lights.is_empty()) {
+		RD::get_singleton()->buffer_update(meshlet_lights_buffer, 0, p_lights.size() * sizeof(MeshletLightGPU), p_lights.ptr());
+	}
+	return meshlet_lights_buffer;
 }
 
 void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_data) {
@@ -1776,8 +1845,16 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 	meshlet_replace_skip_set.clear();
 	meshlet_replace_default_active = false;
 
+	// B6 (rollout milestone): rendering/meshlet/enabled is the real per-project kill-switch
+	// (default true - meshlet replacement is the unconditional default for qualifying meshes once
+	// Phase B3 shipped). --meshlet-replace-default forces it on regardless of the project setting
+	// (useful for A/B comparison in a project that disabled it); --meshlet-disable forces it off
+	// regardless (useful for perf comparison even in a project that has it on by default) -
+	// neither flag *replaces* the project setting, they layer on top of it as developer overrides.
 	static bool overlay_enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-debug-overlay") != nullptr;
-	static bool replace_enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-replace-default") != nullptr;
+	static bool force_enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-replace-default") != nullptr;
+	static bool force_disabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-disable") != nullptr;
+	bool replace_enabled = !force_disabled && (force_enabled || bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/enabled")));
 	if (!overlay_enabled && !replace_enabled) {
 		return;
 	}
@@ -1808,14 +1885,20 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		// material_override (if set) replaces every surface's material - same precedence Godot's
 		// own normal rendering gives it. Otherwise use this specific surface's own material.
 		RID surface_material_rid = inst->data->material_override.is_valid() ? inst->data->material_override : (sdcache->surface_index < inst->data->surface_materials.size() ? inst->data->surface_materials[sdcache->surface_index] : RID());
-		meshlet_scan_material_ids.push_back(_meshlet_resolve_material_id(surface_material_rid));
+		bool material_qualifies = true;
+		meshlet_scan_material_ids.push_back(_meshlet_resolve_material_id(surface_material_rid, material_qualifies));
 		RendererRD::MeshletCuller::InstanceMeshletRange r;
 		r.instance_index = instance_index;
 		r.meshlet_offset = range.offset;
 		r.meshlet_count = range.count;
 		meshlet_scan_ranges.push_back(r);
 
-		if (replace_enabled) {
+		// B6: only skip the normal color draw (i.e. actually replace it with the meshlet path) for
+		// qualifying materials - a non-qualifying instance is still scanned (so --meshlet-debug-
+		// overlay can still show it, approximated with default material values, which is harmless
+		// for a debug visualization) but keeps rendering normally via Forward+ instead of replacing
+		// it with a wrong-looking default-white meshlet draw.
+		if (replace_enabled && material_qualifies) {
 			meshlet_replace_skip_set.insert(sdcache);
 		}
 	}
@@ -1957,7 +2040,7 @@ void RenderForwardClustered::_render_meshlet_early_depth_pass(RenderDataRD *p_re
 	// before Forward+'s own real depth pre-pass).
 	RID material_ids_buffer = meshlet_scan_material_ids_buffer();
 	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_depth_framebuffer);
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_depth_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, Vector3(), Color(), true, true);
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_depth_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, RID(), 0, true, true);
 }
 
 void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer) {
@@ -2016,24 +2099,16 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	RID material_ids_buffer = meshlet_scan_material_ids_buffer();
 	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_color_only_framebuffer);
 
-	// B2 (vertex-lit milestone): real scene directional light, falling back to no lighting
-	// contribution (black, plus whatever emission a material has) if the scene has none - this
-	// milestone deliberately only handles directional light (see
-	// _meshlet_get_directional_light()'s comment), not omni/spot/area, so there's nothing to light
-	// by in that fallback case.
-	Color light_color = Color(0, 0, 0);
-	Vector3 light_direction = Vector3(-0.5f, -1.0f, -0.5f).normalized();
-	float light_energy = 0.0f;
-	if (_meshlet_get_directional_light(p_render_data, light_color, light_energy, light_direction)) {
-		light_color *= light_energy;
-	} else {
-		light_color = Color(0, 0, 0);
-	}
+	// B3 (full per-fragment PBR milestone): real scene lights (directional + omni + spot, capped
+	// at MESHLET_MAX_LIGHTS, no spatial culling) - see _meshlet_collect_lights()'s comment for why
+	// this doesn't bind Forward+'s real cluster buffer.
+	Vector<MeshletLightGPU> lights = _meshlet_collect_lights(p_render_data);
+	RID lights_buffer = meshlet_lights_buffer_rid(lights);
 
 	// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
 	// color (and, if the early pass ran, its partial depth contribution too) - never true here,
 	// matching this pass's existing pre-restructuring behavior.
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, light_direction, light_color, false);
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false);
 
 	// Rebuild Hi-Z once more, now from the fully-resolved depth (everything drawn this frame,
 	// including what this late pass itself just drew) - this becomes *next* frame's "last frame's

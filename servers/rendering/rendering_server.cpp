@@ -3803,6 +3803,16 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/enable", true);
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/disable_for_vendors", "PowerVR,Mali,Adreno,Apple");
 
+	// GPU-driven meshlet renderer (see project plan/memory) - the unconditional default rendering
+	// path for qualifying meshes (opaque, static, StandardMaterial3D/ORMMaterial3D-only - see
+	// RenderForwardClustered::_meshlet_scan_render_list()'s qualifying-mesh filtering) once Phase
+	// B3 (full per-fragment PBR) shipped. Kept as a real, user-facing kill-switch rather than
+	// hardcoding the behavior, since this has only been validated against a handful of test scenes,
+	// not arbitrary existing Godot projects - the existing --meshlet-replace-default/
+	// --meshlet-disable cmdline flags layer on top of this setting as developer overrides, not
+	// replacements for it.
+	GLOBAL_DEF_RST("rendering/meshlet/enabled", true);
+
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);
 

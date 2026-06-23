@@ -802,14 +802,50 @@ private:
 	// invalid (no material assigned) - resolves to one shared default slot. Re-resolves and
 	// re-uploads every call (no per-frame change-detection yet) - acceptable for now since this
 	// mirrors the existing per-frame transform re-upload's level of (lack of) optimization.
-	uint32_t _meshlet_resolve_material_id(const RID &p_material_rid);
-	// B2 (vertex-lit milestone): real scene directional light, extracted directly via
-	// LightStorage's public getters rather than binding Forward+'s real DirectionalLights UBO -
-	// deliberately simpler than full SCENE_UNIFORM_SET integration (deferred to B3, where the
-	// per-fragment clustered-light/shadow/GI binding work happens anyway and the investment pays
-	// for itself). Returns false (light_color/energy/direction left untouched) if the scene has no
-	// directional light - caller should fall back to no lighting contribution in that case.
-	bool _meshlet_get_directional_light(RenderDataRD *p_render_data, Color &r_color, float &r_energy, Vector3 &r_direction);
+	// r_qualifies: false if p_material_rid is valid but isn't BaseMaterial3D/ORMMaterial3D-shaped
+	// (no "albedo" param found) - see B6's qualifying-mesh criteria.
+	uint32_t _meshlet_resolve_material_id(const RID &p_material_rid, bool &r_qualifies);
+
+	// B3 (full per-fragment PBR milestone): mirrors the GLSL-side MeshletLight struct exactly
+	// (std430 layout, 64 bytes). Supersedes B2's single-directional-light approach
+	// (_meshlet_get_directional_light(), now removed) with multiple real scene lights
+	// (directional + omni + spot).
+	struct MeshletLightGPU {
+		float position[3] = { 0, 0, 0 }; // World space - unused (but still present) for directional lights.
+		float inv_radius = 0;
+		float direction[3] = { 0, 0, -1 }; // World space, normalized - the light's own forward.
+		float attenuation = 1;
+		float color[3] = { 0, 0, 0 }; // Energy-premultiplied.
+		float size = 0;
+		float cone_angle = 1; // cos(angle) - only meaningful for spot lights.
+		float cone_attenuation = 1;
+		uint32_t is_directional = 0;
+		uint32_t pad0 = 0;
+	};
+	static constexpr uint32_t MESHLET_MAX_LIGHTS = 16; // Caps the per-fragment light loop's cost
+			// and this SSBO's size - see _meshlet_collect_lights()'s comment for why this is a
+			// flat list with no spatial culling, not Forward+'s real cluster buffer.
+
+	// Extracts up to MESHLET_MAX_LIGHTS real scene lights (directional + omni + spot) via
+	// LightStorage's public getters - same deliberate choice as B2's removed
+	// _meshlet_get_directional_light() to avoid binding Forward+'s real SCENE_UNIFORM_SET/
+	// RENDER_PASS_UNIFORM_SET (would require declaring ~25 matching bindings across two descriptor
+	// sets in this standalone shader to get at the real omni_lights/spot_lights/cluster_buffer -
+	// a large, high-risk undertaking for marginal benefit at this stage, given shadows and GI
+	// would still need separate, equally large integration work and are explicitly out of scope
+	// for this milestone too). No spatial culling: every light in the scene up to the cap is sent
+	// to every meshlet instance's fragment shader, evaluated unconditionally - correct for small-
+	// to-moderate light counts, not scalable to scenes with hundreds of lights. An explicit,
+	// documented tradeoff, not an oversight - revisit if/when real cluster-buffer integration
+	// becomes worth the risk (most naturally bundled with adding real shadow sampling, which needs
+	// the same uniform sets).
+	Vector<MeshletLightGPU> _meshlet_collect_lights(RenderDataRD *p_render_data);
+	RID meshlet_lights_buffer;
+	uint32_t meshlet_lights_buffer_capacity = 0;
+	RID meshlet_lights_buffer_rid(const Vector<MeshletLightGPU> &p_lights); // Builds/reuses a
+			// persistent SSBO from p_lights, the same grow-with-realloc pattern as
+			// meshlet_scan_transforms_buffer().
+
 	Vector<uint32_t> meshlet_scan_material_ids; // Parallel to meshlet_scan_instance_transforms.
 	RID meshlet_scan_material_ids_buffer(); // Builds/reuses a per-instance material-id SSBO from
 			// meshlet_scan_material_ids, the same way meshlet_scan_transforms_buffer() does for
