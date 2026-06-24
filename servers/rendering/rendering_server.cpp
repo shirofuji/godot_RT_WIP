@@ -3840,6 +3840,13 @@ void RenderingServer::init() {
 	// replacements for it.
 	GLOBAL_DEF_RST("rendering/meshlet/enabled", true);
 
+	// Nanite-style continuous cluster LOD: max acceptable per-cluster screen-space geometric error,
+	// in pixels, for the cut in meshlet_cull.glsl. Lower = crisper / more triangles; higher = more
+	// aggressive distance LOD reduction (lower triangle counts). ~1px is the "switch when the error
+	// is about a pixel" target. Tunable live without a rebuild so a project can dial the quality/perf
+	// balance for its own content.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/meshlet/lod_error_threshold_px", PROPERTY_HINT_RANGE, "0.1,16.0,0.1"), 1.0);
+
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);
 
