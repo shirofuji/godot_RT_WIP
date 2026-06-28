@@ -64,6 +64,7 @@ protected:
 	RendererRD::MeshletStorage *meshlet_storage = nullptr;
 	RendererRD::MeshletCuller *meshlet_culler = nullptr;
 	RendererRD::MeshletRenderer *meshlet_renderer = nullptr;
+	class MeshletSoftwareRasterizer *meshlet_software_rasterizer = nullptr;
 	RendererRD::HiZBuilder *hiz_builder = nullptr;
 	RendererRD::ParticlesStorage *particles_storage = nullptr;
 	RendererRD::TextureStorage *texture_storage = nullptr;

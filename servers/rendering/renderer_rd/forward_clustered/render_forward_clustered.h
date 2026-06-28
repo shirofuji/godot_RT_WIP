@@ -864,7 +864,7 @@ private:
 			// from the exact same per-frame instance/range scan.
 	bool _meshlet_early_pass_should_engage(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_is_reflection_probe, bool p_depth_pre_pass, PassMode p_depth_pass_mode) const;
 	void _render_meshlet_early_depth_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_depth_framebuffer);
-	void _render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer, const Color &p_default_bg_color);
+	void _render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer, const Color &p_default_bg_color, RID p_radiance_texture);
 	RID meshlet_debug_overlay_transforms_buffer;
 	uint32_t meshlet_debug_overlay_transforms_capacity = 0;
 	bool meshlet_replace_default_active = false;

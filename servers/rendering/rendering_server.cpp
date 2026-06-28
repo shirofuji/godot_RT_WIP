@@ -1441,7 +1441,12 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 			Vector<SurfaceTool::Meshlet> base_meshlets_st;
 			LocalVector<MeshletDAG::Cluster> dag_clusters;
 			LocalVector<MeshletDAG::ClusterLOD> dag_lods;
-			if (MeshletDAG::build(base_vertices, base_indices, dag_clusters) && !dag_clusters.is_empty()) {
+			// Skip the heavy multi-level Nanite cluster-DAG bake when disabled by project setting,
+			// falling back to a single full-resolution meshlet split (much cheaper, no continuous LOD).
+			// The DAG bake runs synchronously on the surface-creating thread and is CPU-heavy, so
+			// projects that create many meshes at runtime (procedural terrain) can disable it to cut
+			// per-mesh latency. See rendering/meshlet/bake_lod_dag's registration for the full rationale.
+			if (GLOBAL_GET_CACHED(bool, "rendering/meshlet/bake_lod_dag") && MeshletDAG::build(base_vertices, base_indices, dag_clusters) && !dag_clusters.is_empty()) {
 				MeshletDAG::flatten_to_arrays(dag_clusters, base_vertices, base_meshlets_st, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st, dag_lods);
 			} else {
 				base_meshlets_st = SurfaceTool::build_meshlets(base_vertices, base_indices, 64, 124, 0.5f, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st);
@@ -3846,6 +3851,16 @@ void RenderingServer::init() {
 	// is about a pixel" target. Tunable live without a rebuild so a project can dial the quality/perf
 	// balance for its own content.
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/meshlet/lod_error_threshold_px", PROPERTY_HINT_RANGE, "0.1,16.0,0.1"), 1.0);
+
+	// Nanite-style cluster-LOD DAG bake. When enabled (default), each triangle-mesh surface is baked
+	// into a multi-level cluster DAG at creation time (MeshletDAG::build) so the GPU can pick a
+	// crack-free continuous-LOD subset per frame. That bake is CPU-heavy and runs *synchronously on
+	// the thread that creates the surface*, so projects that build many meshes at runtime (procedural
+	// terrain, runtime CSG, etc.) pay noticeable per-mesh latency - often on the main thread, freezing
+	// the window. Disable to skip the DAG and fall back to a single full-resolution meshlet split
+	// (build_meshlets): meshlet rendering still works, just without continuous LOD. Restart-to-apply
+	// since already-baked meshes keep their existing data until recreated.
+	GLOBAL_DEF_RST("rendering/meshlet/bake_lod_dag", true);
 
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);

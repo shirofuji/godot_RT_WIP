@@ -20,6 +20,47 @@
 
 /* INPUT ATTRIBS */
 
+#ifdef MESHLET_PULLING
+vec4 vertex_angle_attrib = vec4(0.0);
+#if defined(NORMAL_USED) || defined(TANGENT_USED)
+vec4 axis_tangent_attrib = vec4(0.0);
+#endif
+#if defined(COLOR_USED)
+vec4 color_attrib = vec4(1.0);
+#endif
+#ifdef UV_USED
+vec2 uv_attrib = vec2(0.0);
+#endif
+#if defined(UV2_USED) || defined(USE_LIGHTMAP) || defined(MODE_RENDER_MATERIAL)
+vec2 uv2_attrib = vec2(0.0);
+#endif
+#if defined(CUSTOM0_USED)
+vec4 custom0_attrib = vec4(0.0);
+#endif
+#if defined(CUSTOM1_USED)
+vec4 custom1_attrib = vec4(0.0);
+#endif
+#if defined(CUSTOM2_USED)
+vec4 custom2_attrib = vec4(0.0);
+#endif
+#if defined(CUSTOM3_USED)
+vec4 custom3_attrib = vec4(0.0);
+#endif
+#if defined(BONES_USED) || defined(USE_PARTICLE_TRAILS)
+uvec4 bone_attrib = uvec4(0);
+#endif
+#if defined(WEIGHTS_USED) || defined(USE_PARTICLE_TRAILS)
+vec4 weight_attrib = vec4(0.0);
+#endif
+#ifdef MOTION_VECTORS
+vec4 previous_vertex_attrib = vec4(0.0);
+#if defined(NORMAL_USED) || defined(TANGENT_USED)
+vec4 previous_normal_attrib = vec4(0.0);
+#endif
+#endif // MOTION_VECTORS
+
+#else // MESHLET_PULLING
+
 // Always contains vertex position in XYZ, can contain tangent angle in W.
 layout(location = 0) in vec4 vertex_angle_attrib;
 
@@ -76,6 +117,7 @@ layout(location = 13) in vec4 previous_normal_attrib;
 #endif
 
 #endif // MOTION_VECTORS
+#endif // MESHLET_PULLING
 
 void axis_angle_to_tbn(vec3 axis, float angle, out vec3 tangent, out vec3 binormal, out vec3 normal) {
 	float c = cos(angle);
@@ -184,7 +226,50 @@ layout(location = 14) out vec2 point_coord_interp;
 
 invariant gl_Position;
 
-#GLOBALS
+// SSBOs
+#ifdef MESHLET_PULLING
+
+struct MeshletDescriptor {
+	vec3 bounds_center;
+	float bounds_radius;
+	vec3 cone_axis;
+	float cone_cutoff;
+	uint vertex_remap_offset;
+	uint vertex_count;
+	uint triangle_offset;
+	uint triangle_count;
+};
+
+layout(set = 4, binding = 0, std430) restrict readonly buffer MeshletDescriptors {
+	MeshletDescriptor data[];
+} meshlet_descriptors;
+
+layout(set = 4, binding = 1, std430) restrict readonly buffer MeshletVertexRemap {
+	uint data[];
+} meshlet_vertex_remap;
+
+layout(set = 4, binding = 2, std430) restrict readonly buffer MeshletTriangles {
+	uint data[];
+} meshlet_triangles;
+
+layout(set = 4, binding = 3, std430) restrict readonly buffer VertexPositions {
+	vec4 data[];
+} meshlet_vertex_positions;
+
+layout(set = 4, binding = 4, std430) restrict readonly buffer MeshletVertexAttributes {
+	vec4 data[];
+} meshlet_vertex_attributes;
+
+#endif // MESHLET_PULLING
+
+vec3 oct_decode_normal(vec2 e) {
+	e = e * 2.0 - 1.0;
+	vec3 v = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+	if (v.z < 0.0) {
+		v.xy = (1.0 - abs(v.yx)) * vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+	}
+	return normalize(v);
+}
 
 #ifdef USE_DOUBLE_PRECISION
 // Helper functions for emulating double precision when adding floats.
@@ -219,6 +304,17 @@ uint multimesh_stride() {
 	stride += sc_multimesh_has_custom_data() ? 1 : 0;
 	return stride;
 }
+
+uint fetch_triangle_local_vertex(uint p_byte_index) {
+#ifdef MESHLET_PULLING
+	uint word = meshlet_triangles.data[p_byte_index / 4];
+	return (word >> ((p_byte_index % 4) * 8)) & 0xFFu;
+#else
+	return 0;
+#endif
+}
+
+#GLOBALS
 
 void vertex_shader(vec3 vertex_input,
 #ifdef NORMAL_USED
@@ -774,6 +870,45 @@ void main() {
 
 	instance_index_interp = instance_index;
 
+#ifdef MESHLET_PULLING
+	uint meshlet_index = draw_call.multimesh_motion_vectors_current_offset + gl_InstanceIndex;
+	uint triangle_id = meshlet_index * 128 + gl_VertexIndex / 3;
+	uint vertex_id = gl_VertexIndex % 3;
+
+	MeshletDescriptor desc = meshlet_descriptors.data[meshlet_index];
+
+	if (triangle_id >= desc.triangle_offset + desc.triangle_count) {
+		gl_Position = vec4(0.0);
+		return;
+	}
+
+	uint local_vertex_index = fetch_triangle_local_vertex(desc.triangle_offset * 3 + (triangle_id - desc.triangle_offset) * 3 + vertex_id);
+	uint global_vertex_index = meshlet_vertex_remap.data[desc.vertex_remap_offset + local_vertex_index];
+
+	vec4 vertex_attrib_0 = meshlet_vertex_attributes.data[global_vertex_index * 3 + 0];
+	vec4 vertex_attrib_1 = meshlet_vertex_attributes.data[global_vertex_index * 3 + 1];
+	vec4 vertex_attrib_2 = meshlet_vertex_attributes.data[global_vertex_index * 3 + 2];
+
+	vertex_angle_attrib = vec4(meshlet_vertex_positions.data[global_vertex_index].xyz, 0.0);
+	
+#if defined(NORMAL_USED) || defined(TANGENT_USED)
+	axis_tangent_attrib = vertex_attrib_0; // Actually, the standard shader expects compressed normals!
+	// Wait! My `scene_forward_clustered.glsl` expects compressed normal in `axis_tangent_attrib`.
+	// Let's just bypass _unpack_vertex_attributes for normal and tangent?
+	// The standard shader does: 
+	// r_normal = oct_to_vec3(signed_normal_attrib * 2.0 - 1.0);
+	// We can just set axis_tangent_attrib to match what it expects!
+	axis_tangent_attrib = vertex_attrib_0;
+#endif
+
+#ifdef UV_USED
+	uv_attrib = vertex_attrib_1.xy;
+#endif
+#if defined(UV2_USED) || defined(USE_LIGHTMAP) || defined(MODE_RENDER_MATERIAL)
+	uv2_attrib = vertex_attrib_1.zw;
+#endif
+#endif
+
 #ifdef MOTION_VECTORS
 	// Previous vertex.
 	vec3 prev_vertex;
@@ -828,6 +963,7 @@ void main() {
 	vec3 binormal;
 #endif
 
+#ifndef MESHLET_PULLING
 	_unpack_vertex_attributes(
 			vertex_angle_attrib,
 			instances.data[instance_index].compressed_aabb_position_pad.xyz,
@@ -841,6 +977,16 @@ void main() {
 			binormal,
 #endif
 			vertex);
+#else
+	vertex = vertex_angle_attrib.xyz;
+#ifdef NORMAL_USED
+	normal = oct_decode_normal(vertex_attrib_0.xy);
+#endif
+#ifdef TANGENT_USED
+	tangent = oct_decode_normal(vertex_attrib_0.zw);
+	binormal = cross(normal, tangent) * (vertex_attrib_1.w > 0.0 ? 1.0 : -1.0);
+#endif
+#endif
 
 	// Current vertex.
 	global_time = scene_data_block.data.time;
@@ -1913,34 +2059,23 @@ void fragment_shader(in SceneData scene_data) {
 		vec3 cascade_normal;
 
 		if (cascade < SVOGI_MAX_CASCADES) {
-			bool use_specular = true;
-			float blend;
-			vec3 diffuse, specular;
-			svogi_process(cascade, cascade_pos, cam_pos, cam_normal, cam_reflection, use_specular, roughness, diffuse, specular, blend);
+			// Indirect diffuse is ADDED on top of the environment/sky ambient, never used to replace
+			// it. The old code did `ambient_light = diffuse`, so any surface where the cone gather
+			// returns ~0 (i.e. anything in shadow) rendered pure black - it threw away the sky ambient
+			// that should fill those areas. Adding the SVOGI bounce instead keeps the sky ambient as a
+			// floor and layers the indirect bounce on top, matching the meshlet path's combine
+			// (meshlet_render.glsl: diffuse_light + ambient_color + gi_diffuse). The old per-cascade
+			// `blend`/mix() was leftover SDFGI cascade-edge-fade logic that no longer applies (this
+			// prototype only populates cascade 0; svogi_process always returns blend == 1.0).
+			//
+			// Specular GI is left off here (use_specular = false): the meshlet path does no SVOGI
+			// specular either, and replacing the sky/reflection-probe specular with a sparse cone
+			// trace caused obvious over-darkened reflections. indirect_specular_light is untouched.
+			vec3 svogi_diffuse, svogi_specular;
+			float svogi_blend;
+			svogi_process(cascade, cascade_pos, cam_pos, cam_normal, cam_reflection, false, roughness, svogi_diffuse, svogi_specular, svogi_blend);
 
-			if (blend > 0.0) {
-				//blend
-				if (cascade == svogi.max_cascades - 1) {
-					diffuse = mix(diffuse, ambient_light, blend);
-					if (use_specular) {
-						indirect_specular_light = mix(specular, indirect_specular_light, blend);
-					}
-				} else {
-					vec3 diffuse2, specular2;
-					float blend2;
-					cascade_pos = (cam_pos - svogi.cascades[cascade + 1].position) * svogi.cascades[cascade + 1].to_probe;
-					svogi_process(cascade + 1, cascade_pos, cam_pos, cam_normal, cam_reflection, use_specular, roughness, diffuse2, specular2, blend2);
-					diffuse = mix(diffuse, diffuse2, blend);
-					if (use_specular) {
-						specular = mix(specular, specular2, blend);
-					}
-				}
-			}
-
-			ambient_light = diffuse;
-			if (use_specular) {
-				indirect_specular_light = specular;
-			}
+			ambient_light += svogi_diffuse;
 		}
 	}
 

@@ -8,14 +8,16 @@ layout(location = 0) out vec3 world_normal_interp;
 layout(location = 1) out flat uint meshlet_index_interp;
 layout(location = 2) out flat uint material_id_interp;
 layout(location = 3) out vec3 world_pos_interp;
+layout(location = 4) out flat vec3 instance_pos_interp;
+layout(location = 5) out vec2 uv_interp;
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
 	vec3 camera_position;
 	uint light_count;
-	vec4 ambient_color; // .rgb = pre-multiplied color*energy (linear), .a = reserved
+	vec4 ambient_color; // .rgb = flat ambient (color*energy, linear), .a = sky-radiance mix amount (0 = none)
 	vec4 svogi_bounds; // .xyz = octree root center (absolute world), .w = root half-size (0 = SVOGI off)
-	vec4 svogi_params; // .x = energy, .yzw reserved
+	vec4 svogi_params; // .x = SVOGI energy, .y = sky-radiance exposure*energy scale, .z = MAX_ROUGHNESS_LOD layer, .w reserved
 }
 params;
 
@@ -114,7 +116,21 @@ void main() {
 	vec4 attrib = vertex_attributes.data[global_vertex_id];
 
 	vec3 world_pos = (transform * vec4(local_pos.xyz, 1.0)).xyz;
-	gl_Position = params.view_projection * vec4(world_pos, 1.0);
+	// Camera-relative projection. params.view_projection is the *camera-relative* view-projection
+	// (projection * rotation-only inverse-camera, with no translation - see
+	// MeshletRenderer::render()), so applying it to (world_pos - camera_position) produces the exact
+	// same clip position as an absolute `view_projection * world_pos` would, but computed entirely
+	// from small-magnitude operands. The absolute form multiplied a large world coordinate (~1e3+
+	// for geometry far from the world origin) by a matrix whose z/w rows carry an equal-and-opposite
+	// ~-1e3 camera translation; in float32 those terms cancel catastrophically down to the tiny
+	// clip-space value, losing ~7-8 mantissa bits. That error is not fixed per object - it shifts as
+	// the object (or camera) moves sub-unit each frame - so the resulting device-Z jitter would
+	// intermittently lose the GREATER_OR_EQUAL depth tie against Forward+'s own depth pre-pass (which
+	// is already precise: it transforms to view space *before* projecting), making moving/distant
+	// meshlet geometry flicker and swap which face/meshlet wins per pixel. Subtracting the camera
+	// position first keeps the projected coordinate near the origin, matching Forward+'s precision.
+	// world_pos itself stays absolute below (world_pos_interp / SVOGI need true world space).
+	gl_Position = params.view_projection * vec4(world_pos - params.camera_position, 1.0);
 
 	// No local-Z flip here. History: this pipeline used to flip the local-Z axis of the decoded
 	// normal to compensate for POLYGON_CULL_FRONT, on the theory that culling what Godot considers
@@ -154,6 +170,8 @@ void main() {
 	world_pos_interp = world_pos;
 	meshlet_index_interp = item.meshlet_index;
 	material_id_interp = instance_material_ids.data[item.instance_index];
+	instance_pos_interp = transform[3].xyz;
+	uv_interp = attrib.zw; // VertexAttributes packs uv in .zw (see the buffer's layout comment).
 
 	// Manual depth bias toward "nearer" (reversed-Z: larger device-Z = nearer - see
 	// meshlet_occlusion_test.glsl's comment). This pipeline frequently draws on top of real depth
@@ -187,14 +205,16 @@ layout(location = 0) in vec3 world_normal_interp;
 layout(location = 1) in flat uint meshlet_index_interp;
 layout(location = 2) in flat uint material_id_interp;
 layout(location = 3) in vec3 world_pos_interp;
+layout(location = 4) in flat vec3 instance_pos_interp;
+layout(location = 5) in vec2 uv_interp;
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection;
 	vec3 camera_position;
 	uint light_count;
-	vec4 ambient_color; // .rgb = pre-multiplied color*energy (linear), .a = reserved
+	vec4 ambient_color; // .rgb = flat ambient (color*energy, linear), .a = sky-radiance mix amount (0 = none)
 	vec4 svogi_bounds; // .xyz = octree root center (absolute world), .w = root half-size (0 = SVOGI off)
-	vec4 svogi_params; // .x = energy, .yzw reserved
+	vec4 svogi_params; // .x = SVOGI energy, .y = sky-radiance exposure*energy scale, .z = MAX_ROUGHNESS_LOD layer, .w reserved
 }
 params;
 
@@ -206,19 +226,62 @@ layout(location = 0) out vec4 frag_color;
 // are uploaded but not sampled yet (deferred - bindless/array texture sampling is its own,
 // separate scope from the lighting model added in this milestone).
 struct MeshletMaterial {
+	// Base PBR (16 bytes)
 	vec4 albedo;
+	
+	// Emission + Normal Scale (16 bytes)
 	vec3 emission;
+	float normal_scale;
+	
+	// PBR factors + Clearcoat (16 bytes)
 	float metallic;
 	float roughness;
 	float specular;
+	float clearcoat;
+
+	// Subsurface (16 bytes)
+	float subsurface_weight;
+	float subsurface_radius_x;
+	float subsurface_radius_y;
+	float subsurface_radius_z;
+	
+	// Subsurface Color + Clearcoat Roughness (16 bytes)
+	vec3 subsurface_color;
+	float clearcoat_roughness;
+
+	// Anisotropy & Transmission & IOR (16 bytes)
+	float anisotropy;
+	float anisotropy_rotation;
+	float transmission;
+	float ior;
+
+	// Sheen & Scissor & UV (16 bytes)
+	float sheen;
+	float sheen_tint;
+	float alpha_scissor_threshold;
+	float pad0;
+
+	// UV Transform (16 bytes)
+	vec2 uv1_scale;
+	vec2 uv1_offset;
+
+	// Flags & Base Textures (16 bytes)
+	uint flags;
 	uint albedo_texture_index;
 	uint normal_texture_index;
 	uint orm_texture_index;
+
+	// Extended Textures (16 bytes)
 	uint emission_texture_index;
-	uint flags;
-	float alpha_scissor_threshold;
-	vec2 uv1_scale;
-	vec2 uv1_offset;
+	uint subsurface_texture_index;
+	uint clearcoat_texture_index;
+	uint anisotropy_texture_index;
+
+	// Final Textures & padding (16 bytes)
+	uint transmission_texture_index;
+	uint pad1;
+	uint pad2;
+	uint pad3;
 };
 
 layout(set = 0, binding = 8, std430) restrict readonly buffer MeshletMaterials {
@@ -278,7 +341,26 @@ layout(set = 0, binding = 10, std430) restrict readonly buffer SVOGINodes {
 }
 svogi_nodes;
 
+// Sky radiance octmap array (Forward+'s sky reflection probe; the most-blurred layer ~= ambient
+// irradiance). The standalone meshlet shader can't see Forward+'s scene UBO, so the sky ambient is
+// sampled here directly and folded in below - without this, meshes on the meshlet path get only the
+// flat ambient_light_color (near-black for a Sky ambient source after srgb->linear), reading as dark
+// in shadow while the rest of the scene gets proper sky fill. params.svogi_params.z = the layer
+// index to sample (MAX_ROUGHNESS_LOD), .y = exposure*energy scale, params.ambient_color.a = sky mix
+// amount (0 => skip; a 1x1 black fallback is bound when there's no sky this frame).
+layout(set = 0, binding = 11) uniform texture2DArray radiance_octmap;
+layout(set = 0, binding = 12) uniform sampler radiance_sampler;
+
+// Per-material PBR textures (albedo/normal/ORM), indexed per-fragment by the material's
+// *_texture_index. Fixed-size descriptor array - MUST equal MeshletStorage::MAX_MATERIAL_TEXTURES
+// (the renderer binds exactly that many, padding unused slots with a default white texture). The
+// index is the per-instance-flat material_id's field, so it's dynamically uniform per draw the same
+// way Forward+ indexes lightmap_textures[] - no nonuniformEXT needed.
+layout(set = 0, binding = 13) uniform texture2D material_textures[256];
+layout(set = 0, binding = 14) uniform sampler material_sampler;
+
 const float M_PI = 3.14159265358979323846;
+const uint MESHLET_TEXTURE_NONE = 0xFFFFFFFFu;
 
 // The following are a deliberately trimmed extraction of scene_forward_lights_inc.glsl's
 // light_compute()/D_GGX()/V_GGX()/SchlickFresnel()/F0()/get_omni_attenuation() - confirmed during
@@ -324,53 +406,80 @@ float get_omni_attenuation(float distance, float inv_range, float decay) {
 	return nd * pow(max(distance, 0.0001), -decay);
 }
 
-// Trimmed light_compute(): no backlight/transmittance/rim/clearcoat/anisotropy, no shadows (the
-// real shadow atlas isn't bound here - see this file's top-level comment), no LIGHT_CODE_USED
-// (custom ShaderMaterial light() functions aren't representable in MeshletMaterial's flattened
-// schema and fall back to normal Forward+ rendering well before reaching this shader).
-void light_compute(vec3 N, vec3 L, vec3 V, vec3 light_color, bool is_directional, float attenuation, vec3 f0, float roughness, float metallic, float specular_amount, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
+// Extended light_compute using MeshletMaterial to evaluate Principled BSDF features.
+void light_compute(vec3 N, vec3 L, vec3 V, vec3 light_color, bool is_directional, float attenuation, MeshletMaterial mat, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
 	float NdotL = min(dot(N, L), 1.0);
 	float cNdotV = max(dot(N, V), 1e-4);
 
 	if (is_directional || attenuation > 1.175494351e-38) {
 		float cNdotL = max(NdotL, 0.0);
+		
+		vec3 H = normalize(V + L);
+		float cNdotH = clamp(dot(N, H), 0.0, 1.0);
+		float cLdotH = clamp(dot(L, H), 0.0, 1.0);
+		float cLdotH5 = SchlickFresnel(cLdotH);
 
-		if (metallic < 1.0) {
-			float diffuse_brdf_NL = cNdotL * (1.0 / M_PI); // Lambert.
-			diffuse_light += light_color * diffuse_brdf_NL * attenuation;
+		// F0 calculation from IOR and Metallic
+		float f0_ior = pow((mat.ior - 1.0) / (mat.ior + 1.0), 2.0);
+		vec3 f0 = mix(vec3(f0_ior), albedo, mat.metallic);
+		
+		float clearcoat_attenuation = 1.0;
+
+		// Clearcoat (fixed IOR of 1.5 -> F0 = 0.04)
+		if (mat.clearcoat > 0.0) {
+			float cc_alpha = mix(0.001, 0.1, mat.clearcoat_roughness);
+			float cc_D = D_GGX(cNdotH, cc_alpha);
+			float cc_G = V_GGX(cNdotL, cNdotV, cc_alpha);
+			float cc_F = mix(0.04, 1.0, cLdotH5) * mat.clearcoat;
+			
+			clearcoat_attenuation = 1.0 - cc_F;
+			vec3 cc_specular = vec3(cNdotL * cc_D * cc_G * cc_F);
+			specular_light += cc_specular * light_color * attenuation;
 		}
 
-		if (roughness > 0.0) {
-			vec3 H = normalize(V + L);
-			float cNdotH = clamp(dot(N, H), 0.0, 1.0);
-			float cLdotH = clamp(dot(L, H), 0.0, 1.0);
+		if (mat.metallic < 1.0) {
+			// Basic diffuse (Lambert)
+			float diffuse_brdf_NL = cNdotL * (1.0 / M_PI);
+			
+			// Simple Subsurface approximation (Wrap lighting)
+			if (mat.subsurface_weight > 0.0) {
+				float wrap = 0.5;
+				float wrap_NdotL = max(0.0, (dot(N, L) + wrap) / (1.0 + wrap));
+				vec3 sss_color = mat.subsurface_color * mat.subsurface_weight;
+				diffuse_brdf_NL = mix(diffuse_brdf_NL, wrap_NdotL * (1.0 / M_PI), mat.subsurface_weight);
+				diffuse_light += light_color * diffuse_brdf_NL * attenuation * clearcoat_attenuation * sss_color;
+			} else {
+				diffuse_light += light_color * diffuse_brdf_NL * attenuation * clearcoat_attenuation;
+			}
+		}
 
-			float alpha_ggx = roughness * roughness;
+		if (mat.roughness > 0.0) {
+			float alpha_ggx = mat.roughness * mat.roughness;
 			float D = D_GGX(cNdotH, alpha_ggx);
 			float G = V_GGX(cNdotL, cNdotV, alpha_ggx);
-			float cLdotH5 = SchlickFresnel(cLdotH);
-			float f90 = clamp(dot(f0, vec3(50.0 * 0.33)), metallic, 1.0);
+			
+			float f90 = clamp(dot(f0, vec3(50.0 * 0.33)), mat.metallic, 1.0);
 			vec3 F = f0 + (f90 - f0) * cLdotH5;
 			vec3 specular_brdf_NL = vec3(cNdotL * D * G) * F;
-			specular_light += specular_brdf_NL * light_color * attenuation * specular_amount;
+			specular_light += specular_brdf_NL * light_color * attenuation * clearcoat_attenuation * mat.specular;
 		}
 	}
 }
 
-void light_process_directional(uint idx, vec3 N, vec3 V, vec3 f0, float roughness, float metallic, float specular_amount, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
+void light_process_directional(uint idx, vec3 N, vec3 V, MeshletMaterial mat, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
 	vec3 L = normalize(-lights.data[idx].direction);
-	light_compute(N, L, V, lights.data[idx].color, true, 1.0, f0, roughness, metallic, specular_amount, albedo, diffuse_light, specular_light);
+	light_compute(N, L, V, lights.data[idx].color, true, 1.0, mat, albedo, diffuse_light, specular_light);
 }
 
-void light_process_omni(uint idx, vec3 vertex, vec3 N, vec3 V, vec3 f0, float roughness, float metallic, float specular_amount, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
+void light_process_omni(uint idx, vec3 vertex, vec3 N, vec3 V, MeshletMaterial mat, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
 	vec3 light_rel_vec = lights.data[idx].position - vertex;
 	float light_length = length(light_rel_vec);
 	float attenuation = get_omni_attenuation(light_length, lights.data[idx].inv_radius, lights.data[idx].attenuation);
 	vec3 L = normalize(light_rel_vec);
-	light_compute(N, L, V, lights.data[idx].color, false, attenuation, f0, roughness, metallic, specular_amount, albedo, diffuse_light, specular_light);
+	light_compute(N, L, V, lights.data[idx].color, false, attenuation, mat, albedo, diffuse_light, specular_light);
 }
 
-void light_process_spot(uint idx, vec3 vertex, vec3 N, vec3 V, vec3 f0, float roughness, float metallic, float specular_amount, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
+void light_process_spot(uint idx, vec3 vertex, vec3 N, vec3 V, MeshletMaterial mat, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
 	vec3 light_rel_vec = lights.data[idx].position - vertex;
 	float light_length = length(light_rel_vec);
 	vec3 light_rel_vec_norm = light_rel_vec / light_length;
@@ -380,7 +489,7 @@ void light_process_spot(uint idx, vec3 vertex, vec3 N, vec3 V, vec3 f0, float ro
 	float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - cone_angle));
 	attenuation *= 1.0 - pow(spot_rim, lights.data[idx].cone_attenuation);
 	vec3 L = light_rel_vec_norm;
-	light_compute(N, L, V, lights.data[idx].color, false, attenuation, f0, roughness, metallic, specular_amount, albedo, diffuse_light, specular_light);
+	light_compute(N, L, V, lights.data[idx].color, false, attenuation, mat, albedo, diffuse_light, specular_light);
 }
 
 // Diffuse cone-march of the SVOGI octree, in absolute world space. Adapted from
@@ -504,6 +613,34 @@ vec3 svogi_hemisphere_gather(vec3 pos, vec3 normal, float surface_offset, float 
 	return acc;
 }
 
+// Cotangent-frame normal mapping without precomputed vertex tangents (Christian Schueler, "Normal
+// Mapping Without Precomputed Tangents"). Builds a TBN basis from the screen-space derivatives of
+// world position and UV, so a tangent-space normal map can be applied to meshes that carry NO
+// per-vertex tangent - which the meshlet pipeline deliberately never stores (saving the attribute
+// memory + the runtime MikkTSpace generation, the way Nanite does for dense geometry). N is the
+// geometric world normal, map_normal the unpacked tangent-space normal (z = up). dFdx/dFdy require
+// this to run in the fragment stage.
+vec3 perturb_normal(vec3 N, vec3 world_pos, vec2 uv, vec3 map_normal) {
+	vec3 dp1 = dFdx(world_pos);
+	vec3 dp2 = dFdy(world_pos);
+	vec2 duv1 = dFdx(uv);
+	vec2 duv2 = dFdy(uv);
+
+	vec3 dp2perp = cross(dp2, N);
+	vec3 dp1perp = cross(N, dp1);
+	vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+	vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+
+	// Degenerate UV derivatives (e.g. a fragment with no UV gradient) -> keep the geometric normal.
+	float det = max(dot(T, T), dot(B, B));
+	if (det <= 0.0) {
+		return N;
+	}
+	float invmax = inversesqrt(det);
+	mat3 TBN = mat3(T * invmax, B * invmax, N);
+	return normalize(TBN * map_normal);
+}
+
 #endif
 
 void main() {
@@ -511,20 +648,43 @@ void main() {
 	MeshletMaterial mat = meshlet_materials.data[material_id_interp];
 	vec3 N = normalize(world_normal_interp);
 	vec3 V = normalize(params.camera_position - world_pos_interp);
+
+	// StandardMaterial3D uv1 transform applied to the interpolated mesh UV.
+	vec2 muv = uv_interp * mat.uv1_scale + mat.uv1_offset;
+
+	// Albedo texture modulates the base color factor.
 	vec3 albedo = mat.albedo.rgb;
-	vec3 f0 = F0(mat.metallic, mat.specular, albedo);
+	if (mat.albedo_texture_index != MESHLET_TEXTURE_NONE) {
+		albedo *= texture(sampler2D(material_textures[mat.albedo_texture_index], material_sampler), muv).rgb;
+	}
+
+	// Normal map -> world normal via the derivative-built TBN (no stored vertex tangents). Unpack the
+	// tangent-space normal (xyz: [0,1] -> [-1,1], blue = z), apply the material's normal_scale to xy.
+	if (mat.normal_texture_index != MESHLET_TEXTURE_NONE) {
+		vec3 nm = texture(sampler2D(material_textures[mat.normal_texture_index], material_sampler), muv).xyz * 2.0 - 1.0;
+		nm.xy *= mat.normal_scale;
+		N = perturb_normal(N, world_pos_interp, muv, normalize(nm));
+	}
+
+	// ORM map: r = occlusion, g = roughness, b = metallic (Godot's ORM channel packing). Modulates
+	// the scalar roughness/metallic factors; occlusion is applied to indirect light below.
+	float ao = 1.0;
+	if (mat.orm_texture_index != MESHLET_TEXTURE_NONE) {
+		vec3 orm = texture(sampler2D(material_textures[mat.orm_texture_index], material_sampler), muv).rgb;
+		ao = orm.r;
+		mat.roughness *= orm.g;
+		mat.metallic *= orm.b;
+	}
 
 	vec3 diffuse_light = vec3(0.0);
 	vec3 specular_light = vec3(0.0);
 	for (uint i = 0; i < params.light_count; i++) {
 		if (lights.data[i].is_directional != 0u) {
-			light_process_directional(i, N, V, f0, mat.roughness, mat.metallic, mat.specular, albedo, diffuse_light, specular_light);
+			light_process_directional(i, N, V, mat, albedo, diffuse_light, specular_light);
 		} else if (lights.data[i].cone_angle < 1.0) {
-			// cone_angle defaults to 1.0 (cos(0)) for omni lights, where it's meaningless - real
-			// spot lights always have a smaller cone_angle than that default.
-			light_process_spot(i, world_pos_interp, N, V, f0, mat.roughness, mat.metallic, mat.specular, albedo, diffuse_light, specular_light);
+			light_process_spot(i, world_pos_interp, N, V, mat, albedo, diffuse_light, specular_light);
 		} else {
-			light_process_omni(i, world_pos_interp, N, V, f0, mat.roughness, mat.metallic, mat.specular, albedo, diffuse_light, specular_light);
+			light_process_omni(i, world_pos_interp, N, V, mat, albedo, diffuse_light, specular_light);
 		}
 	}
 
@@ -541,7 +701,19 @@ void main() {
 		gi_diffuse = svogi_hemisphere_gather(world_pos_interp, N, voxel_size * 3.0, params.svogi_bounds.w * 2.0, params.svogi_bounds.xyz, params.svogi_bounds.w, params.svogi_params.x);
 	}
 
-	vec3 color = albedo * (1.0 - mat.metallic) * (diffuse_light + params.ambient_color.rgb + gi_diffuse) + specular_light + mat.emission;
+	// Environment ambient. Base is the flat ambient_color (used directly for a Color ambient source);
+	// for a Sky source the CPU sets params.ambient_color.a > 0 and we blend in the sky's average
+	// radiance (center texel of the roughest octmap layer ~= directionless sky irradiance), matching
+	// what the default Forward+ path samples per-normal. Directionless is fine here - the roughest
+	// layer carries almost no directional variation - and it avoids threading the octahedral mapping
+	// and per-fragment derivatives into this standalone shader.
+	vec3 ambient = params.ambient_color.rgb;
+	if (params.ambient_color.a > 0.0) {
+		vec3 sky_ambient = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(0.5, 0.5, params.svogi_params.z), 0.0).rgb * params.svogi_params.y;
+		ambient = mix(ambient, sky_ambient, params.ambient_color.a);
+	}
+
+	vec3 color = albedo * (1.0 - mat.metallic) * (diffuse_light + (ambient + gi_diffuse) * ao) + specular_light + mat.emission;
 	frag_color = vec4(color, mat.albedo.a);
 #endif
 	// MESHLET_DEPTH_ONLY: no color output at all - this variant targets a depth-only

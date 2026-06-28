@@ -31,6 +31,7 @@
 #include "meshlet_renderer.h"
 
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 
 using namespace RendererRD;
 
@@ -64,6 +65,29 @@ MeshletRenderer::MeshletRenderer() {
 	}
 	synthetic_index_buffer = RD::get_singleton()->index_buffer_create(index_count, RD::INDEX_BUFFER_FORMAT_UINT32, Span<uint8_t>((const uint8_t *)indices.ptr(), indices.size() * sizeof(uint32_t)));
 	synthetic_index_array = RD::get_singleton()->index_array_create(synthetic_index_buffer, 0, index_count);
+
+	// Sampler for the sky radiance octmap ambient (binding 12). Linear with mipmaps so the LOD-based
+	// layer sample is filtered; clamp so the center-texel fetch never wraps.
+	RD::SamplerState radiance_ss;
+	radiance_ss.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+	radiance_ss.min_filter = RD::SAMPLER_FILTER_LINEAR;
+	radiance_ss.mip_filter = RD::SAMPLER_FILTER_LINEAR;
+	radiance_ss.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	radiance_ss.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	radiance_ss.repeat_w = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	radiance_sampler = RD::get_singleton()->sampler_create(radiance_ss);
+
+	// Material-texture sampler (binding 14): linear with mipmaps, repeat for tiling, anisotropic.
+	RD::SamplerState material_ss;
+	material_ss.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+	material_ss.min_filter = RD::SAMPLER_FILTER_LINEAR;
+	material_ss.mip_filter = RD::SAMPLER_FILTER_LINEAR;
+	material_ss.repeat_u = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	material_ss.repeat_v = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	material_ss.repeat_w = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	material_ss.use_anisotropy = true;
+	material_ss.anisotropy_max = 4.0f;
+	material_sampler = RD::get_singleton()->sampler_create(material_ss);
 }
 
 MeshletRenderer::~MeshletRenderer() {
@@ -75,6 +99,8 @@ MeshletRenderer::~MeshletRenderer() {
 	}
 	RD::get_singleton()->free_rid(synthetic_index_buffer);
 	RD::get_singleton()->free_rid(empty_vertex_array);
+	RD::get_singleton()->free_rid(radiance_sampler);
+	RD::get_singleton()->free_rid(material_sampler);
 	// vertex_format is a VertexFormatID (cached/interned by RD, not an owned RID) - no free needed.
 	render_shader.version_free(render_shader_version);
 	singleton = nullptr;
@@ -159,7 +185,7 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	cached_format = p_framebuffer_format;
 }
 
-void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only, const Color &p_ambient_color, RID p_svogi_octree_buffer, const Vector3 &p_svogi_bounds_center, float p_svogi_bounds_half_size, float p_svogi_energy) {
+void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only, const Color &p_ambient_color, RID p_svogi_octree_buffer, const Vector3 &p_svogi_bounds_center, float p_svogi_bounds_half_size, float p_svogi_energy, RID p_radiance_texture, float p_sky_ambient_mix, float p_radiance_exposure, float p_max_roughness_lod) {
 	ERR_FAIL_NULL(MeshletStorage::get_singleton());
 
 	_ensure_pipeline(p_framebuffer_format, p_depth_only);
@@ -277,6 +303,49 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			u.append_id(p_svogi_octree_buffer.is_valid() ? p_svogi_octree_buffer : storage->get_meshlet_material_buffer_rid());
 			uniforms.push_back(u);
 		}
+		if (!p_depth_only) {
+			// Bindings 11/12 (sky radiance octmap + its sampler) - same depth-only exclusion reasoning
+			// as 8/9/10; the non-depth-only shader layout always declares them, so a valid texture must
+			// always be bound. When the caller has no sky this frame (p_radiance_texture invalid) a
+			// 1x1 black texture2DArray stands in - p_sky_ambient_mix is 0 in that case, so the fragment
+			// shader's `if (ambient_color.a > 0.0)` never samples it.
+			RID radiance = p_radiance_texture;
+			if (radiance.is_null()) {
+				radiance = TextureStorage::get_singleton()->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK);
+			}
+			RD::Uniform ut;
+			ut.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+			ut.binding = 11;
+			ut.append_id(radiance);
+			uniforms.push_back(ut);
+
+			RD::Uniform us;
+			us.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+			us.binding = 12;
+			us.append_id(radiance_sampler);
+			uniforms.push_back(us);
+		}
+		if (!p_depth_only) {
+			// Binding 13/14: the material-texture descriptor array + its sampler. The fragment shader
+			// indexes material_textures[mat.*_texture_index]. The array is a fixed size
+			// (MeshletStorage::MAX_MATERIAL_TEXTURES) - Vulkan requires every declared element to be a
+			// valid binding - so pad the live table with a default white texture beyond what's used.
+			const Vector<RID> &tex_table = storage->get_material_texture_rids();
+			RID default_white = TextureStorage::get_singleton()->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+			RD::Uniform utex;
+			utex.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+			utex.binding = 13;
+			for (uint32_t i = 0; i < MeshletStorage::MAX_MATERIAL_TEXTURES; i++) {
+				utex.append_id(i < (uint32_t)tex_table.size() ? tex_table[i] : default_white);
+			}
+			uniforms.push_back(utex);
+
+			RD::Uniform usmat;
+			usmat.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+			usmat.binding = 14;
+			usmat.append_id(material_sampler);
+			uniforms.push_back(usmat);
+		}
 		RID render_shader_rid_to_use = p_depth_only ? depth_only_shader_rid : render_shader_rid;
 		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, render_shader_rid_to_use, 0);
 
@@ -293,7 +362,16 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			float svogi_params[4]; // x = energy, yzw reserved
 		};
 		RenderPushConstant push_constant;
-		Projection vp = p_projection * Projection(p_camera_transform.affine_inverse());
+		// Camera-relative view-projection: the inverse camera with its translation stripped (basis
+		// only). The shader applies this to (world_pos - camera_position) rather than to the absolute
+		// world_pos, which is mathematically identical (basis_inv * (world - cam) == full_view * world)
+		// but keeps every operand small-magnitude, avoiding the float32 catastrophic cancellation the
+		// absolute path suffered for geometry far from the world origin - the root cause of moving/
+		// distant meshlet geometry flickering against Forward+'s precise depth pre-pass (see
+		// meshlet_render.glsl's gl_Position comment for the full derivation).
+		Transform3D camera_rotation_only = p_camera_transform;
+		camera_rotation_only.origin = Vector3();
+		Projection vp = p_projection * Projection(camera_rotation_only.affine_inverse());
 		for (int col = 0; col < 4; col++) {
 			for (int row = 0; row < 4; row++) {
 				push_constant.view_projection[col * 4 + row] = vp.columns[col][row];
@@ -306,7 +384,9 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		push_constant.ambient_color[0] = p_depth_only ? 0.0f : p_ambient_color.r;
 		push_constant.ambient_color[1] = p_depth_only ? 0.0f : p_ambient_color.g;
 		push_constant.ambient_color[2] = p_depth_only ? 0.0f : p_ambient_color.b;
-		push_constant.ambient_color[3] = 0.0f;
+		// .a = sky-radiance mix amount: > 0 makes the fragment shader blend the sky octmap ambient
+		// over the flat ambient_color (see meshlet_render.glsl). Zeroed for depth-only.
+		push_constant.ambient_color[3] = p_depth_only ? 0.0f : p_sky_ambient_mix;
 		// svogi_bounds.w (root half-size) == 0 signals "SVOGI off / no data" to the shader, which
 		// then skips the trace entirely - so zero it whenever depth-only or no octree was supplied.
 		bool svogi_active = !p_depth_only && p_svogi_bounds_half_size > 0.0f;
@@ -315,8 +395,10 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		push_constant.svogi_bounds[2] = svogi_active ? (float)p_svogi_bounds_center.z : 0.0f;
 		push_constant.svogi_bounds[3] = svogi_active ? p_svogi_bounds_half_size : 0.0f;
 		push_constant.svogi_params[0] = svogi_active ? p_svogi_energy : 0.0f;
-		push_constant.svogi_params[1] = 0.0f;
-		push_constant.svogi_params[2] = 0.0f;
+		// .y = sky-radiance exposure*energy scale, .z = MAX_ROUGHNESS_LOD layer to sample (see the
+		// radiance octmap binding in meshlet_render.glsl). Zeroed for depth-only.
+		push_constant.svogi_params[1] = p_depth_only ? 0.0f : p_radiance_exposure;
+		push_constant.svogi_params[2] = p_depth_only ? 0.0f : p_max_roughness_lod;
 		push_constant.svogi_params[3] = 0.0f;
 
 		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : cached_pipeline);

@@ -44,6 +44,14 @@ namespace RendererRD {
 // which keep working for the non-meshlet rendering path.
 class MeshletStorage {
 public:
+	// Size of the meshlet shader's material-texture descriptor array (texture2D material_textures[N]
+	// in meshlet_render.glsl - must match exactly). Per-material *_texture_index fields in
+	// MeshletMaterialGPU index into it; the renderer binds this many textures every frame, padding
+	// unused slots with a default. Distinct material textures beyond this are dropped (WARN + a
+	// fall-through to the scalar PBR factors), which is fine for the bounded material counts this
+	// renderer targets - bump it if a real scene needs more.
+	static constexpr uint32_t MAX_MATERIAL_TEXTURES = 256;
+
 	struct Range {
 		uint32_t offset = 0;
 		uint32_t count = 0;
@@ -85,22 +93,60 @@ public:
 	// ShaderMaterial/visual-shader materials can't be represented here and fall back to normal
 	// Forward+ rendering (see _meshlet_scan_render_list's qualifying-mesh filtering).
 	struct MeshletMaterialGPU {
-		float albedo[4] = { 1, 1, 1, 1 }; // rgb + alpha.
-		float emission[3] = { 0, 0, 0 };
+		// Base PBR (16 bytes)
+		float albedo[4] = { 1, 1, 1, 1 }; // rgb + alpha
+		
+		// Emission + Normal Scale (16 bytes)
+		float emission[3] = { 0, 0, 0 }; // rgb
+		float normal_scale = 1.0f;
+		
+		// PBR factors + Clearcoat (16 bytes)
 		float metallic = 0.0f;
 		float roughness = 1.0f;
 		float specular = 0.5f;
-		uint32_t albedo_texture_index = 0xFFFFFFFF; // Index into the bindless texture array
-				// (meshlet_render.glsl's material_textures[]); 0xFFFFFFFF = none, use the flat
-				// albedo color above instead.
-		uint32_t normal_texture_index = 0xFFFFFFFF;
-		uint32_t orm_texture_index = 0xFFFFFFFF; // Packed occlusion/roughness/metallic (Godot's
-				// existing ORM convention).
-		uint32_t emission_texture_index = 0xFFFFFFFF;
-		uint32_t flags = 0; // Bit 0: alpha_scissor. Bit 1: unlit. Bit 2: backface_enabled.
+		float clearcoat = 0.0f;
+
+		// Subsurface (16 bytes)
+		float subsurface_weight = 0.0f;
+		float subsurface_radius[3] = { 1, 1, 1 };
+		
+		// Subsurface Color + Clearcoat Roughness (16 bytes)
+		float subsurface_color[3] = { 1, 1, 1 };
+		float clearcoat_roughness = 0.0f;
+
+		// Anisotropy & Transmission & IOR (16 bytes)
+		float anisotropy = 0.0f;
+		float anisotropy_rotation = 0.0f;
+		float transmission = 0.0f;
+		float ior = 1.45f;
+
+		// Sheen & Scissor & UV (16 bytes)
+		float sheen = 0.0f;
+		float sheen_tint = 0.5f;
 		float alpha_scissor_threshold = 0.5f;
+		float pad0 = 0.0f; // Padding to align UVs
+
+		// UV Transform (16 bytes)
 		float uv1_scale[2] = { 1, 1 };
 		float uv1_offset[2] = { 0, 0 };
+
+		// Flags & Base Textures (16 bytes)
+		uint32_t flags = 0; // Bit 0: alpha_scissor. Bit 1: unlit. Bit 2: backface_enabled.
+		uint32_t albedo_texture_index = 0xFFFFFFFF; // 0xFFFFFFFF = none
+		uint32_t normal_texture_index = 0xFFFFFFFF;
+		uint32_t orm_texture_index = 0xFFFFFFFF; // packed occlusion/roughness/metallic
+
+		// Extended Textures (16 bytes)
+		uint32_t emission_texture_index = 0xFFFFFFFF;
+		uint32_t subsurface_texture_index = 0xFFFFFFFF;
+		uint32_t clearcoat_texture_index = 0xFFFFFFFF;
+		uint32_t anisotropy_texture_index = 0xFFFFFFFF;
+
+		// Final Textures & padding (16 bytes)
+		uint32_t transmission_texture_index = 0xFFFFFFFF;
+		uint32_t pad1 = 0;
+		uint32_t pad2 = 0;
+		uint32_t pad3 = 0;
 	};
 
 	struct UploadResult {
@@ -169,6 +215,14 @@ private:
 			// breaks in practice).
 	HashMap<RID, uint32_t> material_rid_to_slot; // Dedup - many surfaces share one material RID.
 
+	// Global table of distinct material RD-texture RIDs referenced by uploaded MeshletMaterialGPUs
+	// (albedo/normal/ORM). Indices into material_texture_rids are what the *_texture_index fields
+	// store; the renderer binds material_texture_rids (padded to MAX_MATERIAL_TEXTURES) as the
+	// shader's material_textures[] descriptor array. Append-only with RID dedup, same rationale as
+	// material_rid_to_slot - bounded distinct-texture count, not freed for now.
+	HashMap<RID, uint32_t> texture_rid_to_slot;
+	Vector<RID> material_texture_rids;
+
 	static Vector2 _oct_encode_normal(const Vector3 &p_normal);
 
 public:
@@ -201,6 +255,12 @@ public:
 	// the existing slot's contents get overwritten in place rather than allocating a new one.
 	uint32_t upload_material(const RID &p_material_rid, const MeshletMaterialGPU &p_material_data);
 	RID get_meshlet_material_buffer_rid() const { return meshlet_material_buffer.rid; }
+
+	// Registers one RD-texture RID into the global material-texture table (dedup by RID), returning
+	// its slot index for a MeshletMaterialGPU *_texture_index field, or 0xFFFFFFFF if p_rd_texture is
+	// invalid or the table is full (MAX_MATERIAL_TEXTURES). The renderer binds get_material_texture_rids().
+	uint32_t register_material_texture(const RID &p_rd_texture);
+	const Vector<RID> &get_material_texture_rids() const { return material_texture_rids; }
 
 	RID get_vertex_position_buffer_rid() const { return vertex_position_buffer.rid; }
 	RID get_vertex_attribute_buffer_rid() const { return vertex_attribute_buffer.rid; }

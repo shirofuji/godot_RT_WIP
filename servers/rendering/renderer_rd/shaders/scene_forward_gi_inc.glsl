@@ -184,16 +184,21 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 			// post-voxelize mipmap dispatch loop and svogi_mipmap.glsl), so sampling a coarser
 			// level for a wide cone is correct, not just "still empty".
 			if (current_half_size * 2.0 <= target_size || depth == 5u) {
-				uint albedo_packed = svogi_nodes[node_idx].albedo;
-				if (albedo_packed != 0u) {
-					// Unpack R8G8B8A8
-					vec3 albedo = vec3(
-						float((albedo_packed >> 24u) & 0xFFu) / 255.0,
-						float((albedo_packed >> 16u) & 0xFFu) / 255.0,
-						float((albedo_packed >> 8u) & 0xFFu) / 255.0
+				// The node's packed "albedo" field actually holds LIT RADIANCE (outgoing diffuse =
+				// surface albedo * direct light + emission), written by svogi_voxelize.glsl's
+				// direct-light-injection step - so this returns the bounced light arriving from the
+				// voxel and the caller multiplies by the receiving surface's albedo (ambient_light *=
+				// albedo, later in the fragment) for correct one-bounce indirect diffuse. Same as the
+				// meshlet path's svogi_cone_trace(); the old code read it as raw albedo at half
+				// weight (alpha 0.5), which both double-darkened it and never reached full opacity.
+				uint radiance_packed = svogi_nodes[node_idx].albedo;
+				if (radiance_packed != 0u) {
+					vec3 vox_radiance = vec3(
+						float((radiance_packed >> 24u) & 0xFFu) / 255.0,
+						float((radiance_packed >> 16u) & 0xFFu) / 255.0,
+						float((radiance_packed >> 8u) & 0xFFu) / 255.0
 					);
-					// Boost energy slightly for the prototype
-					voxel_color = vec4(albedo * svogi.energy * 0.5, 0.5); 
+					voxel_color = vec4(vox_radiance * svogi.energy, 1.0);
 				}
 				break;
 			}
@@ -212,20 +217,62 @@ vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distan
 	return color;
 }
 
+// Branchless orthonormal basis from a unit normal (Duff et al. 2017), orienting the diffuse cone
+// set into the surface's hemisphere.
+void svogi_basis(vec3 n, out vec3 t, out vec3 b) {
+	float s = n.z >= 0.0 ? 1.0 : -1.0;
+	float a = -1.0 / (s + n.z);
+	float bb = n.x * n.y * a;
+	t = vec3(1.0 + s * n.x * n.x * a, s * bb, -s * n.x);
+	b = vec3(bb, s + n.y * n.y * a, -n.y);
+}
+
+// Cosine-weighted 6-cone hemisphere gather: one cone along the normal plus five tilted 60 deg off it
+// at 72 deg azimuth, weighted toward the normal (sums to 1) to approximate the Lambert irradiance
+// integral. Ported from meshlet_render.glsl so the default Forward+ GI path gets the same strong,
+// smooth bounce instead of a single weak normal-aligned cone. The shared origin is pushed off along
+// the normal first so the tilted cones clear the surface's own curvature (else: dark-petal artifact).
+vec3 svogi_hemisphere_gather(vec3 pos, vec3 normal, float surface_offset, float max_distance) {
+	vec3 t, b;
+	svogi_basis(normal, t, b);
+
+	const vec3 CONE_DIRS[6] = vec3[](
+			vec3(0.0, 0.0, 1.0),
+			vec3(0.0, 0.866025, 0.5),
+			vec3(0.823639, 0.267617, 0.5),
+			vec3(0.509037, -0.700629, 0.5),
+			vec3(-0.509037, -0.700629, 0.5),
+			vec3(-0.823639, 0.267617, 0.5));
+	const float CONE_WEIGHTS[6] = float[](0.25, 0.15, 0.15, 0.15, 0.15, 0.15);
+
+	vec3 start = pos + normal * surface_offset;
+
+	vec3 acc = vec3(0.0);
+	for (int i = 0; i < 6; i++) {
+		vec3 dir = normalize(t * CONE_DIRS[i].x + b * CONE_DIRS[i].y + normal * CONE_DIRS[i].z);
+		acc += CONE_WEIGHTS[i] * svogi_cone_trace(start, dir, 0.577, max_distance, surface_offset * 0.5).rgb;
+	}
+	return acc;
+}
+
 void svogi_process(uint cascade, vec3 cascade_pos, vec3 cam_pos, vec3 cam_normal, vec3 cam_specular_normal, bool use_specular, float roughness, out vec3 diffuse_light, out vec3 specular_light, out float blend) {
-	// Replaced legacy SDFGI process with SVOGI cone trace
-	
-	// Diffuse cone (wide)
-	vec4 diffuse_accum = svogi_cone_trace(cam_pos + cam_normal * svogi.normal_bias, cam_normal, 1.0, 100.0, 0.1);
-	diffuse_light = diffuse_accum.rgb;
-	
-	// Specular cone (narrow based on roughness)
+	// Cascade-0 octree extent (svogi_cone_trace derives the bounds itself; we just need a sane
+	// surface offset and trace distance from it). to_cell == 1/cell_size, so (1/to_cell)*grid_size
+	// is the full extent; halve for the half-extent.
+	float bounds_half = (1.0 / svogi.cascades[0].to_cell) * svogi.grid_size.x * 0.5;
+	float voxel_size = bounds_half / 32.0; // root half-size / 32 ~= leaf diameter.
+	float max_distance = bounds_half * 2.0;
+
+	// Indirect diffuse: cosine-weighted 6-cone hemisphere gather (matches the meshlet path).
+	diffuse_light = svogi_hemisphere_gather(cam_pos, cam_normal, voxel_size * 3.0, max_distance);
+
+	// Indirect specular: single roughness-widened cone along the reflection vector.
 	if (use_specular) {
-		vec4 specular_accum = svogi_cone_trace(cam_pos + cam_specular_normal * svogi.normal_bias, cam_specular_normal, tan(roughness * 0.5 * M_PI * 0.99), 100.0, 0.1);
+		vec4 specular_accum = svogi_cone_trace(cam_pos + cam_specular_normal * voxel_size * 3.0, cam_specular_normal, tan(roughness * 0.5 * M_PI * 0.99), max_distance, voxel_size * 1.5);
 		specular_light = specular_accum.rgb;
 	} else {
 		specular_light = vec3(0.0);
 	}
-	
-	blend = 1.0; // Fully blend SVOGI
+
+	blend = 1.0;
 }

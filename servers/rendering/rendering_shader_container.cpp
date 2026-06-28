@@ -476,7 +476,9 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 							if (reflection.uniform_sets[set][k].binding == uniform.binding) {
 								// Already exists, verify that it's the same type.
 								ERR_FAIL_COND_V_MSG(reflection.uniform_sets[set][k].type != uniform.type, FAILED,
-										"On shader stage '" + String(RDC::SHADER_STAGE_NAMES[stage]) + "', uniform '" + binding.name + "' trying to reuse location for set=" + itos(set) + ", binding=" + itos(uniform.binding) + " with different uniform type.");
+										"On shader stage '" + String(RDC::SHADER_STAGE_NAMES[stage]) + "', uniform '" + binding.name + "' trying to reuse location for set=" + itos(set) + ", binding=" + itos(uniform.binding) + " with different uniform type: old_type=" + itos(reflection.uniform_sets[set][k].type) + " new_type=" + itos(uniform.type));
+
+
 
 								// Also, verify that it's the same size.
 								ERR_FAIL_COND_V_MSG(reflection.uniform_sets[set][k].length != uniform.length, FAILED,

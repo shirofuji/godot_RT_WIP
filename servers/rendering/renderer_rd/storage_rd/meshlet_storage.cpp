@@ -199,6 +199,24 @@ uint32_t MeshletStorage::upload_material(const RID &p_material_rid, const Meshle
 	return slot;
 }
 
+uint32_t MeshletStorage::register_material_texture(const RID &p_rd_texture) {
+	if (p_rd_texture.is_null()) {
+		return 0xFFFFFFFF;
+	}
+	HashMap<RID, uint32_t>::Iterator it = texture_rid_to_slot.find(p_rd_texture);
+	if (it != texture_rid_to_slot.end()) {
+		return it->value;
+	}
+	if ((uint32_t)material_texture_rids.size() >= MAX_MATERIAL_TEXTURES) {
+		WARN_PRINT_ONCE("MeshletStorage: material-texture table full (MAX_MATERIAL_TEXTURES); extra textures fall back to scalar PBR factors.");
+		return 0xFFFFFFFF;
+	}
+	uint32_t slot = (uint32_t)material_texture_rids.size();
+	material_texture_rids.push_back(p_rd_texture);
+	texture_rid_to_slot[p_rd_texture] = slot;
+	return slot;
+}
+
 Vector2 MeshletStorage::_oct_encode_normal(const Vector3 &p_normal) {
 	Vector3 n = p_normal;
 	real_t l1_norm = Math::abs(n.x) + Math::abs(n.y) + Math::abs(n.z);

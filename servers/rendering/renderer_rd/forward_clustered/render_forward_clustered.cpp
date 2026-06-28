@@ -436,6 +436,13 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 		pipeline_key.color_pass_flags = 0;
 
+		if (surf->owner->data->base_type == RSE::INSTANCE_MESH && p_pass_mode == PASS_MODE_COLOR) {
+			RendererRD::MeshletStorage::Range range = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_meshlet_range(surf->owner->data->base, surf->surface_index);
+			if (meshlet_replace_default_active && range.is_valid()) {
+				pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MESHLET;
+			}
+		}
+
 		switch (p_pass_mode) {
 			case PASS_MODE_COLOR: {
 				if (element_info.uses_lightmap) {
@@ -598,7 +605,6 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			}
 
 			RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, push_constant_size);
-
 			uint32_t instance_count = surf->owner->instance_count > 1 ? surf->owner->instance_count : element_info.repeat;
 			if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS) {
 				instance_count /= surf->owner->trail_steps;
@@ -606,7 +612,71 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 			bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
 
-			if (emulate_point_size) {
+			if (meshlet_replace_default_active && surf->owner->data->base_type == RSE::INSTANCE_MESH && !emulate_point_size && p_pass_mode == PASS_MODE_COLOR) {
+				RendererRD::MeshletStorage::Range meshlet_range = mesh_storage->mesh_surface_get_meshlet_range(surf->owner->data->base, surf->surface_index);
+				if (meshlet_range.is_valid()) {
+					RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
+					Vector<RD::Uniform> uniforms;
+					{
+						RD::Uniform u;
+						u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+						u.binding = 0;
+						u.append_id(meshlet_storage->get_meshlet_descriptor_buffer_rid());
+						uniforms.push_back(u);
+					}
+					{
+						RD::Uniform u;
+						u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+						u.binding = 1;
+						u.append_id(meshlet_storage->get_meshlet_vertex_buffer_rid());
+						uniforms.push_back(u);
+					}
+					{
+						RD::Uniform u;
+						u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+						u.binding = 2;
+						u.append_id(meshlet_storage->get_meshlet_triangle_buffer_rid());
+						uniforms.push_back(u);
+					}
+					{
+						RD::Uniform u;
+						u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+						u.binding = 3;
+						u.append_id(meshlet_storage->get_vertex_position_buffer_rid());
+						uniforms.push_back(u);
+					}
+					{
+						RD::Uniform u;
+						u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+						u.binding = 4;
+						u.append_id(meshlet_storage->get_vertex_attribute_buffer_rid());
+						uniforms.push_back(u);
+					}
+					
+					RID shader_rd = shader->get_shader_variant(pipeline_key.version, pipeline_key.color_pass_flags, pipeline_key.ubershader);
+					RID meshlet_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shader_rd, 4);
+					RD::get_singleton()->draw_list_bind_uniform_set(draw_list, meshlet_uniform_set, 4);
+
+					for (uint32_t inst_idx = 0; inst_idx < instance_count; inst_idx++) {
+						uint32_t real_instance_index;
+						if (surf->owner->instance_count > 1) { // MultiMesh - currently unsupported by meshlets
+							real_instance_index = surf->owner->gi_offset_cache + inst_idx;
+						} else { // Grouped via repeat
+							GeometryInstanceSurfaceDataCache *inst_surf = p_params->elements[i + inst_idx];
+							real_instance_index = inst_surf->owner->gi_offset_cache;
+						}
+						
+						push_constant.base_index = real_instance_index;
+						push_constant.multimesh_motion_vectors_current_offset = meshlet_range.offset;
+						RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, push_constant_size);
+						
+						// draw_list_draw arguments: p_list, p_use_indices, p_instances, p_procedural_vertices
+						RD::get_singleton()->draw_list_draw(draw_list, false, meshlet_range.count, 192);
+					}
+				} else {
+					RD::get_singleton()->draw_list_draw(draw_list, index_array_rd.is_valid(), instance_count);
+				}
+			} else if (emulate_point_size) {
 				if (indirect) {
 					WARN_PRINT("Indirect draws are not supported when emulating point size.");
 				}
@@ -1767,6 +1837,41 @@ uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_mater
 			data.emission[1] = emission.g * energy;
 			data.emission[2] = emission.b * energy;
 		}
+
+		// Material textures. Resolve each BaseMaterial3D texture param (a Texture2D RID Variant set by
+		// BaseMaterial3D::set_texture) to its RD texture, register it in the meshlet texture table, and
+		// store the slot in the matching *_texture_index field. The shader samples material_textures[]
+		// at that index, or falls back to the scalar PBR factors above when the index is 0xFFFFFFFF
+		// (param unset / no texture). texture_orm is only present on ORM-packed materials; separate
+		// metallic/roughness/AO maps aren't folded here yet (the scalar factors stand in for them).
+		RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+		auto register_param_texture = [&](const StringName &p_param) -> uint32_t {
+			Variant tv = material_storage->material_get_param(material_rid, p_param);
+			if (tv.get_type() != Variant::RID) {
+				return 0xFFFFFFFF;
+			}
+			return meshlet_storage->register_material_texture(texture_storage->texture_get_rd_texture((RID)tv));
+		};
+		data.albedo_texture_index = register_param_texture("texture_albedo");
+		data.normal_texture_index = register_param_texture("texture_normal");
+		data.orm_texture_index = register_param_texture("texture_orm");
+
+		Variant normal_scale_v = material_storage->material_get_param(material_rid, "normal_scale");
+		if (normal_scale_v.get_type() != Variant::NIL) {
+			data.normal_scale = normal_scale_v;
+		}
+		Variant uv1_scale_v = material_storage->material_get_param(material_rid, "uv1_scale");
+		if (uv1_scale_v.get_type() == Variant::VECTOR3) {
+			Vector3 s = uv1_scale_v;
+			data.uv1_scale[0] = s.x;
+			data.uv1_scale[1] = s.y;
+		}
+		Variant uv1_offset_v = material_storage->material_get_param(material_rid, "uv1_offset");
+		if (uv1_offset_v.get_type() == Variant::VECTOR3) {
+			Vector3 o = uv1_offset_v;
+			data.uv1_offset[0] = o.x;
+			data.uv1_offset[1] = o.y;
+		}
 	}
 	// material_rid stays an invalid/default RID when p_material is null (no material assigned) -
 	// upload_material()'s RID-keyed dedup means every such instance shares one default slot.
@@ -2089,7 +2194,7 @@ void RenderForwardClustered::_render_meshlet_early_depth_pass(RenderDataRD *p_re
 	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_depth_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, RID(), 0, true, true);
 }
 
-void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer, const Color &p_default_bg_color) {
+void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer, const Color &p_default_bg_color, RID p_radiance_texture) {
 	if (p_render_buffers.is_null() || !p_color_only_framebuffer.is_valid()) {
 		return;
 	}
@@ -2157,6 +2262,14 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	// (render_scene_data_rd.cpp lines 159-196). Does not include sky cubemap contribution
 	// (would require binding the radiance texture to the meshlet shader - future work).
 	Color meshlet_ambient_color(0, 0, 0, 0);
+	float meshlet_sky_ambient_mix = 0.0f; // > 0 => blend in the sky radiance octmap over the flat color.
+	float meshlet_radiance_exposure = 1.0f;
+	float meshlet_max_roughness_lod = (float)(get_roughness_layers() - 1); // Roughest octmap layer = ambient.
+	// The meshlet shader declares the radiance binding as a texture2DArray, so only feed it a real
+	// radiance texture when the project actually uses array reflections (the default on desktop). On a
+	// non-array config the radiance is a plain 2D texture - binding it here would be a layout mismatch,
+	// so we pass RID() (MeshletRenderer binds a black 2DArray fallback) and leave sky ambient off.
+	RID meshlet_radiance_tex = (is_using_radiance_octmap_array() && p_radiance_texture.is_valid()) ? p_radiance_texture : RID();
 	RID env = p_render_data->environment;
 	if (env.is_valid()) {
 		RSE::EnvironmentAmbientSource ambient_src = environment_get_ambient_source(env);
@@ -2174,6 +2287,18 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 			bool use_ambient_light = use_ambient_cubemap || ambient_src == RSE::ENV_AMBIENT_SOURCE_COLOR;
 			if (use_ambient_light) {
 				meshlet_ambient_color = Color(color.r * energy, color.g * energy, color.b * energy, 1.0);
+			}
+			// Sky ambient: when ambient comes (wholly or partly) from the sky, have the meshlet shader
+			// blend the sky radiance octmap's average over the flat color above - mirroring the default
+			// Forward+ path's cubemap_ambient (scene_forward_clustered.glsl ~1888-1902). The flat
+			// ambient_light_color is near-black for a Sky source, so without this meshlet-path meshes
+			// (e.g. StandardMaterial3D players) read dark in shadow while ShaderMaterial terrain on the
+			// default path gets proper sky fill. IBL_exposure_normalization is 1.0 without
+			// CameraAttributes (the common case - render_scene_data_rd.cpp:242), so the scale is just
+			// the ambient energy here.
+			if (use_ambient_cubemap && meshlet_radiance_tex.is_valid()) {
+				meshlet_sky_ambient_mix = environment_get_ambient_sky_contribution(env);
+				meshlet_radiance_exposure = energy;
 			}
 		}
 	}
@@ -2202,7 +2327,7 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
 	// color (and, if the early pass ran, its partial depth contribution too) - never true here,
 	// matching this pass's existing pre-restructuring behavior.
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy);
+	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_sky_ambient_mix, meshlet_radiance_exposure, meshlet_max_roughness_lod);
 
 	// Rebuild Hi-Z once more, now from the fully-resolved depth (everything drawn this frame,
 	// including what this late pass itself just drew) - this becomes *next* frame's "last frame's
@@ -2870,7 +2995,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE, p_render_data);
 	}
 
-	_render_meshlet_late_pass(p_render_data, rb, color_only_framebuffer, p_default_bg_color);
+	_render_meshlet_late_pass(p_render_data, rb, color_only_framebuffer, p_default_bg_color, radiance_texture);
 
 	if (debug_voxelgis) {
 		Projection dc;

@@ -133,6 +133,16 @@ void main() {
 	// regardless of the object's actual screen size - not incorrect, but defeats the point of
 	// building a multi-mip Hi-Z chain at all.
 	float screen_radius_px = abs(world_radius * params.proj_y_scale * params.screen_size[1] * 0.5) / clip_w_center;
+	vec2 radius_uv = vec2(screen_radius_px) / vec2(params.screen_size[0], params.screen_size[1]);
+
+	// If any part of the footprint is off-screen, bypass occlusion culling to avoid false positives from clamped Hi-Z edge samples.
+	if (uv.x - radius_uv.x < 0.0 || uv.x + radius_uv.x > 1.0 || uv.y - radius_uv.y < 0.0 || uv.y + radius_uv.y > 1.0) {
+		uint slot = atomicAdd(visible_meshlets.count, 1);
+		if (slot < params.max_visible) {
+			visible_meshlets.data[slot] = item;
+		}
+		return;
+	}
 	// Hi-Z mip 0 is half the original screen resolution, so a footprint diameter of
 	// `screen_radius_px * 2` original-resolution pixels is `screen_radius_px` Hi-Z-mip0 pixels.
 	float mip_f = floor(log2(max(screen_radius_px, 1.0)));

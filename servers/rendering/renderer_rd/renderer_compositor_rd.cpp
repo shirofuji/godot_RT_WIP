@@ -36,6 +36,7 @@
 #include "core/os/os.h"
 #include "servers/display/display_server.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
+#include "servers/rendering/renderer_rd/forward_clustered/meshlet_software_rasterizer.h"
 #include "servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.h"
 #include "servers/rendering/rendering_server_types.h"
 
@@ -179,6 +180,7 @@ void RendererCompositorRD::finalize() {
 	memdelete(light_storage);
 	memdelete(hiz_builder);
 	memdelete(meshlet_renderer);
+	memdelete(meshlet_software_rasterizer);
 	memdelete(meshlet_culler);
 	memdelete(meshlet_storage);
 	memdelete(mesh_storage);
@@ -371,6 +373,7 @@ RendererCompositorRD::RendererCompositorRD() {
 	meshlet_storage = memnew(RendererRD::MeshletStorage);
 	meshlet_culler = memnew(RendererRD::MeshletCuller);
 	meshlet_renderer = memnew(RendererRD::MeshletRenderer);
+	meshlet_software_rasterizer = memnew(MeshletSoftwareRasterizer);
 	hiz_builder = memnew(RendererRD::HiZBuilder);
 	light_storage = memnew(RendererRD::LightStorage);
 	particles_storage = memnew(RendererRD::ParticlesStorage);

@@ -67,6 +67,11 @@ private:
 	RID synthetic_index_buffer; // 0, 1, 2, ..., MAX_TRIANGLES_PER_MESHLET*3-1.
 	RID synthetic_index_array;
 
+	RID radiance_sampler; // Linear-with-mipmaps, clamp - for sampling the sky radiance octmap ambient
+			// (binding 12 of the non-depth-only shader). Created once; freed in the destructor.
+	RID material_sampler; // Linear-with-mipmaps, repeat + anisotropy - for the material-texture array
+			// (binding 14). Tiling textures need repeat (unlike the clamp radiance sampler).
+
 	RD::FramebufferFormatID cached_framebuffer_format = RD::INVALID_FORMAT_ID;
 	RID cached_pipeline;
 	RD::FramebufferFormatID cached_depth_only_framebuffer_format = RD::INVALID_FORMAT_ID;
@@ -104,7 +109,14 @@ public:
 	// then be an invalid RID (a harmless fallback buffer is bound in its place, never indexed).
 	// bounds are absolute world space (the octree is built in absolute world space). All ignored
 	// when p_depth_only is true.
-	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear = true, bool p_depth_only = false, const Color &p_ambient_color = Color(0, 0, 0, 0), RID p_svogi_octree_buffer = RID(), const Vector3 &p_svogi_bounds_center = Vector3(), float p_svogi_bounds_half_size = 0.0f, float p_svogi_energy = 1.0f);
+	// p_radiance_texture/p_sky_ambient_mix/p_radiance_exposure/p_max_roughness_lod: sky ambient. When
+	// p_sky_ambient_mix > 0 the fragment shader blends in the sky's average radiance (roughest octmap
+	// layer p_max_roughness_lod, scaled by p_radiance_exposure) over the flat p_ambient_color, by
+	// p_sky_ambient_mix - this is how meshlet-path meshes get sky fill in shadow under a Sky ambient
+	// source (the flat ambient_light_color is near-black there). p_radiance_texture must be a valid
+	// texture2DArray when p_depth_only is false; pass an invalid RID (a black fallback is bound) when
+	// there's no sky, and leave p_sky_ambient_mix at 0. All ignored when p_depth_only is true.
+	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear = true, bool p_depth_only = false, const Color &p_ambient_color = Color(0, 0, 0, 0), RID p_svogi_octree_buffer = RID(), const Vector3 &p_svogi_bounds_center = Vector3(), float p_svogi_bounds_half_size = 0.0f, float p_svogi_energy = 1.0f, RID p_radiance_texture = RID(), float p_sky_ambient_mix = 0.0f, float p_radiance_exposure = 1.0f, float p_max_roughness_lod = 0.0f);
 
 	MeshletRenderer();
 	~MeshletRenderer();

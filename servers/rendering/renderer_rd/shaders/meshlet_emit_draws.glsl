@@ -82,11 +82,12 @@ void main() {
 	}
 
 	if (idx >= real_visible_count) {
-		// Beyond the real visible count for this frame - explicitly mark degenerate
-		// (instance_count=0, drawn as a no-op) rather than leaving this slot untouched, since it
-		// may hold a real, non-degenerate command left over from a previous frame that had more
-		// visible meshlets than this one.
-		commands.data[idx].instance_count = 0;
+		// vkCmdDrawIndexedIndirectCount bounds the actual number of indirect commands
+		// executed to real_visible_count, so we don't need to explicitly zero out the
+		// remainder of the buffer.
+		// Doing so causes out-of-bounds writes if max_draws * sizeof(IndirectCommand)
+		// exceeds the device's maxStorageBufferRange, which silently wraps around and
+		// corrupts the valid commands at the start of the buffer!
 		return;
 	}
 
