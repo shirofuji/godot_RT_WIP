@@ -346,6 +346,17 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 		const GeometryInstanceSurfaceDataCache *surf = p_params->elements[i];
 		const RenderElementInfo &element_info = p_params->element_info[i];
 
+		// Skip meshlet-replaceable (qualifying) surfaces in the opaque COLOR pass - the standalone
+		// meshlet late pass draws them instead. Done in place rather than by rebuilding the element
+		// list: that rebuild dropped these elements but copied the survivors' `repeat` group counts
+		// verbatim, desyncing the group indexing (i += element_info.repeat - 1, below) so unrelated
+		// opaque geometry read the wrong elements and rendered black (the terrain-black bug). Skipping
+		// in place keeps every surviving element at its original index, so the grouping stays valid.
+		// Color pass only - the depth pre-pass still writes their depth (occluders for the late pass).
+		if (meshlet_replace_default_active && p_pass_mode == PASS_MODE_COLOR && meshlet_replace_skip_set.has(const_cast<GeometryInstanceSurfaceDataCache *>(surf))) {
+			continue;
+		}
+
 		if (p_pass_mode == PASS_MODE_COLOR && surf->color_pass_inclusion_mask && (p_color_pass_flags & surf->color_pass_inclusion_mask) == 0) {
 			// Some surfaces can be repeated in multiple render lists. We exclude them from being rendered on the color pass based on the
 			// features supported by the pass compared to the exclusion mask.
@@ -438,7 +449,14 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 		if (surf->owner->data->base_type == RSE::INSTANCE_MESH && p_pass_mode == PASS_MODE_COLOR) {
 			RendererRD::MeshletStorage::Range range = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_meshlet_range(surf->owner->data->base, surf->surface_index);
-			if (meshlet_replace_default_active && range.is_valid()) {
+			// Select the MESHLET_PULLING shader variant only for meshlet-replaceable (skip-set)
+			// surfaces - MUST match the draw-path gate below (the actual MESHLET_PULLING vs normal
+			// draw). A non-qualifying ShaderMaterial (e.g. terrain) drawn normally but with the pulling
+			// variant selected would read vertices from the unbound meshlet set instead of its real
+			// vertex/index buffers and render black; gating both consistently keeps it fully on the
+			// normal path. (In practice skip-set surfaces are filtered out of the opaque list, so this
+			// keeps the whole opaque color pass on the normal variant.)
+			if (meshlet_replace_default_active && range.is_valid() && meshlet_replace_skip_set.has(const_cast<GeometryInstanceSurfaceDataCache *>(surf))) {
 				pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MESHLET;
 			}
 		}
@@ -612,7 +630,17 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 			bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
 
-			if (meshlet_replace_default_active && surf->owner->data->base_type == RSE::INSTANCE_MESH && !emulate_point_size && p_pass_mode == PASS_MODE_COLOR) {
+			// MESHLET_PULLING re-fetches vertices from the global meshlet buffers, which store only
+			// position / octahedral-normal / uv - NOT vertex colors, uv2, or custom attributes. So it's
+			// only valid for meshlet-REPLACEABLE (qualifying, BaseMaterial3D-shaped) surfaces, which by
+			// definition use just those attributes; those are exactly the ones in meshlet_replace_skip_set.
+			// A non-qualifying custom ShaderMaterial (e.g. the procedural terrain, which packs its block
+			// type into vertex color) must NOT take this path - pulling drops its vertex color and it
+			// renders black. Gating on skip-set membership routes such meshes to the normal draw below
+			// (full index buffer + every vertex attribute) instead. (Qualifying surfaces are filtered out
+			// of this opaque list entirely and drawn by the standalone meshlet late pass, so in practice
+			// this guard keeps the whole opaque color pass on the normal vertex path.)
+			if (meshlet_replace_default_active && meshlet_replace_skip_set.has(const_cast<GeometryInstanceSurfaceDataCache *>(surf)) && surf->owner->data->base_type == RSE::INSTANCE_MESH && !emulate_point_size && p_pass_mode == PASS_MODE_COLOR) {
 				RendererRD::MeshletStorage::Range meshlet_range = mesh_storage->mesh_surface_get_meshlet_range(surf->owner->data->base, surf->surface_index);
 				if (meshlet_range.is_valid()) {
 					RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
@@ -2020,27 +2048,35 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		// opaque pass's own framebuffer object are the exact same RID/attachment set, and whether the
 		// late pass's two mid-frame Hi-Z rebuilds (hiz_builder->build_into(), which dispatch compute
 		// work) insert a correct barrier before the following sky/color-load-bearing draws.
-		uint32_t instance_index = (uint32_t)meshlet_scan_instance_transforms.size();
-		meshlet_scan_instance_transforms.push_back(inst->transform);
 		// material_override (if set) replaces every surface's material - same precedence Godot's
 		// own normal rendering gives it. Otherwise use this specific surface's own material.
 		RID surface_material_rid = inst->data->material_override.is_valid() ? inst->data->material_override : (sdcache->surface_index < inst->data->surface_materials.size() ? inst->data->surface_materials[sdcache->surface_index] : RID());
 		bool material_qualifies = true;
-		meshlet_scan_material_ids.push_back(_meshlet_resolve_material_id(surface_material_rid, material_qualifies));
+		uint32_t material_id = _meshlet_resolve_material_id(surface_material_rid, material_qualifies);
+
+		// Only scan instances the meshlet path will actually render: replacement enabled AND a
+		// qualifying (StandardMaterial3D/ORMMaterial3D-shaped) material that flattens into a
+		// MeshletMaterialGPU. A non-qualifying custom ShaderMaterial (e.g. the procedural terrain) must
+		// stay on Forward+: it can't be expressed as a meshlet material, and the late pass draws EVERY
+		// scanned range, so scanning it would overwrite its correct Forward+ color with a wrong
+		// default-material meshlet draw - observed as the ShaderMaterial terrain rendering depth-only
+		// black with meshlet enabled. (Previously non-qualifying instances were scanned anyway so
+		// --meshlet-debug-overlay could approximate them; that overlay no longer visualizes them, an
+		// acceptable trade for correct default rendering.) Also covers the meshlet-disabled case
+		// (replace_enabled == false) - nothing is scanned, the late pass is a no-op.
+		if (!(replace_enabled && material_qualifies)) {
+			continue;
+		}
+
+		uint32_t instance_index = (uint32_t)meshlet_scan_instance_transforms.size();
+		meshlet_scan_instance_transforms.push_back(inst->transform);
+		meshlet_scan_material_ids.push_back(material_id);
 		RendererRD::MeshletCuller::InstanceMeshletRange r;
 		r.instance_index = instance_index;
 		r.meshlet_offset = range.offset;
 		r.meshlet_count = range.count;
 		meshlet_scan_ranges.push_back(r);
-
-		// B6: only skip the normal color draw (i.e. actually replace it with the meshlet path) for
-		// a qualifying material - a non-qualifying-material instance is still scanned (so
-		// --meshlet-debug-overlay can still show it, approximated with default material values,
-		// which is harmless for a debug visualization) but keeps rendering normally via Forward+
-		// instead of replacing it with a wrong-looking default-white meshlet draw.
-		if (replace_enabled && material_qualifies) {
-			meshlet_replace_skip_set.insert(sdcache);
-		}
+		meshlet_replace_skip_set.insert(sdcache);
 	}
 }
 
@@ -2930,20 +2966,6 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			GeometryInstanceSurfaceDataCache **opaque_elements_ptr = render_list[RENDER_LIST_OPAQUE].elements.ptr();
 			RenderElementInfo *opaque_element_info_ptr = render_list[RENDER_LIST_OPAQUE].element_info.ptr();
 			int opaque_elements_count = render_list[RENDER_LIST_OPAQUE].elements.size();
-			LocalVector<GeometryInstanceSurfaceDataCache *> meshlet_filtered_elements;
-			LocalVector<RenderElementInfo> meshlet_filtered_element_info;
-			if (meshlet_replace_default_active && !meshlet_replace_skip_set.is_empty()) {
-				for (uint32_t i = 0; i < render_list[RENDER_LIST_OPAQUE].elements.size(); i++) {
-					if (meshlet_replace_skip_set.has(render_list[RENDER_LIST_OPAQUE].elements[i])) {
-						continue;
-					}
-					meshlet_filtered_elements.push_back(render_list[RENDER_LIST_OPAQUE].elements[i]);
-					meshlet_filtered_element_info.push_back(render_list[RENDER_LIST_OPAQUE].element_info[i]);
-				}
-				opaque_elements_ptr = meshlet_filtered_elements.ptr();
-				opaque_element_info_ptr = meshlet_filtered_element_info.ptr();
-				opaque_elements_count = meshlet_filtered_elements.size();
-			}
 
 			RenderListParameters render_list_params(opaque_elements_ptr, opaque_element_info_ptr, opaque_elements_count, reverse_cull, PASS_MODE_COLOR, opaque_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 			_render_list_with_draw_list(&render_list_params, opaque_framebuffer, RD::DrawFlags(load_color ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_COLOR_ALL) | (depth_pre_pass ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0u, p_render_data->render_region);
