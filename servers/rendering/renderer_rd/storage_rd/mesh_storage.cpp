@@ -30,6 +30,8 @@
 
 #include "mesh_storage.h"
 
+#include "core/config/project_settings.h"
+#include "core/object/worker_thread_pool.h"
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -518,6 +520,29 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	mesh->surfaces[mesh->surface_count] = s;
 	mesh->surface_count++;
 
+	// Kick off the async Nanite cluster-LOD DAG bake for this surface, off the render/main thread (only
+	// if enabled and the surface actually got single-level meshlets). The worker bakes the multi-level
+	// DAG; process_pending_meshlet_bakes() later swaps it into s->meshlet_upload, reusing the vertex
+	// range. Until then the surface renders at full detail (leaf-only). Reconstruct the full-res index
+	// list from the surface's index data (16- or 32-bit, by vertex count) for the bake.
+	if (s->meshlet_upload.vertex_range.is_valid() && new_surface.meshlet_positions.size() > 0 && new_surface.index_count > 0 && GLOBAL_GET_CACHED(bool, "rendering/meshlet/bake_lod_dag")) {
+		PackedInt32Array base_indices;
+		base_indices.resize(new_surface.index_count);
+		int *bw = base_indices.ptrw();
+		if (new_surface.vertex_count <= 65536) {
+			const uint16_t *ip = (const uint16_t *)new_surface.index_data.ptr();
+			for (uint32_t i = 0; i < new_surface.index_count; i++) {
+				bw[i] = ip[i];
+			}
+		} else {
+			const uint32_t *ip = (const uint32_t *)new_surface.index_data.ptr();
+			for (uint32_t i = 0; i < new_surface.index_count; i++) {
+				bw[i] = (int)ip[i];
+			}
+		}
+		_enqueue_meshlet_dag_bake(p_mesh, mesh->surface_count - 1, new_surface.meshlet_positions, base_indices);
+	}
+
 	for (MeshInstance *mi : mesh->instances) {
 		_mesh_instance_add_surface(mi, mesh, mesh->surface_count - 1);
 	}
@@ -531,6 +556,64 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	}
 
 	mesh->material_cache.clear();
+}
+
+void MeshStorage::_enqueue_meshlet_dag_bake(RID p_mesh, uint32_t p_surface, const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices) {
+	PendingMeshletBake *pending = memnew(PendingMeshletBake);
+	pending->mesh = p_mesh;
+	pending->surface_index = p_surface;
+	pending->vertices = p_vertices;
+	pending->indices = p_indices;
+	WorkerThreadPool::get_singleton()->add_native_task(&MeshStorage::_meshlet_dag_bake_task, pending, false, "Meshlet cluster-LOD DAG bake");
+}
+
+void MeshStorage::_meshlet_dag_bake_task(void *p_userdata) {
+	PendingMeshletBake *pending = static_cast<PendingMeshletBake *>(p_userdata);
+	CompletedMeshletBake completed;
+	completed.mesh = pending->mesh;
+	completed.surface_index = pending->surface_index;
+	bool ok = RenderingServer::bake_meshlet_dag(pending->vertices, pending->indices, completed.meshlets, completed.meshlet_vertices, completed.meshlet_triangles, completed.bounds, completed.lods);
+	memdelete(pending);
+	if (!ok || completed.meshlets.is_empty()) {
+		return; // DAG not bakeable - keep the single-level meshlets the surface already has.
+	}
+	MeshStorage *self = MeshStorage::get_singleton();
+	if (self == nullptr) {
+		return; // shutting down.
+	}
+	MutexLock lock(self->meshlet_bake_mutex);
+	self->meshlet_bakes_completed.push_back(completed);
+}
+
+void MeshStorage::process_pending_meshlet_bakes() {
+	LocalVector<CompletedMeshletBake> done;
+	{
+		MutexLock lock(meshlet_bake_mutex);
+		if (meshlet_bakes_completed.is_empty()) {
+			return;
+		}
+		done = meshlet_bakes_completed;
+		meshlet_bakes_completed.clear();
+	}
+	MeshletStorage *meshlet_storage = MeshletStorage::get_singleton();
+	if (meshlet_storage == nullptr) {
+		return;
+	}
+	for (const CompletedMeshletBake &b : done) {
+		Mesh *mesh = mesh_owner.get_or_null(b.mesh);
+		if (mesh == nullptr || b.surface_index >= mesh->surface_count) {
+			continue; // mesh or surface was freed before the bake finished.
+		}
+		Mesh::Surface *s = mesh->surfaces[b.surface_index];
+		if (!s->meshlet_upload.vertex_range.is_valid()) {
+			continue; // no single-level meshlets to replace.
+		}
+		// The DAG indexes the same base vertices, so reuse the already-uploaded vertex range: free only
+		// the single-level meshlet ranges and upload the multi-level DAG meshlets + LOD-cut records.
+		MeshletStorage::Range vertex_range = s->meshlet_upload.vertex_range;
+		meshlet_storage->free_meshlets(s->meshlet_upload);
+		s->meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, b.meshlets, b.meshlet_vertices, b.meshlet_triangles, b.bounds, b.lods);
+	}
 }
 
 void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {

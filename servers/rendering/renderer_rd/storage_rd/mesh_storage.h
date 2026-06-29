@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/os/mutex.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/self_list.h"
@@ -187,6 +188,34 @@ private:
 	};
 
 	mutable RID_Owner<Mesh, true> mesh_owner;
+
+	// Deferred Nanite cluster-LOD (DAG) bake. The expensive multi-level DAG bake is NOT done during
+	// surface creation (that only does a cheap single-level meshlet split - see _surface_set_data).
+	// Instead, when rendering/meshlet/bake_lod_dag is on, each surface's DAG is baked on a
+	// WorkerThreadPool thread off the render/main thread; finished bakes are pushed to a mutex-guarded
+	// queue and swapped into the surface's meshlets once per frame via process_pending_meshlet_bakes()
+	// (re-uploading the meshlet ranges, reusing the already-uploaded vertex range). This keeps boot /
+	// runtime mesh creation fast while still enabling continuous LOD - it just engages a beat later.
+	struct PendingMeshletBake {
+		RID mesh;
+		uint32_t surface_index = 0;
+		PackedVector3Array vertices; // base (full-res) positions for the DAG bake.
+		PackedInt32Array indices; // base (full-res) index buffer.
+	};
+	struct CompletedMeshletBake {
+		RID mesh;
+		uint32_t surface_index = 0;
+		Vector<RenderingServerTypes::MeshletInfo> meshlets;
+		PackedInt32Array meshlet_vertices;
+		PackedByteArray meshlet_triangles;
+		Vector<RenderingServerTypes::MeshletBoundsInfo> bounds;
+		Vector<RenderingServerTypes::MeshletLODInfo> lods;
+	};
+	Mutex meshlet_bake_mutex;
+	LocalVector<CompletedMeshletBake> meshlet_bakes_completed; // guarded by meshlet_bake_mutex.
+
+	void _enqueue_meshlet_dag_bake(RID p_mesh, uint32_t p_surface, const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices);
+	static void _meshlet_dag_bake_task(void *p_userdata); // runs on a WorkerThreadPool thread.
 
 	/* Mesh Instance API */
 
@@ -667,6 +696,10 @@ public:
 	virtual void mesh_instance_check_for_update(RID p_mesh_instance) override;
 	virtual void mesh_instance_set_canvas_item_transform(RID p_mesh_instance, const Transform2D &p_transform) override;
 	virtual void update_mesh_instances() override;
+
+	// Swap any finished background DAG bakes into their surfaces' meshlets. Call once per frame on the
+	// render thread (the meshlet scan does). Cheap no-op when nothing finished this frame.
+	void process_pending_meshlet_bakes();
 
 	/* MULTIMESH API */
 

@@ -467,7 +467,11 @@ void light_compute(vec3 N, vec3 L, vec3 V, vec3 light_color, bool is_directional
 }
 
 void light_process_directional(uint idx, vec3 N, vec3 V, MeshletMaterial mat, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
-	vec3 L = normalize(-lights.data[idx].direction);
+	// L is the direction TO the light. lights.data[].direction (filled by _meshlet_collect_lights from
+	// the light's basis) already points toward the source for this path, so it's used directly - NOT
+	// negated. Negating it inverted the diffuse/specular relative to Forward+ (lit side on the wrong
+	// side), confirmed against the same scene's MultiMesh/Forward+ geometry.
+	vec3 L = normalize(lights.data[idx].direction);
 	light_compute(N, L, V, lights.data[idx].color, true, 1.0, mat, albedo, diffuse_light, specular_light);
 }
 

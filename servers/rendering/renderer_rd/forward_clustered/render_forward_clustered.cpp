@@ -1988,6 +1988,10 @@ RID RenderForwardClustered::meshlet_lights_buffer_rid(const Vector<MeshletLightG
 }
 
 void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_data, RenderListType p_list_type) {
+	// Swap in any background Nanite cluster-LOD DAG bakes that finished since last frame (deferred
+	// meshlet bake - see MeshStorage). Render-thread, once per frame, cheap no-op when none finished.
+	RendererRD::MeshStorage::get_singleton()->process_pending_meshlet_bakes();
+
 	meshlet_scan_instance_transforms.clear();
 	meshlet_scan_material_ids.clear();
 	meshlet_scan_ranges.clear();

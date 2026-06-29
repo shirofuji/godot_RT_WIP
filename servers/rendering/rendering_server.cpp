@@ -1214,6 +1214,35 @@ static Vector<RenderingServerTypes::MeshletLODInfo> _meshlet_lod_convert(const L
 	return dst;
 }
 
+bool RenderingServer::bake_meshlet_dag(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices, Vector<RenderingServerTypes::MeshletInfo> &r_meshlets, PackedInt32Array &r_meshlet_vertices, PackedByteArray &r_meshlet_triangles, Vector<RenderingServerTypes::MeshletBoundsInfo> &r_bounds, Vector<RenderingServerTypes::MeshletLODInfo> &r_lods) {
+	// Bake the Nanite-style cluster-LOD DAG for one surface (multi-level meshlet pool + per-cluster
+	// LOD-cut records). Pure CPU, no engine state touched, so it's safe to run on a WorkerThreadPool
+	// thread off the render/main thread - that's the whole point: MeshStorage's deferred-bake queue
+	// calls this in the background and swaps the result in when done (see _surface_set_data, which
+	// only does the cheap single-level split synchronously). Returns false if the DAG can't be built
+	// (meshopt hooks missing / degenerate input); the caller then just keeps the single-level meshlets.
+	r_meshlets.clear();
+	r_meshlet_vertices.clear();
+	r_meshlet_triangles.clear();
+	r_bounds.clear();
+	r_lods.clear();
+	if (SurfaceTool::build_meshlets_func == nullptr || p_vertices.is_empty() || p_indices.size() < 3 || p_indices.size() % 3 != 0) {
+		return false;
+	}
+	LocalVector<MeshletDAG::Cluster> dag_clusters;
+	if (!MeshletDAG::build(p_vertices, p_indices, dag_clusters) || dag_clusters.is_empty()) {
+		return false;
+	}
+	LocalVector<MeshletDAG::ClusterLOD> dag_lods;
+	Vector<SurfaceTool::MeshletBounds> bounds_st;
+	Vector<SurfaceTool::Meshlet> meshlets_st;
+	MeshletDAG::flatten_to_arrays(dag_clusters, p_vertices, meshlets_st, r_meshlet_vertices, r_meshlet_triangles, bounds_st, dag_lods);
+	r_meshlets = _meshlet_info_convert(meshlets_st);
+	r_bounds = _meshlet_bounds_convert(bounds_st);
+	r_lods = _meshlet_lod_convert(dag_lods);
+	return !r_meshlets.is_empty();
+}
+
 Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes, const Dictionary &p_lods, uint64_t p_compress_format) {
 	ERR_FAIL_INDEX_V(p_primitive, RSE::PRIMITIVE_MAX, ERR_INVALID_PARAMETER);
 	ERR_FAIL_COND_V(p_arrays.size() != RSE::ARRAY_MAX, ERR_INVALID_PARAMETER);
@@ -1432,28 +1461,16 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 		base_uvs = p_arrays[RSE::ARRAY_TEX_UV];
 		PackedInt32Array base_indices = p_arrays[RSE::ARRAY_INDEX];
 		if (base_indices.size() % 3 == 0) {
-			// The surface's full-resolution meshlet set IS the Nanite-style cluster DAG: every LOD
-			// level baked into one pool, with per-cluster LOD-cut data (self/parent error + bounds)
-			// so the GPU can pick a crack-free continuous-LOD subset at render time. If the DAG bake
-			// can't run (meshopt hooks missing / degenerate input), fall back to a single-level
-			// meshlet split (base_meshlet_lods stays empty -> legacy LOD-0-only behavior downstream).
+			// Surface creation always produces a cheap single-level (LOD-0) meshlet split here, so it
+			// never blocks on the heavy work. The Nanite cluster-LOD DAG (continuous LOD) is baked
+			// ASYNCHRONOUSLY on a WorkerThreadPool thread after the surface exists, then swapped in when
+			// ready (see MeshStorage's deferred meshlet-bake queue / RenderingServer::bake_meshlet_dag),
+			// gated by rendering/meshlet/bake_lod_dag. Until that swap, base_meshlet_lods stays empty
+			// (leaf-only), which the cull shader treats as "always the right LOD" - full detail, no CLOD.
 			Vector<SurfaceTool::MeshletBounds> base_bounds_st;
-			Vector<SurfaceTool::Meshlet> base_meshlets_st;
-			LocalVector<MeshletDAG::Cluster> dag_clusters;
-			LocalVector<MeshletDAG::ClusterLOD> dag_lods;
-			// Skip the heavy multi-level Nanite cluster-DAG bake when disabled by project setting,
-			// falling back to a single full-resolution meshlet split (much cheaper, no continuous LOD).
-			// The DAG bake runs synchronously on the surface-creating thread and is CPU-heavy, so
-			// projects that create many meshes at runtime (procedural terrain) can disable it to cut
-			// per-mesh latency. See rendering/meshlet/bake_lod_dag's registration for the full rationale.
-			if (GLOBAL_GET_CACHED(bool, "rendering/meshlet/bake_lod_dag") && MeshletDAG::build(base_vertices, base_indices, dag_clusters) && !dag_clusters.is_empty()) {
-				MeshletDAG::flatten_to_arrays(dag_clusters, base_vertices, base_meshlets_st, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st, dag_lods);
-			} else {
-				base_meshlets_st = SurfaceTool::build_meshlets(base_vertices, base_indices, 64, 124, 0.5f, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st);
-			}
+			Vector<SurfaceTool::Meshlet> base_meshlets_st = SurfaceTool::build_meshlets(base_vertices, base_indices, 64, 124, 0.5f, base_meshlet_vertices, base_meshlet_triangles, base_bounds_st);
 			base_meshlets = _meshlet_info_convert(base_meshlets_st);
 			base_meshlet_bounds = _meshlet_bounds_convert(base_bounds_st);
-			base_meshlet_lods = _meshlet_lod_convert(dag_lods);
 
 			for (int i = 0; i < lods.size(); i++) {
 				PackedInt32Array lod_indices;
