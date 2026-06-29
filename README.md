@@ -1,4 +1,39 @@
-# Godot Engine
+# Godot Likha Engine
+
+**Likha** is an experimental fork of [Godot Engine](https://godotengine.org) **4.8**
+(`4.8.likha`) built around a **GPU-driven, Nanite-style meshlet renderer** for the
+Forward+ backend. It tracks upstream Godot and stays a drop-in editor — everything below
+about stock Godot still applies — but adds a parallel high-density geometry path.
+
+> ⚠️ **Experimental / work in progress.** The meshlet path is opt-in/gated and has so far
+> been validated against the developer's own scenes, not arbitrary projects. Hardware
+> floor for the meshlet pipeline is roughly a **GTX 1660 Super**.
+
+## What Likha adds
+
+- **GPU-driven meshlet renderer** — geometry is split into meshlet clusters and drawn with
+  GPU frustum culling, backface-**cone** culling, **two-pass temporal Hi-Z occlusion**
+  culling, and indirect multi-draw. Gated by `rendering/meshlet/enabled`.
+- **Continuous LOD (CLOD)** — a Nanite-style per-surface cluster **DAG** with per-cluster
+  screen-space-error LOD-cut data, so the GPU selects a crack-free continuous-LOD subset
+  per view in the cull shader. Tuned via `rendering/meshlet/lod_error_threshold_px`.
+- **Asynchronous DAG bake** *(new)* — the heavy cluster-DAG bake now runs on a background
+  `WorkerThreadPool` thread instead of stalling surface creation. Meshes appear immediately
+  at full detail and CLOD engages a beat later when each bake lands, so continuous LOD can
+  stay on (`rendering/meshlet/bake_lod_dag`) without the multi-second boot stall.
+- **Meshlet PBR materials** — albedo / normal / ORM sampled through a capped texture array,
+  with in-shader derived (cotangent-frame) tangents and sky-radiance ambient — no stored
+  vertex tangents required.
+- **SVOGI ambient fixes** — sparse-voxel GI now *adds* to ambient with a 6-cone
+  cosine-weighted gather, fixing pure-black shadows on both the Forward+ and meshlet paths.
+- **Large-world precision** — the meshlet render path is camera-relative, matching Forward+
+  precision for distant/large-coordinate geometry.
+
+Most meshlet behavior is controlled under **Project Settings → Rendering → Meshlet**.
+
+---
+
+## Upstream: Godot Engine
 
 <p align="center">
   <a href="https://godotengine.org">
