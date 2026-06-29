@@ -2048,9 +2048,19 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		// opaque pass's own framebuffer object are the exact same RID/attachment set, and whether the
 		// late pass's two mid-frame Hi-Z rebuilds (hiz_builder->build_into(), which dispatch compute
 		// work) insert a correct barrier before the following sky/color-load-bearing draws.
-		// material_override (if set) replaces every surface's material - same precedence Godot's
-		// own normal rendering gives it. Otherwise use this specific surface's own material.
-		RID surface_material_rid = inst->data->material_override.is_valid() ? inst->data->material_override : (sdcache->surface_index < inst->data->surface_materials.size() ? inst->data->surface_materials[sdcache->surface_index] : RID());
+		// Resolve the material with Godot's real precedence: instance material_override, then this
+		// instance's per-surface override, then the MESH's own surface material. The mesh-surface
+		// fallback was missing - a material set on the MeshInstance's *mesh* (e.g. CapsuleMesh.material /
+		// any mesh whose surface carries its own material, the common case) resolved to an invalid RID
+		// and the meshlet path rendered it flat default-white instead of the real albedo.
+		RID surface_material_rid;
+		if (inst->data->material_override.is_valid()) {
+			surface_material_rid = inst->data->material_override;
+		} else if (sdcache->surface_index < inst->data->surface_materials.size() && inst->data->surface_materials[sdcache->surface_index].is_valid()) {
+			surface_material_rid = inst->data->surface_materials[sdcache->surface_index];
+		} else {
+			surface_material_rid = mesh_storage->mesh_surface_get_material(inst->data->base, sdcache->surface_index);
+		}
 		bool material_qualifies = true;
 		uint32_t material_id = _meshlet_resolve_material_id(surface_material_rid, material_qualifies);
 
