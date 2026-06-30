@@ -2390,6 +2390,16 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	// matching this pass's existing pre-restructuring behavior.
 	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_sky_ambient_mix, meshlet_radiance_exposure, meshlet_max_roughness_lod);
 
+	// S0c: drain this frame's GPU page-feedback and stream the requested fine virtual-texture pages
+	// into the pool for next frame (evicting LRU under the pool budget). read_feedback_requests() is a
+	// GPU-readback stall for now - reading LAST frame's feedback to hide it is a later refinement.
+	if (RendererRD::VirtualTextureStorage::is_enabled()) {
+		RendererRD::VirtualTextureStorage *vts = RendererRD::VirtualTextureStorage::get_singleton();
+		if (vts) {
+			vts->update_streaming(vts->read_feedback_requests());
+		}
+	}
+
 	// Rebuild Hi-Z once more, now from the fully-resolved depth (everything drawn this frame,
 	// including what this late pass itself just drew) - this becomes *next* frame's "last frame's
 	// Hi-Z" for its early pass. Writing into the same role-flipped texture as the mid-build above

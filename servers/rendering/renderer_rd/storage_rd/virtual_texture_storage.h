@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_rd/shaders/virtual_texture_blit.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
@@ -153,6 +154,13 @@ public:
 	void clear_feedback();
 	Vector<PageRequest> read_feedback_requests();
 
+	// S0c: the per-frame residency drain. Given the page set the frame sampled (read_feedback_requests),
+	// streams in any requested fine (non-base) pages not yet resident - blitting them into the pool and
+	// patching the indirection - and evicts the least-recently-used streamed pages when the pool is full
+	// (the pool size IS the VRAM budget). Bounded to MAX_STREAMS_PER_FRAME new pages per call.
+	// Always-resident base mips are never streamed or evicted.
+	void update_streaming(const Vector<PageRequest> &p_requests);
+
 	// std430, mirrored by the shader's VTMeta struct. One entry per registered virtual texture,
 	// indexed by vt_id; lets the shader recover each mip's texel dimensions to map a UV to a page +
 	// in-page offset. resident_mip_floor is the coarsest mip guaranteed resident (S0a: always 0,
@@ -201,10 +209,26 @@ private:
 		uint32_t height = 0;
 		uint32_t mip_count = 0;
 		uint32_t vt_id = 0xFFFFFFFF;
-		LocalVector<uint32_t> resident_tiles; // Pool tiles to release in free_virtual_texture().
+		uint32_t resident_mip_floor = 0; // Mips >= this are the always-resident base (never evicted).
+		LocalVector<uint32_t> resident_tiles; // Base pool tiles, released in free_virtual_texture().
+		Vector<uint8_t> indirection_cpu; // CPU shadow of this layer's page table, for per-page patching.
 	};
 	LocalVector<VirtualTexture> virtual_textures; // Indexed by vt_id.
 	HashMap<RID, uint32_t> source_rid_to_vt_id; // Dedup.
+
+	// S0c streaming / LRU-eviction state.
+	static constexpr uint32_t MAX_STREAMS_PER_FRAME = 128; // Cap new pages blitted per update_streaming.
+	static constexpr uint64_t NO_STREAMED_PAGE = 0xFFFFFFFFFFFFFFFFull; // tile_page_key sentinel.
+	HashMap<uint64_t, uint32_t> streamed_page_to_tile; // page_key -> tile, for resident streamed pages.
+	LocalVector<uint64_t> tile_page_key; // Per pool tile: the streamed page it holds, or NO_STREAMED_PAGE
+			// (a base tile / free tile) - only != sentinel tiles are LRU-evictable.
+	LocalVector<uint32_t> tile_last_used; // Per pool tile: last stream_frame it was sampled (LRU key).
+	uint32_t stream_frame = 0;
+
+	static uint64_t _page_key(uint32_t p_vt_id, uint32_t p_mip, uint32_t p_page_x, uint32_t p_page_y);
+	static uint32_t _indirection_mip_offset(uint32_t p_mip); // Byte offset of mip p_mip within one layer.
+	uint32_t _stream_alloc_tile(HashSet<uint32_t> &r_dirty_layers); // Alloc a tile, evicting LRU if full.
+	void _set_page_indirection(uint32_t p_vt_id, uint32_t p_mip, uint32_t p_page_x, uint32_t p_page_y, uint32_t p_tile, bool p_resident, HashSet<uint32_t> &r_dirty_layers);
 
 	// Blits one source page (PAGE_SIZE^2 of the given source mip at page coord, plus replicated
 	// borders -> STORED_PAGE_SIZE^2) into the pool tile. Implemented as a compute dispatch

@@ -144,10 +144,19 @@ bool VirtualTextureStorage::_ensure_initialized() {
 		ERR_FAIL_COND_V(vt_metadata_buffer.is_null(), false);
 	}
 
-	// Free-list of pool tiles (all free initially). Popped from the back; S0a never returns them.
-	free_tiles.resize(POOL_TILES_X * POOL_TILES_Y);
-	for (uint32_t i = 0; i < free_tiles.size(); i++) {
-		free_tiles[i] = (POOL_TILES_X * POOL_TILES_Y - 1) - i; // So index 0 is popped first.
+	// Free-list of pool tiles (all free initially). Popped from the back.
+	const uint32_t tile_count = POOL_TILES_X * POOL_TILES_Y;
+	free_tiles.resize(tile_count);
+	for (uint32_t i = 0; i < tile_count; i++) {
+		free_tiles[i] = (tile_count - 1) - i; // So index 0 is popped first.
+	}
+	// S0c per-tile streaming/LRU state. NO_STREAMED_PAGE = "not a streamed tile" (free or base), so
+	// only != sentinel tiles are eviction candidates.
+	tile_page_key.resize(tile_count);
+	tile_last_used.resize(tile_count);
+	for (uint32_t i = 0; i < tile_count; i++) {
+		tile_page_key[i] = NO_STREAMED_PAGE;
+		tile_last_used[i] = 0;
 	}
 
 	initialized = true;
@@ -261,13 +270,29 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 		int32_t pad2;
 	};
 
-	rd->draw_command_begin_label("VT register (resident blit)");
+	// S0c: make only the always-resident coarse base resident now - from the finest mip whose page
+	// grid is a single page, up to the coarsest. Finer mips stream in on demand from GPU feedback and
+	// evict under the pool budget. For a single-mip texture this resolves to mip 0 = the whole texture,
+	// i.e. S0a's "everything resident" behaviour, unchanged.
+	uint32_t always_resident_from = mip_count - 1;
+	for (uint32_t m = 0; m < mip_count; m++) {
+		uint32_t mw = MAX(width >> m, 1u);
+		uint32_t mh = MAX(height >> m, 1u);
+		uint32_t pgx = (mw + PAGE_SIZE - 1) / PAGE_SIZE;
+		uint32_t pgy = (mh + PAGE_SIZE - 1) / PAGE_SIZE;
+		if (pgx * pgy <= 1) {
+			always_resident_from = m;
+			break;
+		}
+	}
+
+	rd->draw_command_begin_label("VT register (resident base blit)");
 	RD::ComputeListID cl = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(cl, blit_pipeline);
 	rd->compute_list_bind_uniform_set(cl, blit_set, 0);
 
 	bool out_of_tiles = false;
-	for (uint32_t m = 0; m < mip_count && !out_of_tiles; m++) {
+	for (uint32_t m = always_resident_from; m < mip_count && !out_of_tiles; m++) {
 		uint32_t mip_w = MAX(width >> m, 1u);
 		uint32_t mip_h = MAX(height >> m, 1u);
 		uint32_t ind_dim = MAX(INDIRECTION_DIM >> m, 1u);
@@ -278,7 +303,7 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 			for (uint32_t px = 0; px < pages_x; px++) {
 				uint32_t tile = _allocate_tile();
 				if (tile == 0xFFFFFFFF) {
-					WARN_PRINT_ONCE("VirtualTextureStorage: page pool full while making a texture resident (S0a holds everything resident - this is expected at scene scale and is what S0c's eviction fixes). Remaining pages fall back to not-resident.");
+					WARN_PRINT_ONCE("VirtualTextureStorage: page pool full while making the always-resident base resident - the resident base across all virtual textures exceeds the pool. Raise POOL_TILES or reduce the base mip footprint. Remaining base pages fall back to not-resident.");
 					out_of_tiles = true;
 					break;
 				}
@@ -318,8 +343,13 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 	meta.width = width;
 	meta.height = height;
 	meta.mip_count = mip_count;
-	meta.resident_mip_floor = 0; // S0a: everything resident.
+	meta.resident_mip_floor = always_resident_from; // mips >= this are the always-resident base.
 	rd->buffer_update(vt_metadata_buffer, vt_id * sizeof(VTMetadataGPU), sizeof(VTMetadataGPU), &meta);
+
+	// Keep a CPU shadow of the page table + the floor so update_streaming() can patch individual page
+	// texels (resident on stream-in, not-resident on eviction) and re-upload just the changed layers.
+	vt.resident_mip_floor = always_resident_from;
+	vt.indirection_cpu = indirection_data;
 
 	virtual_textures.push_back(vt);
 	source_rid_to_vt_id[p_source_rd_texture] = vt_id;
@@ -413,4 +443,181 @@ Vector<VirtualTextureStorage::PageRequest> VirtualTextureStorage::read_feedback_
 		requests.push_back(r);
 	}
 	return requests;
+}
+
+uint64_t VirtualTextureStorage::_page_key(uint32_t p_vt_id, uint32_t p_mip, uint32_t p_page_x, uint32_t p_page_y) {
+	return (uint64_t(p_vt_id) << 40) | (uint64_t(p_mip) << 32) | (uint64_t(p_page_y) << 16) | uint64_t(p_page_x);
+}
+
+uint32_t VirtualTextureStorage::_indirection_mip_offset(uint32_t p_mip) {
+	uint32_t off = 0;
+	for (uint32_t m = 0; m < p_mip; m++) {
+		uint32_t dim = MAX(INDIRECTION_DIM >> m, 1u);
+		off += dim * dim * 4; // RGBA8_UINT
+	}
+	return off;
+}
+
+void VirtualTextureStorage::_set_page_indirection(uint32_t p_vt_id, uint32_t p_mip, uint32_t p_page_x, uint32_t p_page_y, uint32_t p_tile, bool p_resident, HashSet<uint32_t> &r_dirty_layers) {
+	if (p_vt_id >= virtual_textures.size()) {
+		return;
+	}
+	VirtualTexture &vt = virtual_textures[p_vt_id];
+	uint32_t ind_dim = MAX(INDIRECTION_DIM >> p_mip, 1u);
+	uint32_t offset = _indirection_mip_offset(p_mip) + (p_page_y * ind_dim + p_page_x) * 4;
+	if (offset + 4 > (uint32_t)vt.indirection_cpu.size()) {
+		return;
+	}
+	uint8_t *texel = vt.indirection_cpu.ptrw() + offset;
+	if (p_resident) {
+		texel[0] = uint8_t(p_tile % POOL_TILES_X);
+		texel[1] = uint8_t(p_tile / POOL_TILES_X);
+		texel[2] = 1; // resident
+		texel[3] = 0;
+	} else {
+		texel[0] = texel[1] = texel[2] = texel[3] = 0; // not resident
+	}
+	r_dirty_layers.insert(p_vt_id);
+}
+
+uint32_t VirtualTextureStorage::_stream_alloc_tile(HashSet<uint32_t> &r_dirty_layers) {
+	uint32_t tile = _allocate_tile();
+	if (tile != 0xFFFFFFFF) {
+		return tile;
+	}
+	// Pool full: evict the least-recently-used streamed tile that wasn't sampled THIS frame (so this
+	// frame's working set is never evicted - if nothing older is evictable, the page just doesn't
+	// stream this frame and the shader keeps using the coarser resident fallback).
+	uint32_t lru_tile = 0xFFFFFFFF;
+	uint32_t lru_frame = 0xFFFFFFFF;
+	for (uint32_t t = 0; t < tile_page_key.size(); t++) {
+		if (tile_page_key[t] == NO_STREAMED_PAGE || tile_last_used[t] >= stream_frame) {
+			continue;
+		}
+		if (tile_last_used[t] < lru_frame) {
+			lru_frame = tile_last_used[t];
+			lru_tile = t;
+		}
+	}
+	if (lru_tile == 0xFFFFFFFF) {
+		return 0xFFFFFFFF;
+	}
+	uint64_t key = tile_page_key[lru_tile];
+	_set_page_indirection(uint32_t(key >> 40), uint32_t((key >> 32) & 0xFFu), uint32_t(key & 0xFFFFu), uint32_t((key >> 16) & 0xFFFFu), 0, false, r_dirty_layers);
+	streamed_page_to_tile.erase(key);
+	tile_page_key[lru_tile] = NO_STREAMED_PAGE;
+	_free_tile(lru_tile);
+	return _allocate_tile();
+}
+
+void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_requests) {
+	if (!initialized || p_requests.is_empty()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	stream_frame++;
+	HashSet<uint32_t> dirty_layers;
+
+	struct StreamOp {
+		uint32_t vt_id;
+		uint32_t mip;
+		uint32_t page_x;
+		uint32_t page_y;
+		uint32_t tile;
+		RID source;
+	};
+	LocalVector<StreamOp> ops;
+	uint32_t streamed = 0;
+
+	for (int i = 0; i < p_requests.size(); i++) {
+		const PageRequest &req = p_requests[i];
+		if (req.vt_id >= virtual_textures.size()) {
+			continue;
+		}
+		VirtualTexture &vt = virtual_textures[req.vt_id];
+		if (vt.source.is_null() || req.mip >= vt.resident_mip_floor) {
+			continue; // invalid, or an always-resident base mip
+		}
+		uint64_t key = _page_key(req.vt_id, req.mip, req.page_x, req.page_y);
+		HashMap<uint64_t, uint32_t>::Iterator it = streamed_page_to_tile.find(key);
+		if (it != streamed_page_to_tile.end()) {
+			tile_last_used[it->value] = stream_frame; // already resident - touch so it survives eviction
+			continue;
+		}
+		if (streamed >= MAX_STREAMS_PER_FRAME) {
+			continue;
+		}
+		uint32_t tile = _stream_alloc_tile(dirty_layers);
+		if (tile == 0xFFFFFFFF) {
+			continue; // pool saturated by this frame's own working set; fallback covers it
+		}
+		streamed_page_to_tile[key] = tile;
+		tile_page_key[tile] = key;
+		tile_last_used[tile] = stream_frame;
+		_set_page_indirection(req.vt_id, req.mip, req.page_x, req.page_y, tile, true, dirty_layers);
+
+		StreamOp op;
+		op.vt_id = req.vt_id;
+		op.mip = req.mip;
+		op.page_x = req.page_x;
+		op.page_y = req.page_y;
+		op.tile = tile;
+		op.source = vt.source;
+		ops.push_back(op);
+		streamed++;
+	}
+
+	// Blit all newly-resident pages in one compute list. Uniform sets (one per distinct source) must
+	// be created BEFORE the list (uniform_set_create can't run inside an active compute list).
+	if (!ops.is_empty()) {
+		HashMap<RID, RID> source_sets;
+		Vector<RID> sets_to_free;
+		for (uint32_t i = 0; i < ops.size(); i++) {
+			if (!source_sets.has(ops[i].source)) {
+				RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>{ blit_source_sampler, ops[i].source });
+				RD::Uniform u_pool(RD::UNIFORM_TYPE_IMAGE, 1, page_pool_texture);
+				Vector<RD::Uniform> us;
+				us.push_back(u_source);
+				us.push_back(u_pool);
+				RID set = rd->uniform_set_create(us, blit_shader_rid, 0);
+				source_sets[ops[i].source] = set;
+				sets_to_free.push_back(set);
+			}
+		}
+		struct BlitPush {
+			int32_t src_page_origin[2];
+			int32_t pool_tile_origin[2];
+			int32_t src_mip;
+			int32_t pad0;
+			int32_t pad1;
+			int32_t pad2;
+		};
+		rd->draw_command_begin_label("VT stream-in blit");
+		RD::ComputeListID cl = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(cl, blit_pipeline);
+		for (uint32_t i = 0; i < ops.size(); i++) {
+			rd->compute_list_bind_uniform_set(cl, source_sets[ops[i].source], 0);
+			uint32_t tile_x = ops[i].tile % POOL_TILES_X;
+			uint32_t tile_y = ops[i].tile / POOL_TILES_X;
+			BlitPush push;
+			push.src_page_origin[0] = int32_t(ops[i].page_x * PAGE_SIZE);
+			push.src_page_origin[1] = int32_t(ops[i].page_y * PAGE_SIZE);
+			push.pool_tile_origin[0] = int32_t(tile_x * STORED_PAGE_SIZE);
+			push.pool_tile_origin[1] = int32_t(tile_y * STORED_PAGE_SIZE);
+			push.src_mip = int32_t(ops[i].mip);
+			push.pad0 = push.pad1 = push.pad2 = 0;
+			rd->compute_list_set_push_constant(cl, &push, sizeof(BlitPush));
+			rd->compute_list_dispatch_threads(cl, STORED_PAGE_SIZE, STORED_PAGE_SIZE, 1);
+		}
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+		for (int i = 0; i < sets_to_free.size(); i++) {
+			rd->free_rid(sets_to_free[i]);
+		}
+	}
+
+	// Re-upload just the indirection layers whose page table changed (stream-ins + evictions).
+	for (const uint32_t &vt_id : dirty_layers) {
+		rd->texture_update(indirection_texture, vt_id, virtual_textures[vt_id].indirection_cpu);
+	}
 }

@@ -413,17 +413,25 @@ const float VT_POOL_TEXELS = float(VT_POOL_TILES_X) * VT_STORED_PAGE_SIZE; // po
 // wrap boundary, acceptable for S0a (none in the no-op content).
 vec4 vt_sample_mip(uint vt_id, vec2 uv, int mip) {
 	VTMeta m = vt_meta.data[vt_id];
-	int max_mip = int(min(m.mip_count, uint(VT_INDIRECTION_MIPS))) - 1;
-	mip = clamp(mip, int(m.resident_mip_floor), max(max_mip, 0));
+	int max_mip = max(int(min(m.mip_count, uint(VT_INDIRECTION_MIPS))) - 1, 0);
+	int floor_mip = int(m.resident_mip_floor); // mips >= this are always resident (the streaming base).
+	mip = clamp(mip, 0, max_mip);
 
-	vec2 mip_size = vec2(max(ivec2(int(m.width) >> mip, int(m.height) >> mip), ivec2(1)));
-	vec2 texel_coord = fract(uv) * mip_size; // fractional texel position within the mip
+	ivec2 mip_size = max(ivec2(int(m.width) >> mip, int(m.height) >> mip), ivec2(1));
+	vec2 texel_coord = fract(uv) * vec2(mip_size); // fractional texel position within the mip
 	ivec2 page = ivec2(texel_coord) / int(VT_PAGE_SIZE);
-
 	uvec4 entry = texelFetch(usampler2DArray(vt_indirection, vt_point_sampler), ivec3(page, int(vt_id)), mip);
-	// entry.z == 0 -> not resident. S0a keeps everything resident, so this is only reached if the pool
-	// overflowed at registration; sampling tile (entry.xy) then is harmless. S0c walks to a coarser
-	// resident mip here instead.
+
+	// S0c streaming fallback: a finer page may not be resident yet (still streaming, or evicted). Drop
+	// to the always-resident floor mip (coarser, never a hole) - entry.z != 0 means resident. The
+	// feedback path still reports the FINE mip the fragment wanted, so it streams in for next frame.
+	if (entry.z == 0u && mip < floor_mip) {
+		mip = floor_mip;
+		mip_size = max(ivec2(int(m.width) >> mip, int(m.height) >> mip), ivec2(1));
+		texel_coord = fract(uv) * vec2(mip_size);
+		page = ivec2(texel_coord) / int(VT_PAGE_SIZE);
+		entry = texelFetch(usampler2DArray(vt_indirection, vt_point_sampler), ivec3(page, int(vt_id)), mip);
+	}
 
 	vec2 in_page = texel_coord - vec2(page * int(VT_PAGE_SIZE)); // [0, VT_PAGE_SIZE), fractional kept
 	vec2 pool_texel = vec2(entry.xy) * VT_STORED_PAGE_SIZE + vec2(VT_PAGE_BORDER) + in_page;

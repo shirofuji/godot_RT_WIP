@@ -1262,6 +1262,115 @@ void test_virtual_texture_render_and_feedback() {
 	rd->free_rid(source);
 }
 
+// S0c: registers a MIPPED virtual texture (so its fine mips are NOT in the always-resident base),
+// requests a fine page, runs the streaming drain, and verifies via GPU readback that the page became
+// resident in the page table AND that its pool tile holds the correct source mip - i.e. on-demand
+// streaming + the page-table patch + the blit all work. Deterministic (no rendering); only with
+// --vt-enable (register/streaming run regardless of the flag, but it keeps this grouped with the VT
+// path - the backend works flag-independently, like the S0a/S0b backend tests).
+void test_virtual_texture_streaming() {
+	RendererRD::VirtualTextureStorage *vts = RendererRD::VirtualTextureStorage::get_singleton();
+	if (vts == nullptr) {
+		check(false, "VT streaming: VirtualTextureStorage singleton exists");
+		return;
+	}
+	RD *rd = RD::get_singleton();
+
+	// 512x512, 4 explicit mips, a distinct solid colour per mip (so a readback identifies which mip a
+	// pool tile holds). Mip 2 (128px) is a single page, so the always-resident base is mips 2-3 and
+	// mips 0-1 stream on demand.
+	const uint32_t TEX = 512;
+	const uint32_t MIPS = 4;
+	const uint8_t mip_colors[4][3] = { { 230, 30, 30 }, { 30, 230, 30 }, { 30, 30, 230 }, { 200, 200, 30 } };
+	Vector<uint8_t> data;
+	{
+		uint32_t total = 0;
+		for (uint32_t m = 0; m < MIPS; m++) {
+			uint32_t d = TEX >> m;
+			total += d * d * 4;
+		}
+		data.resize_initialized(total);
+		uint8_t *p = data.ptrw();
+		uint32_t off = 0;
+		for (uint32_t m = 0; m < MIPS; m++) {
+			uint32_t d = TEX >> m;
+			for (uint32_t i = 0; i < d * d; i++) {
+				p[off + i * 4 + 0] = mip_colors[m][0];
+				p[off + i * 4 + 1] = mip_colors[m][1];
+				p[off + i * 4 + 2] = mip_colors[m][2];
+				p[off + i * 4 + 3] = 255;
+			}
+			off += d * d * 4;
+		}
+	}
+	RD::TextureFormat tf;
+	tf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	tf.width = TEX;
+	tf.height = TEX;
+	tf.mipmaps = MIPS;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT;
+	Vector<Vector<uint8_t>> layers;
+	layers.push_back(data);
+	RID source = rd->texture_create(tf, RD::TextureView(), layers);
+	uint32_t vt_id = vts->register_virtual_texture(source);
+	check(vt_id != 0xFFFFFFFFu, "VT streaming: mipped source registered");
+	if (vt_id == 0xFFFFFFFFu) {
+		rd->free_rid(source);
+		return;
+	}
+
+	const uint32_t IND_DIM = RendererRD::VirtualTextureStorage::INDIRECTION_DIM;
+	RID ind_rid = vts->get_indirection_texture_rid();
+
+	// Pick a fine mip-0 page (mip 0 is streamable, not in the base). Indirection texel for mip 0 page
+	// (px,py) lives at (py*IND_DIM + px)*4 (mip 0 is the first sub-image of the layer).
+	const uint32_t px = 1, py = 1;
+	uint32_t texel_off = (py * IND_DIM + px) * 4;
+
+	Vector<uint8_t> ind_before = rd->texture_get_data(ind_rid, vt_id);
+	bool not_resident_before = ((uint32_t)ind_before.size() > texel_off + 3) && ind_before[texel_off + 2] == 0;
+	check(not_resident_before, "VT streaming: the fine mip-0 page is NOT resident before streaming (base-only)");
+
+	RendererRD::VirtualTextureStorage::PageRequest req;
+	req.vt_id = vt_id;
+	req.mip = 0;
+	req.page_x = px;
+	req.page_y = py;
+	Vector<RendererRD::VirtualTextureStorage::PageRequest> reqs;
+	reqs.push_back(req);
+	vts->update_streaming(reqs);
+
+	Vector<uint8_t> ind_after = rd->texture_get_data(ind_rid, vt_id);
+	bool resident_after = ((uint32_t)ind_after.size() > texel_off + 3) && ind_after[texel_off + 2] == 1;
+	check(resident_after, "VT streaming: the requested fine page is resident after update_streaming (on-demand stream-in)");
+
+	// The streamed tile must hold mip 0's colour (red) - proves the blit copied the right mip.
+	bool tile_has_mip0 = false;
+	if (resident_after) {
+		uint32_t tile_x = ind_after[texel_off + 0];
+		uint32_t tile_y = ind_after[texel_off + 1];
+		const uint32_t STORED = RendererRD::VirtualTextureStorage::STORED_PAGE_SIZE;
+		const uint32_t BORDER = RendererRD::VirtualTextureStorage::PAGE_BORDER;
+		RD::TextureFormat ttf;
+		ttf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+		ttf.width = STORED;
+		ttf.height = STORED;
+		ttf.usage_bits = RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		RID tile_tex = rd->texture_create(ttf, RD::TextureView());
+		rd->texture_copy(vts->get_page_pool_texture_rid(), tile_tex, Vector3(tile_x * STORED, tile_y * STORED, 0), Vector3(0, 0, 0), Vector3(STORED, STORED, 1), 0, 0, 0, 0);
+		Vector<uint8_t> td = rd->texture_get_data(tile_tex, 0);
+		uint32_t cc = ((BORDER + 64) * STORED + (BORDER + 64)) * 4; // a content texel inside the page
+		if ((uint32_t)td.size() > cc + 2) {
+			tile_has_mip0 = Math::abs((int)td[cc + 0] - (int)mip_colors[0][0]) < 12 && Math::abs((int)td[cc + 1] - (int)mip_colors[0][1]) < 12 && Math::abs((int)td[cc + 2] - (int)mip_colors[0][2]) < 12;
+		}
+		rd->free_rid(tile_tex);
+	}
+	check(tile_has_mip0, "VT streaming: the streamed pool tile holds the correct source mip 0 content (blit correct)");
+
+	vts->free_virtual_texture(vt_id);
+	rd->free_rid(source);
+}
+
 } // namespace
 
 void run_meshlet_selftest_if_requested() {
@@ -1279,6 +1388,7 @@ void run_meshlet_selftest_if_requested() {
 	test_meshlet_material_lookup_vs_cpu_reference();
 	test_virtual_texture_blit_and_indirection();
 	test_virtual_texture_render_and_feedback();
+	test_virtual_texture_streaming();
 	if (g_failures == 0) {
 		print_line("MESHLET_SELFTEST: all checks passed");
 	} else {
