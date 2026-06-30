@@ -169,7 +169,14 @@ void main() {
 	world_normal_interp = world_normal;
 	world_pos_interp = world_pos;
 	meshlet_index_interp = item.meshlet_index;
-	material_id_interp = instance_material_ids.data[item.instance_index];
+	// Per-instance material slot, with bit 31 repurposed as the "owns its own depth" flag (set
+	// CPU-side for plain INSTANCE_MESH meshlet objects, which are skipped from Forward+'s depth
+	// pre-pass so the late pass writes their depth alone - no self-tie, so no depth bias needed).
+	// Material slots are small indices, so bit 31 is always free. MultiMesh flora leaves it clear:
+	// it stays in the depth pre-pass and still needs the bias to win the tie (see below).
+	uint raw_material_id = instance_material_ids.data[item.instance_index];
+	bool owns_own_depth = (raw_material_id & 0x80000000u) != 0u;
+	material_id_interp = raw_material_id & 0x7FFFFFFFu;
 	instance_pos_interp = transform[3].xyz;
 	uv_interp = attrib.zw; // VertexAttributes packs uv in .zw (see the buffer's layout comment).
 
@@ -191,8 +198,13 @@ void main() {
 	// values. Scaling by gl_Position.w keeps the nudge a fixed fraction of NDC-Z regardless of
 	// distance, rather than a fixed absolute amount that would be too large up close and too
 	// small far away.
-	const float DEPTH_BIAS_NDC_FRACTION = 0.005;
-	gl_Position.z = min(gl_Position.z + DEPTH_BIAS_NDC_FRACTION * gl_Position.w, gl_Position.w);
+	// Bias is 0 for instances that own their own depth (skipped from Forward+'s depth pre-pass - the
+	// late pass writes their depth alone, so the color pass ties exactly against itself and a real
+	// depth-test against the world correctly occludes them: no holes, no see-through). MultiMesh flora
+	// stays in the depth pre-pass, so its color pass still has to out-bias Forward+'s slightly-different
+	// depth for the same surface - keep the ~0.005 band-aid only for those.
+	float depth_bias_ndc_fraction = owns_own_depth ? 0.0 : 0.005;
+	gl_Position.z = min(gl_Position.z + depth_bias_ndc_fraction * gl_Position.w, gl_Position.w);
 }
 
 #[fragment]

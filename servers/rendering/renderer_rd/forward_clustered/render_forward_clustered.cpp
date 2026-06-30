@@ -357,6 +357,17 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			continue;
 		}
 
+		// Also skip meshlet-replaceable INSTANCE_MESH surfaces in the main DEPTH pre-pass (PASS_MODE_DEPTH
+		// / _NORMAL_ROUGHNESS only - PASS_MODE_SHADOW is separate, so they still cast shadows). The meshlet
+		// late pass writes their depth itself with NO bias, so they own their depth cleanly: the color pass
+		// ties exactly against itself (no self-tie holes) and depth-tests against the real world depth (no
+		// see-through). In place, not a list rebuild, for the same repeat-grouping reason as above.
+		// INSTANCE_MESH only: MultiMesh flora stays in the depth pre-pass (it keeps the bias band-aid and
+		// its normal_roughness for screen-space SSAO/SVOGI - see the per-instance bias in meshlet_render.glsl).
+		if (meshlet_replace_default_active && (p_pass_mode == PASS_MODE_DEPTH || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI) && meshlet_replace_skip_set.has(const_cast<GeometryInstanceSurfaceDataCache *>(surf)) && surf->owner->data->base_type == RSE::INSTANCE_MESH) {
+			continue;
+		}
+
 		if (p_pass_mode == PASS_MODE_COLOR && surf->color_pass_inclusion_mask && (p_color_pass_flags & surf->color_pass_inclusion_mask) == 0) {
 			// Some surfaces can be repeated in multiple render lists. We exclude them from being rendered on the color pass based on the
 			// features supported by the pass compared to the exclusion mask.
@@ -2114,7 +2125,12 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		if (is_mesh) {
 			uint32_t instance_index = (uint32_t)meshlet_scan_instance_transforms.size();
 			meshlet_scan_instance_transforms.push_back(inst->transform);
-			meshlet_scan_material_ids.push_back(material_id);
+			// Bit 31 = "owns its own depth": plain INSTANCE_MESH meshlet objects are skipped from
+			// Forward+'s depth pre-pass (below), so the late pass writes their depth alone and the
+			// shader applies no depth bias - eliminating the self-tie holes + see-through. (Material
+			// slots are small, so bit 31 is always free.) MultiMesh flora below leaves it clear: it
+			// stays in the depth pre-pass and keeps the bias band-aid, unchanged.
+			meshlet_scan_material_ids.push_back(material_id | 0x80000000u);
 			RendererRD::MeshletCuller::InstanceMeshletRange r;
 			r.instance_index = instance_index;
 			r.meshlet_offset = range.offset;
