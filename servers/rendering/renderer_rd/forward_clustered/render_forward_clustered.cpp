@@ -1900,6 +1900,18 @@ uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_mater
 			data.uv1_offset[0] = o.x;
 			data.uv1_offset[1] = o.y;
 		}
+
+		// Alpha-scissor (cutout): BaseMaterial3D only declares the "alpha_scissor_threshold" shader
+		// uniform when its transparency mode is TRANSPARENCY_ALPHA_SCISSOR, so a non-NIL value here is
+		// a reliable "this is a cutout material" signal. Set flags bit 0 + the threshold so
+		// meshlet_render.glsl discards fully-transparent texels - the common case for foliage/flora,
+		// which otherwise renders as solid quads through the meshlet path. (Alpha-BLENDED materials
+		// are in RENDER_LIST_ALPHA, never scanned here, so this only ever applies to opaque/cutout.)
+		Variant alpha_scissor_v = material_storage->material_get_param(material_rid, "alpha_scissor_threshold");
+		if (alpha_scissor_v.get_type() != Variant::NIL) {
+			data.alpha_scissor_threshold = alpha_scissor_v;
+			data.flags |= 1u; // Bit 0 = alpha-scissor (matches meshlet_render.glsl's discard test).
+		}
 	}
 	// material_rid stays an invalid/default RID when p_material is null (no material assigned) -
 	// upload_material()'s RID-keyed dedup means every such instance shares one default slot.
@@ -2016,17 +2028,34 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 
 	meshlet_replace_default_active = replace_enabled;
 
+	// MultiMesh CLOD sub-toggle (independent of the main meshlet kill-switch above, so it can be
+	// turned off alone) + the per-MultiMesh CPU-expansion cap: above this many visible instances a
+	// MultiMesh falls back to full-detail Forward+ rather than expand on the CPU every frame.
+	bool multimesh_lod_enabled = replace_enabled && bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/multimesh_lod"));
+	const uint32_t MESHLET_MULTIMESH_MAX_INSTANCES = 1 << 14; // 16384
+
 	// Real per-frame instance/meshlet-range list, built from the real opaque render list - each
 	// element is one already-CPU-frustum-visible (instance, surface) pair (see
-	// GeometryInstanceSurfaceDataCache); only RSE::INSTANCE_MESH instances with baked meshlets on
-	// that surface are included (multimesh/particles/skeleton-deformed meshes are out of scope
-	// for this first pass, same LOD0-only simplicity as every other phase so far).
+	// GeometryInstanceSurfaceDataCache). RSE::INSTANCE_MESH instances are included directly;
+	// RSE::INSTANCE_MULTIMESH instances are expanded per-instance below (each gets its own LOD cut).
+	// Particles / skeleton-deformed meshes remain out of scope.
 	for (GeometryInstanceSurfaceDataCache *sdcache : render_list[p_list_type].elements) {
 		GeometryInstanceForwardClustered *inst = sdcache->owner;
-		if (!inst || !inst->data || inst->data->base_type != RSE::INSTANCE_MESH) {
+		if (!inst || !inst->data) {
 			continue;
 		}
-		RendererRD::MeshletStorage::Range range = mesh_storage->mesh_surface_get_meshlet_range(inst->data->base, sdcache->surface_index);
+		// The base MESH RID is inst->data->base for a plain mesh, but the shared mesh *inside* the
+		// multimesh for INSTANCE_MULTIMESH. Multimesh expansion is gated by multimesh_lod_enabled.
+		const bool is_mesh = inst->data->base_type == RSE::INSTANCE_MESH;
+		const bool is_multimesh = inst->data->base_type == RSE::INSTANCE_MULTIMESH;
+		if (!is_mesh && !(is_multimesh && multimesh_lod_enabled)) {
+			continue;
+		}
+		RID base_mesh_rid = is_mesh ? inst->data->base : mesh_storage->_multimesh_get_mesh(inst->data->base);
+		if (base_mesh_rid.is_null()) {
+			continue;
+		}
+		RendererRD::MeshletStorage::Range range = mesh_storage->mesh_surface_get_meshlet_range(base_mesh_rid, sdcache->surface_index);
 		if (range.count == 0) {
 			continue;
 		}
@@ -2063,7 +2092,7 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		} else if (sdcache->surface_index < inst->data->surface_materials.size() && inst->data->surface_materials[sdcache->surface_index].is_valid()) {
 			surface_material_rid = inst->data->surface_materials[sdcache->surface_index];
 		} else {
-			surface_material_rid = mesh_storage->mesh_surface_get_material(inst->data->base, sdcache->surface_index);
+			surface_material_rid = mesh_storage->mesh_surface_get_material(base_mesh_rid, sdcache->surface_index);
 		}
 		bool material_qualifies = true;
 		uint32_t material_id = _meshlet_resolve_material_id(surface_material_rid, material_qualifies);
@@ -2082,15 +2111,46 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 			continue;
 		}
 
-		uint32_t instance_index = (uint32_t)meshlet_scan_instance_transforms.size();
-		meshlet_scan_instance_transforms.push_back(inst->transform);
-		meshlet_scan_material_ids.push_back(material_id);
-		RendererRD::MeshletCuller::InstanceMeshletRange r;
-		r.instance_index = instance_index;
-		r.meshlet_offset = range.offset;
-		r.meshlet_count = range.count;
-		meshlet_scan_ranges.push_back(r);
-		meshlet_replace_skip_set.insert(sdcache);
+		if (is_mesh) {
+			uint32_t instance_index = (uint32_t)meshlet_scan_instance_transforms.size();
+			meshlet_scan_instance_transforms.push_back(inst->transform);
+			meshlet_scan_material_ids.push_back(material_id);
+			RendererRD::MeshletCuller::InstanceMeshletRange r;
+			r.instance_index = instance_index;
+			r.meshlet_offset = range.offset;
+			r.meshlet_count = range.count;
+			meshlet_scan_ranges.push_back(r);
+			meshlet_replace_skip_set.insert(sdcache);
+		} else {
+			// MultiMesh: expand each visible instance into its own transform + range (all sharing the
+			// base mesh's meshlet range), so each instance gets an independent per-instance LOD cut in
+			// the cull pass. World transform = the MultiMeshInstance node transform * the per-instance
+			// local transform. A pathologically large MultiMesh is capped and left OUT of skip_set, so
+			// it keeps rendering full-detail via normal Forward+ (GPU-driven expansion is the eventual
+			// fix for very high instance counts).
+			RID mm = inst->data->base;
+			int visible = mesh_storage->_multimesh_get_visible_instances(mm);
+			uint32_t count = (visible >= 0) ? (uint32_t)visible : (uint32_t)MAX(0, mesh_storage->_multimesh_get_instance_count(mm));
+			if (count == 0) {
+				continue;
+			}
+			if (count > MESHLET_MULTIMESH_MAX_INSTANCES) {
+				WARN_PRINT_ONCE(vformat("MultiMesh CLOD: a MultiMesh has %d visible instances, over the per-MultiMesh CPU-expansion cap (%d) - it falls back to full-detail Forward+. (GPU-driven expansion is the fix when flora scales this high.)", count, MESHLET_MULTIMESH_MAX_INSTANCES));
+				continue;
+			}
+			for (uint32_t i = 0; i < count; i++) {
+				Transform3D world_i = inst->transform * mesh_storage->_multimesh_instance_get_transform(mm, i);
+				uint32_t instance_index = (uint32_t)meshlet_scan_instance_transforms.size();
+				meshlet_scan_instance_transforms.push_back(world_i);
+				meshlet_scan_material_ids.push_back(material_id);
+				RendererRD::MeshletCuller::InstanceMeshletRange r;
+				r.instance_index = instance_index;
+				r.meshlet_offset = range.offset;
+				r.meshlet_count = range.count;
+				meshlet_scan_ranges.push_back(r);
+			}
+			meshlet_replace_skip_set.insert(sdcache);
+		}
 	}
 }
 
@@ -2296,6 +2356,16 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	RendererRD::HiZBuilder::HiZResult mid_hiz = hiz_builder->build_into(p_render_buffers, write_hiz_name, depth_tex, screen_size);
 
 	RendererRD::MeshletCuller::CullResult occlusion_result = meshlet_culler->occlude(transforms_buffer, frustum_result, mid_hiz.texture, mid_hiz.mip_count, camera_transform, projection, screen_size, MESHLET_LIVE_CAPACITY);
+
+	// --meshlet-lod-diag: flag-gated CLOD diagnostic (a GPU-readback stall, debug only). Shows the
+	// per-cluster LOD cut at work - instances= (scanned (instance,surface) ranges, including every
+	// expanded MultiMesh instance) stays fixed while visible_meshlets= drops as the camera pulls back
+	// and per-instance projected error shrinks below the threshold. The whole point of MultiMesh CLOD.
+	static bool meshlet_lod_diag = OS::get_singleton()->get_cmdline_args().find("--meshlet-lod-diag") != nullptr;
+	if (meshlet_lod_diag) {
+		uint32_t visible_meshlets = (uint32_t)meshlet_culler->debug_read_visible(occlusion_result).size();
+		print_line(vformat("MESHLET_LOD_DIAG: instances=%d visible_meshlets=%d", (int)meshlet_scan_ranges.size(), (int)visible_meshlets));
+	}
 
 	RendererRD::MeshletCuller::IndirectDrawResult draws = meshlet_culler->emit_indirect_draws(occlusion_result, MESHLET_LIVE_CAPACITY);
 

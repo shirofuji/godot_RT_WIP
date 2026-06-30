@@ -656,10 +656,21 @@ void main() {
 	// StandardMaterial3D uv1 transform applied to the interpolated mesh UV.
 	vec2 muv = uv_interp * mat.uv1_scale + mat.uv1_offset;
 
-	// Albedo texture modulates the base color factor.
+	// Albedo texture modulates the base color factor; its alpha feeds alpha-scissor below.
 	vec3 albedo = mat.albedo.rgb;
+	float alpha = mat.albedo.a;
 	if (mat.albedo_texture_index != MESHLET_TEXTURE_NONE) {
-		albedo *= texture(sampler2D(material_textures[mat.albedo_texture_index], material_sampler), muv).rgb;
+		vec4 albedo_tex = texture(sampler2D(material_textures[mat.albedo_texture_index], material_sampler), muv);
+		albedo *= albedo_tex.rgb;
+		alpha *= albedo_tex.a;
+	}
+
+	// Alpha-scissor (cutout) discard: flags bit 0 = alpha_scissor (set CPU-side from the material's
+	// TRANSPARENCY_ALPHA_SCISSOR mode, see _meshlet_resolve_material_id). Foliage/flora that uses
+	// cutout transparency renders real holes instead of solid quads. The meshlet path is opaque-only,
+	// so this is a hard discard (no blending) - exactly matching how Forward+ treats alpha-scissor.
+	if ((mat.flags & 1u) != 0u && alpha < mat.alpha_scissor_threshold) {
+		discard;
 	}
 
 	// Normal map -> world normal via the derivative-built TBN (no stored vertex tangents). Unpack the
@@ -718,7 +729,7 @@ void main() {
 	}
 
 	vec3 color = albedo * (1.0 - mat.metallic) * (diffuse_light + (ambient + gi_diffuse) * ao) + specular_light + mat.emission;
-	frag_color = vec4(color, mat.albedo.a);
+	frag_color = vec4(color, alpha);
 #endif
 	// MESHLET_DEPTH_ONLY: no color output at all - this variant targets a depth-only
 	// framebuffer (Forward+'s real depth pre-pass framebuffer, which has zero color
