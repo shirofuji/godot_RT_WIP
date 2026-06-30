@@ -32,6 +32,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
+#include "core/templates/hash_set.h"
 
 using namespace RendererRD;
 
@@ -62,6 +63,9 @@ VirtualTextureStorage::~VirtualTextureStorage() {
 		}
 		if (blit_source_sampler.is_valid()) {
 			rd->free_rid(blit_source_sampler);
+		}
+		if (feedback_image.is_valid()) {
+			rd->free_rid(feedback_image);
 		}
 		blit_shader.version_free(blit_shader_version);
 	}
@@ -348,4 +352,65 @@ RID VirtualTextureStorage::get_indirection_texture_rid() {
 RID VirtualTextureStorage::get_vt_metadata_buffer_rid() {
 	_ensure_initialized();
 	return vt_metadata_buffer;
+}
+
+RID VirtualTextureStorage::get_feedback_image(const Size2i &p_render_size) {
+	if (!_ensure_initialized()) {
+		return RID();
+	}
+	RD *rd = RD::get_singleton();
+	Size2i dims(MAX(1, (p_render_size.width + (int)FEEDBACK_TILE - 1) / (int)FEEDBACK_TILE),
+			MAX(1, (p_render_size.height + (int)FEEDBACK_TILE - 1) / (int)FEEDBACK_TILE));
+	if (!feedback_image.is_valid() || dims != feedback_dims) {
+		if (feedback_image.is_valid()) {
+			rd->free_rid(feedback_image);
+		}
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R32_UINT;
+		tf.width = dims.width;
+		tf.height = dims.height;
+		tf.texture_type = RD::TEXTURE_TYPE_2D;
+		tf.mipmaps = 1;
+		tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		feedback_image = rd->texture_create(tf, RD::TextureView());
+		feedback_dims = dims;
+	}
+	return feedback_image;
+}
+
+void VirtualTextureStorage::clear_feedback() {
+	if (feedback_image.is_null()) {
+		return;
+	}
+	// Reset every tile to 0xFFFFFFFF (= "no request"). texture_update is a texture op, so the caller
+	// must run this OUTSIDE any active draw/compute list (the renderer clears before draw_list_begin).
+	Vector<uint8_t> clear_data;
+	clear_data.resize_initialized(feedback_dims.width * feedback_dims.height * 4);
+	memset(clear_data.ptrw(), 0xFF, clear_data.size());
+	RD::get_singleton()->texture_update(feedback_image, 0, clear_data);
+}
+
+Vector<VirtualTextureStorage::PageRequest> VirtualTextureStorage::read_feedback_requests() {
+	Vector<PageRequest> requests;
+	if (feedback_image.is_null()) {
+		return requests;
+	}
+	Vector<uint8_t> data = RD::get_singleton()->texture_get_data(feedback_image, 0);
+	const uint32_t *p = (const uint32_t *)data.ptr();
+	uint32_t count = (uint32_t)data.size() / 4;
+	HashSet<uint32_t> seen; // Dedup identical (vt_id,mip,page) packed values across tiles.
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t v = p[i];
+		if (v == 0xFFFFFFFFu || seen.has(v)) {
+			continue;
+		}
+		seen.insert(v);
+		PageRequest r;
+		r.page_x = v & 0x3Fu;
+		r.page_y = (v >> 6) & 0x3Fu;
+		r.vt_id = (v >> 12) & 0xFFu;
+		r.mip = (v >> 20) & 0xFu;
+		requests.push_back(r);
+	}
+	return requests;
 }

@@ -1082,6 +1082,186 @@ void test_virtual_texture_blit_and_indirection() {
 	rd->free_rid(source);
 }
 
+// S0b: renders a sphere whose albedo is a virtual texture and verifies (1) sampleVirtual() actually
+// fetched the pool (the in-shader VT sampling that S0a never exercised), and (2) the GPU feedback
+// reported the page(s) sampled. Only meaningful with --vt-enable (the VT shader variant + feedback
+// only engage when is_enabled()); a no-op otherwise.
+void test_virtual_texture_render_and_feedback() {
+	if (!RendererRD::VirtualTextureStorage::is_enabled()) {
+		print_line("MESHLET_SELFTEST: (VT render+feedback test skipped - run with --vt-enable to exercise it)");
+		return;
+	}
+	RendererRD::MeshletStorage *storage = RendererRD::MeshletStorage::get_singleton();
+	RendererRD::MeshletCuller *culler = RendererRD::MeshletCuller::get_singleton();
+	RendererRD::HiZBuilder *hiz_builder = RendererRD::HiZBuilder::get_singleton();
+	RendererRD::MeshletRenderer *renderer = RendererRD::MeshletRenderer::get_singleton();
+	RendererRD::VirtualTextureStorage *vts = RendererRD::VirtualTextureStorage::get_singleton();
+	if (!storage || !culler || !hiz_builder || !renderer || !vts) {
+		check(false, "VT render: required singletons exist");
+		return;
+	}
+	RD *rd = RD::get_singleton();
+
+	// A solid, distinctly-blue source texture: a correct VT sample shows blue dominance; a failed one
+	// (returning the flat white albedo factor) would be grey/white.
+	const uint32_t TEX = 256;
+	Vector<uint8_t> tex_data;
+	tex_data.resize_initialized(TEX * TEX * 4);
+	{
+		uint8_t *p = tex_data.ptrw();
+		for (uint32_t i = 0; i < TEX * TEX; i++) {
+			p[i * 4 + 0] = 51; // ~0.20 R
+			p[i * 4 + 1] = 140; // ~0.55 G
+			p[i * 4 + 2] = 230; // ~0.90 B
+			p[i * 4 + 3] = 255;
+		}
+	}
+	RD::TextureFormat src_tf;
+	src_tf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	src_tf.width = TEX;
+	src_tf.height = TEX;
+	src_tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT;
+	Vector<Vector<uint8_t>> src_layers;
+	src_layers.push_back(tex_data);
+	RID source = rd->texture_create(src_tf, RD::TextureView(), src_layers);
+
+	uint32_t vt_id = vts->register_virtual_texture(source);
+	check(vt_id != 0xFFFFFFFFu, "VT render: source registered as a virtual texture");
+
+	RendererRD::MeshletStorage::MeshletMaterialGPU mat; // white albedo factor * the blue VT texture
+	mat.albedo_texture_index = vt_id;
+	uint32_t material_id = storage->upload_material(source, mat);
+	RID material_ids_buffer = rd->storage_buffer_create(sizeof(uint32_t));
+	rd->buffer_update(material_ids_buffer, 0, sizeof(uint32_t), &material_id);
+
+	PackedVector3Array vertices;
+	PackedInt32Array indices;
+	get_sphere_geometry(vertices, indices);
+	PackedInt32Array meshlet_vertices;
+	PackedByteArray meshlet_triangles;
+	Vector<SurfaceTool::MeshletBounds> bounds_st;
+	Vector<SurfaceTool::Meshlet> meshlets_st = SurfaceTool::build_meshlets(vertices, indices, 64, 124, 0.5f, meshlet_vertices, meshlet_triangles, bounds_st);
+	Vector<RenderingServerTypes::MeshletInfo> meshlets_info;
+	meshlets_info.resize(meshlets_st.size());
+	memcpy(meshlets_info.ptrw(), meshlets_st.ptr(), sizeof(SurfaceTool::Meshlet) * meshlets_st.size());
+	Vector<RenderingServerTypes::MeshletBoundsInfo> bounds_info;
+	bounds_info.resize(bounds_st.size());
+	memcpy(bounds_info.ptrw(), bounds_st.ptr(), sizeof(SurfaceTool::MeshletBounds) * bounds_st.size());
+	PackedVector3Array normals;
+	normals.resize(vertices.size());
+	for (int i = 0; i < vertices.size(); i++) {
+		normals.write[i] = vertices[i].normalized();
+	}
+	RendererRD::MeshletStorage::UploadResult upload = storage->upload_mesh_meshlets(vertices, normals, PackedVector2Array(), meshlets_info, meshlet_vertices, meshlet_triangles, bounds_info);
+
+	Transform3D instance_transform(Basis(), Vector3(0, 0, 0));
+	LocalVector<float> transforms_data;
+	transforms_data.resize(16);
+	transform_to_mat4_columns(instance_transform, &transforms_data[0]);
+	RID transforms_buffer = rd->storage_buffer_create(transforms_data.size() * sizeof(float));
+	rd->buffer_update(transforms_buffer, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
+
+	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> ranges;
+	RendererRD::MeshletCuller::InstanceMeshletRange r;
+	r.instance_index = 0;
+	r.meshlet_offset = upload.meshlet_range.offset;
+	r.meshlet_count = upload.meshlet_range.count;
+	ranges.push_back(r);
+
+	Transform3D camera_xform(Basis(), Vector3(0, 0, 5));
+	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 0.05f, 20.0f);
+	Projection depth_correction;
+	depth_correction.set_depth_correction();
+	Projection projection = depth_correction * raw_projection;
+	Vector<Plane> planes = projection.get_projection_planes(camera_xform);
+	RendererRD::MeshletCuller::CullResult frustum_result = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin);
+
+	const int hiz_source_size = 64;
+	RD::TextureFormat dtf;
+	dtf.format = RD::DATA_FORMAT_R32_SFLOAT;
+	dtf.width = hiz_source_size;
+	dtf.height = hiz_source_size;
+	dtf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+	RID far_depth = rd->texture_create(dtf, RD::TextureView());
+	Vector<uint8_t> far_bytes;
+	far_bytes.resize_initialized(hiz_source_size * hiz_source_size * sizeof(float)); // 0.0 = far (reversed-Z)
+	rd->texture_update(far_depth, 0, far_bytes);
+	Ref<RenderSceneBuffersRD> hiz_rb;
+	hiz_rb.instantiate();
+	RendererRD::HiZBuilder::HiZResult hiz = hiz_builder->build_into(hiz_rb, RB_MESHLET_HIZ_A, far_depth, Size2i(hiz_source_size, hiz_source_size));
+	RendererRD::MeshletCuller::CullResult occlusion_result = culler->occlude(transforms_buffer, frustum_result, hiz.texture, hiz.mip_count, camera_xform, projection, Size2i(hiz_source_size, hiz_source_size));
+	RendererRD::MeshletCuller::IndirectDrawResult draws = culler->emit_indirect_draws(occlusion_result);
+
+	const int render_size = 256;
+	RD::TextureFormat color_tf;
+	color_tf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	color_tf.width = render_size;
+	color_tf.height = render_size;
+	color_tf.usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+	RID color_texture = rd->texture_create(color_tf, RD::TextureView());
+	RD::TextureFormat depth_tf2;
+	depth_tf2.format = RD::DATA_FORMAT_D32_SFLOAT;
+	depth_tf2.width = render_size;
+	depth_tf2.height = render_size;
+	depth_tf2.usage_bits = RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	RID depth_texture = rd->texture_create(depth_tf2, RD::TextureView());
+	Vector<RID> attachments;
+	attachments.push_back(color_texture);
+	attachments.push_back(depth_texture);
+	RID framebuffer = rd->framebuffer_create(attachments);
+	RD::FramebufferFormatID framebuffer_format = rd->framebuffer_get_format(framebuffer);
+
+	struct {
+		float position[3] = { 0, 0, 0 };
+		float inv_radius = 0;
+		float direction[3] = { 0, 0, -1 };
+		float attenuation = 1;
+		float color[3] = { (float)Math::PI, (float)Math::PI, (float)Math::PI };
+		float size = 0;
+		float cone_angle = 1;
+		float cone_attenuation = 1;
+		uint32_t is_directional = 1;
+		uint32_t pad0 = 0;
+	} light_data;
+	RID lights_buffer = rd->storage_buffer_create(sizeof(light_data));
+	rd->buffer_update(lights_buffer, 0, sizeof(light_data), &light_data);
+
+	renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, framebuffer, framebuffer_format, Rect2i(0, 0, render_size, render_size), projection, camera_xform, lights_buffer, 1);
+
+	// (1) sampleVirtual fetched the pool: the center pixel reflects the BLUE texture (b clearly > r),
+	// not the flat white albedo factor.
+	Vector<uint8_t> pixels = rd->texture_get_data(color_texture, 0);
+	bool sampled_blue = false;
+	if ((int)pixels.size() == render_size * render_size * 4) {
+		int c = (render_size / 2 * render_size + render_size / 2) * 4;
+		sampled_blue = (pixels[c + 2] > pixels[c + 0] + 30) && pixels[c + 2] > 80;
+	}
+	check(sampled_blue, "VT render: center pixel shows the blue VT albedo texture (sampleVirtual fetched the pool, not the flat factor)");
+
+	// (2) GPU feedback reported page requests, including for the rendered texture's vt_id.
+	Vector<RendererRD::VirtualTextureStorage::PageRequest> reqs = vts->read_feedback_requests();
+	bool feedback_has_vt = false;
+	for (int i = 0; i < reqs.size(); i++) {
+		if (reqs[i].vt_id == vt_id) {
+			feedback_has_vt = true;
+			break;
+		}
+	}
+	check(!reqs.is_empty(), "VT feedback: the render reported at least one page request");
+	check(feedback_has_vt, "VT feedback: the requested pages include the rendered texture's vt_id");
+
+	rd->free_rid(lights_buffer);
+	rd->free_rid(framebuffer);
+	rd->free_rid(depth_texture);
+	rd->free_rid(color_texture);
+	rd->free_rid(far_depth);
+	rd->free_rid(transforms_buffer);
+	rd->free_rid(material_ids_buffer);
+	storage->free_mesh_meshlets(upload);
+	vts->free_virtual_texture(vt_id);
+	rd->free_rid(source);
+}
+
 } // namespace
 
 void run_meshlet_selftest_if_requested() {
@@ -1098,6 +1278,7 @@ void run_meshlet_selftest_if_requested() {
 	test_meshlet_render_visual_proof();
 	test_meshlet_material_lookup_vs_cpu_reference();
 	test_virtual_texture_blit_and_indirection();
+	test_virtual_texture_render_and_feedback();
 	if (g_failures == 0) {
 		print_line("MESHLET_SELFTEST: all checks passed");
 	} else {

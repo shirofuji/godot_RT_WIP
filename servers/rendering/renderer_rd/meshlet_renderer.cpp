@@ -246,6 +246,17 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 
 	_ensure_pipeline(p_framebuffer_format, p_depth_only, use_virtual_textures);
 
+	// S0b: the VT shader variant writes per-screen-tile page feedback to binding 18. Fetch + clear it
+	// before the draw list opens (texture_update can't run inside a draw list). The caller drains it
+	// (VirtualTextureStorage::read_feedback_requests) when it wants the page set; here we just keep it
+	// bound and freshly cleared each pass.
+	RID vt_feedback_image;
+	if (use_virtual_textures) {
+		VirtualTextureStorage *vts = VirtualTextureStorage::get_singleton();
+		vt_feedback_image = vts->get_feedback_image(p_viewport.size);
+		vts->clear_feedback();
+	}
+
 	RD::DrawListID draw_list;
 	if (p_clear) {
 		// 0.0 = far under Godot RD's reversed-Z convention (near=1.0, far=0.0) - matches the
@@ -393,6 +404,7 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 15, vts->get_indirection_texture_rid()));
 			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 16, vt_indirection_sampler));
 			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, vts->get_vt_metadata_buffer_rid()));
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 18, vt_feedback_image)); // S0b: page-request feedback.
 		} else if (!p_depth_only) {
 			// Binding 13/14: the material-texture descriptor array + its sampler. The fragment shader
 			// indexes material_textures[mat.*_texture_index]. The array is a fixed size

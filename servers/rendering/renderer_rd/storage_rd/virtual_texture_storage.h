@@ -96,6 +96,20 @@ public:
 	static constexpr uint32_t INDIRECTION_DIM = MAX_TEXTURE_SIZE / PAGE_SIZE; // 64 pages per side.
 	static constexpr uint32_t INDIRECTION_MIPS = 7; // log2(64) + 1: 64,32,16,8,4,2,1.
 
+	// S0b GPU feedback: one r32ui texel per FEEDBACK_TILE-pixel screen tile (MUST match
+	// VT_FEEDBACK_TILE in meshlet_render.glsl). Packed (mip<<20 | vt_id<<12 | page_y<<6 | page_x);
+	// 0xFFFFFFFF = no request.
+	static constexpr uint32_t FEEDBACK_TILE = 16;
+
+	// One decoded feedback entry: a (vt_id, mip, page) the rendered frame actually sampled. S0c
+	// streams these in; S0b just reports/asserts them.
+	struct PageRequest {
+		uint32_t vt_id = 0;
+		uint32_t mip = 0;
+		uint32_t page_x = 0;
+		uint32_t page_y = 0;
+	};
+
 	static VirtualTextureStorage *get_singleton();
 
 	// The single kill-switch consulted by every VT integration point (texture registration in
@@ -129,6 +143,16 @@ public:
 	RID get_indirection_texture_rid();
 	RID get_vt_metadata_buffer_rid(); // Per-vt_id VTMetadataGPU (base size + mip count) for the shader.
 
+	// S0b GPU feedback. The renderer binds the feedback image (binding 18, r32ui) in the VT shader
+	// variant; get_feedback_image() lazily (re)creates it sized to the render target in FEEDBACK_TILE
+	// tiles. clear_feedback() resets it to "no request" (call before the pass; it's a texture op, so
+	// not inside a draw list). read_feedback_requests() reads it back and decodes the deduped set of
+	// pages the frame sampled - a GPU-readback stall, so S0b/tests call it directly; S0c reads last
+	// frame's to avoid the stall.
+	RID get_feedback_image(const Size2i &p_render_size);
+	void clear_feedback();
+	Vector<PageRequest> read_feedback_requests();
+
 	// std430, mirrored by the shader's VTMeta struct. One entry per registered virtual texture,
 	// indexed by vt_id; lets the shader recover each mip's texel dimensions to map a UV to a page +
 	// in-page offset. resident_mip_floor is the coarsest mip guaranteed resident (S0a: always 0,
@@ -154,6 +178,9 @@ private:
 	RID page_pool_texture; // 2D, (POOL_TILES_X*STORED_PAGE_SIZE) x (POOL_TILES_Y*STORED_PAGE_SIZE).
 	RID indirection_texture; // 2D_ARRAY, MAX_VIRTUAL_TEXTURES layers, mipped to the page-grid chain.
 	RID vt_metadata_buffer; // Storage buffer of VTMetadataGPU[MAX_VIRTUAL_TEXTURES].
+
+	RID feedback_image; // S0b: r32ui, render size / FEEDBACK_TILE; one (vt_id,mip,page) per tile.
+	Size2i feedback_dims; // Current feedback image dimensions, in tiles.
 
 	// Blit pipeline (virtual_texture_blit.glsl): copies a source page -> a pool tile with borders.
 	VirtualTextureBlitShaderRD blit_shader;

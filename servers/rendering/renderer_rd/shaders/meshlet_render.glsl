@@ -381,6 +381,30 @@ layout(set = 0, binding = 17, std430) restrict readonly buffer VTMetadata {
 }
 vt_meta;
 
+// S0b GPU feedback: one r32ui texel per VT_FEEDBACK_TILE-pixel screen tile records which
+// (vt_id, mip, page) that tile sampled, so the CPU can stream exactly the pages on screen (S0c).
+// Packing (mip in the high bits so atomicMin keeps the FINEST mip a tile needs):
+//   bits 0-5 page_x | 6-11 page_y | 12-19 vt_id | 20-23 mip.  0xFFFFFFFF (cleared) = no request.
+// MUST match VirtualTextureStorage's decode + VT_FEEDBACK_TILE.
+#define VT_FEEDBACK_TILE 16
+layout(r32ui, set = 0, binding = 18) uniform restrict uimage2D vt_feedback;
+
+void vt_write_feedback(uint vt_id, vec2 uv) {
+	VTMeta m = vt_meta.data[vt_id];
+	vec2 tex_size = vec2(max(m.width, 1u), max(m.height, 1u));
+	vec2 dx = dFdx(uv) * tex_size;
+	vec2 dy = dFdy(uv) * tex_size;
+	float lod = max(0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-8)), 0.0);
+	int max_mip = int(min(m.mip_count, uint(VT_INDIRECTION_MIPS))) - 1;
+	int mip = clamp(int(floor(lod)), 0, max(max_mip, 0));
+	ivec2 mip_size = max(ivec2(int(m.width) >> mip, int(m.height) >> mip), ivec2(1));
+	ivec2 page = ivec2(fract(uv) * vec2(mip_size)) / int(VT_PAGE_SIZE);
+	uint packed = (uint(mip) << 20) | (vt_id << 12) | (uint(page.y) << 6) | uint(page.x);
+	imageAtomicMin(vt_feedback, ivec2(gl_FragCoord.xy) / VT_FEEDBACK_TILE, packed);
+}
+
+#define VT_FEEDBACK(m_idx, m_uv) vt_write_feedback(m_idx, m_uv)
+
 const float VT_POOL_TEXELS = float(VT_POOL_TILES_X) * VT_STORED_PAGE_SIZE; // pool is square.
 
 // Samples one integer VT mip: page-table (indirection) lookup -> physical page in the pool -> sample.
@@ -431,6 +455,7 @@ layout(set = 0, binding = 13) uniform texture2D material_textures[256];
 layout(set = 0, binding = 14) uniform sampler material_sampler;
 
 #define SAMPLE_MATERIAL_TEX(m_idx, m_uv) texture(sampler2D(material_textures[m_idx], material_sampler), m_uv)
+#define VT_FEEDBACK(m_idx, m_uv) // no-op: no virtual texturing in this variant
 
 #endif // MESHLET_USE_VIRTUAL_TEXTURES
 
@@ -735,6 +760,10 @@ void main() {
 	vec3 albedo = mat.albedo.rgb;
 	if (mat.albedo_texture_index != MESHLET_TEXTURE_NONE) {
 		albedo *= SAMPLE_MATERIAL_TEX(mat.albedo_texture_index, muv).rgb;
+		// S0b: record this tile's page request for the albedo VT (representative - normal/ORM share
+		// the same UV/mip/page; S0c makes a material's sibling textures resident together). No-op in
+		// the non-VT variant.
+		VT_FEEDBACK(mat.albedo_texture_index, muv);
 	}
 
 	// Normal map -> world normal via the derivative-built TBN (no stored vertex tangents). Unpack the
