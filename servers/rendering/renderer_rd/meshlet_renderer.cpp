@@ -32,6 +32,7 @@
 
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
 
 using namespace RendererRD;
 
@@ -45,12 +46,14 @@ MeshletRenderer::MeshletRenderer() {
 	singleton = this;
 
 	Vector<String> versions;
-	versions.push_back(""); // Version 0: normal (debug color + depth).
+	versions.push_back(""); // Version 0: normal (direct material_textures[] sampling + depth).
 	versions.push_back("\n#define MESHLET_DEPTH_ONLY\n"); // Version 1: no fragment color output.
+	versions.push_back("\n#define MESHLET_USE_VIRTUAL_TEXTURES\n"); // Version 2: VT-sampled color.
 	render_shader.initialize(versions);
 	render_shader_version = render_shader.version_create();
 	render_shader_rid = render_shader.version_get_shader(render_shader_version, 0);
 	depth_only_shader_rid = render_shader.version_get_shader(render_shader_version, 1);
+	vt_shader_rid = render_shader.version_get_shader(render_shader_version, 2);
 
 	// Vertex-pulling: no per-surface vertex buffer at all, every attribute is fetched manually
 	// in the vertex shader body via gl_VertexIndex/gl_InstanceIndex.
@@ -88,6 +91,29 @@ MeshletRenderer::MeshletRenderer() {
 	material_ss.use_anisotropy = true;
 	material_ss.anisotropy_max = 4.0f;
 	material_sampler = RD::get_singleton()->sampler_create(material_ss);
+
+	// VT page-pool sampler (binding 14 of the VT variant): linear + CLAMP, no mip filtering (the pool
+	// is single-mip; sampleVirtual() blends VT mips by sampling two pages itself). Clamp because the
+	// pool is an atlas of unrelated pages - repeat would wrap a sample across tile boundaries; the
+	// per-page replicated borders are what make intra-page bilinear filtering seamless instead.
+	RD::SamplerState pool_ss;
+	pool_ss.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+	pool_ss.min_filter = RD::SAMPLER_FILTER_LINEAR;
+	pool_ss.mip_filter = RD::SAMPLER_FILTER_NEAREST;
+	pool_ss.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	pool_ss.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	pool_ss.repeat_w = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	pool_sampler = RD::get_singleton()->sampler_create(pool_ss);
+
+	// VT indirection sampler (binding 16): nearest + clamp. Only ever read via texelFetch (which
+	// ignores filtering), but a usampler2DArray binding still needs a sampler RID.
+	RD::SamplerState ind_ss;
+	ind_ss.mag_filter = RD::SAMPLER_FILTER_NEAREST;
+	ind_ss.min_filter = RD::SAMPLER_FILTER_NEAREST;
+	ind_ss.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	ind_ss.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	ind_ss.repeat_w = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	vt_indirection_sampler = RD::get_singleton()->sampler_create(ind_ss);
 }
 
 MeshletRenderer::~MeshletRenderer() {
@@ -97,18 +123,42 @@ MeshletRenderer::~MeshletRenderer() {
 	if (cached_depth_only_pipeline.is_valid()) {
 		RD::get_singleton()->free_rid(cached_depth_only_pipeline);
 	}
+	if (cached_vt_pipeline.is_valid()) {
+		RD::get_singleton()->free_rid(cached_vt_pipeline);
+	}
 	RD::get_singleton()->free_rid(synthetic_index_buffer);
 	RD::get_singleton()->free_rid(empty_vertex_array);
 	RD::get_singleton()->free_rid(radiance_sampler);
 	RD::get_singleton()->free_rid(material_sampler);
+	RD::get_singleton()->free_rid(pool_sampler);
+	RD::get_singleton()->free_rid(vt_indirection_sampler);
 	// vertex_format is a VertexFormatID (cached/interned by RD, not an owned RID) - no free needed.
 	render_shader.version_free(render_shader_version);
 	singleton = nullptr;
 }
 
-void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only) {
-	RID &cached = p_depth_only ? cached_depth_only_pipeline : cached_pipeline;
-	RD::FramebufferFormatID &cached_format = p_depth_only ? cached_depth_only_framebuffer_format : cached_framebuffer_format;
+void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only, bool p_virtual_textures) {
+	// Three independently-cached pipelines: depth-only (temporal early pass), VT color (virtual-
+	// texture sampling variant), and normal color (direct material_textures[] sampling). VT only
+	// applies to the color path, so p_depth_only takes precedence over p_virtual_textures.
+	RID *cached_ptr;
+	RD::FramebufferFormatID *cached_format_ptr;
+	RID variant_shader_rid;
+	if (p_depth_only) {
+		cached_ptr = &cached_depth_only_pipeline;
+		cached_format_ptr = &cached_depth_only_framebuffer_format;
+		variant_shader_rid = depth_only_shader_rid;
+	} else if (p_virtual_textures) {
+		cached_ptr = &cached_vt_pipeline;
+		cached_format_ptr = &cached_vt_framebuffer_format;
+		variant_shader_rid = vt_shader_rid;
+	} else {
+		cached_ptr = &cached_pipeline;
+		cached_format_ptr = &cached_framebuffer_format;
+		variant_shader_rid = render_shader_rid;
+	}
+	RID &cached = *cached_ptr;
+	RD::FramebufferFormatID &cached_format = *cached_format_ptr;
 
 	if (cached.is_valid() && cached_format == p_framebuffer_format) {
 		return;
@@ -175,7 +225,7 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	// vertex-pulling vs. Forward+'s own real vertex shader, both targeting the same mesh). A
 	// direct, fixed-fraction nudge in the shader gives predictable, measured control instead.
 
-	RID shader_rid = p_depth_only ? depth_only_shader_rid : render_shader_rid;
+	RID shader_rid = variant_shader_rid;
 	// create_disabled(0): the depth-only variant targets a framebuffer with zero color
 	// attachments (e.g. Forward+'s real depth pre-pass framebuffer) - the color blend state's
 	// attachment count must match the framebuffer's actual color attachment count.
@@ -188,7 +238,13 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only, const Color &p_ambient_color, RID p_svogi_octree_buffer, const Vector3 &p_svogi_bounds_center, float p_svogi_bounds_half_size, float p_svogi_energy, RID p_radiance_texture, float p_sky_ambient_mix, float p_radiance_exposure, float p_max_roughness_lod) {
 	ERR_FAIL_NULL(MeshletStorage::get_singleton());
 
-	_ensure_pipeline(p_framebuffer_format, p_depth_only);
+	// VT sampling applies only to the color path (depth-only samples no material textures). The
+	// kill-switch lives in VirtualTextureStorage::is_enabled() (resolves --vt-enable/--vt-disable over
+	// the project setting); when off, the normal version-0 shader + direct material_textures[] binding
+	// run, byte-identical to a build without VT.
+	const bool use_virtual_textures = !p_depth_only && VirtualTextureStorage::is_enabled() && VirtualTextureStorage::get_singleton() != nullptr;
+
+	_ensure_pipeline(p_framebuffer_format, p_depth_only, use_virtual_textures);
 
 	RD::DrawListID draw_list;
 	if (p_clear) {
@@ -325,7 +381,19 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			us.append_id(radiance_sampler);
 			uniforms.push_back(us);
 		}
-		if (!p_depth_only) {
+		if (!p_depth_only && use_virtual_textures) {
+			// VT color variant (version 2): bindings 13-17 are the virtual-texturing resources -
+			// page pool (13) + its sampler (14), indirection page-table array (15) + its sampler (16),
+			// and the per-VT metadata SSBO (17) - replacing the direct material_textures[] array. The
+			// material's *_texture_index fields are vt_ids here (MeshletStorage routed them through
+			// VirtualTextureStorage::register_virtual_texture); sampleVirtual() resolves them.
+			VirtualTextureStorage *vts = VirtualTextureStorage::get_singleton();
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 13, vts->get_page_pool_texture_rid()));
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 14, pool_sampler));
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 15, vts->get_indirection_texture_rid()));
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 16, vt_indirection_sampler));
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, vts->get_vt_metadata_buffer_rid()));
+		} else if (!p_depth_only) {
 			// Binding 13/14: the material-texture descriptor array + its sampler. The fragment shader
 			// indexes material_textures[mat.*_texture_index]. The array is a fixed size
 			// (MeshletStorage::MAX_MATERIAL_TEXTURES) - Vulkan requires every declared element to be a
@@ -346,7 +414,7 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			usmat.append_id(material_sampler);
 			uniforms.push_back(usmat);
 		}
-		RID render_shader_rid_to_use = p_depth_only ? depth_only_shader_rid : render_shader_rid;
+		RID render_shader_rid_to_use = p_depth_only ? depth_only_shader_rid : (use_virtual_textures ? vt_shader_rid : render_shader_rid);
 		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, render_shader_rid_to_use, 0);
 
 		// Matches meshlet_render.glsl's Params push-constant block exactly (128 bytes). The same
@@ -401,7 +469,7 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		push_constant.svogi_params[2] = p_depth_only ? 0.0f : p_max_roughness_lod;
 		push_constant.svogi_params[3] = 0.0f;
 
-		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : cached_pipeline);
+		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : (use_virtual_textures ? cached_vt_pipeline : cached_pipeline));
 		RD::get_singleton()->draw_list_bind_vertex_array(draw_list, empty_vertex_array);
 		RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set, 0);
 		RD::get_singleton()->draw_list_bind_index_array(draw_list, synthetic_index_array);

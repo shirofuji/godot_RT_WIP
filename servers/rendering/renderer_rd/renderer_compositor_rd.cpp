@@ -182,6 +182,7 @@ void RendererCompositorRD::finalize() {
 	memdelete(meshlet_renderer);
 	memdelete(meshlet_software_rasterizer);
 	memdelete(meshlet_culler);
+	memdelete(virtual_texture_storage);
 	memdelete(meshlet_storage);
 	memdelete(mesh_storage);
 	memdelete(material_storage);
@@ -371,6 +372,7 @@ RendererCompositorRD::RendererCompositorRD() {
 	material_storage = memnew(RendererRD::MaterialStorage);
 	mesh_storage = memnew(RendererRD::MeshStorage);
 	meshlet_storage = memnew(RendererRD::MeshletStorage);
+	virtual_texture_storage = memnew(RendererRD::VirtualTextureStorage);
 	meshlet_culler = memnew(RendererRD::MeshletCuller);
 	meshlet_renderer = memnew(RendererRD::MeshletRenderer);
 	meshlet_software_rasterizer = memnew(MeshletSoftwareRasterizer);

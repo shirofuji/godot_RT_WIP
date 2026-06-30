@@ -55,10 +55,14 @@ private:
 
 	MeshletRenderShaderRD render_shader;
 	RID render_shader_version;
-	RID render_shader_rid; // Version 0: normal (debug color + depth).
+	RID render_shader_rid; // Version 0: normal (direct material_textures[] sampling + depth).
 	RID depth_only_shader_rid; // Version 1 (MESHLET_DEPTH_ONLY): no fragment color output at
 			// all - for the temporal early pass, which targets Forward+'s real depth pre-pass
 			// framebuffer (zero color attachments).
+	RID vt_shader_rid; // Version 2 (MESHLET_USE_VIRTUAL_TEXTURES): color path that samples material
+			// textures through VirtualTextureStorage's page pool + indirection instead of the direct
+			// material_textures[] array. Selected when VirtualTextureStorage::is_enabled() and not
+			// depth-only; otherwise version 0 runs, byte-identical to a no-VT build.
 
 	RD::VertexFormatID vertex_format = 0; // Empty - all attribute fetch is manual (vertex-pulling).
 	RID empty_vertex_array; // Zero attributes/buffers, but RD still requires *some* vertex array
@@ -71,13 +75,21 @@ private:
 			// (binding 12 of the non-depth-only shader). Created once; freed in the destructor.
 	RID material_sampler; // Linear-with-mipmaps, repeat + anisotropy - for the material-texture array
 			// (binding 14). Tiling textures need repeat (unlike the clamp radiance sampler).
+	RID pool_sampler; // Linear, CLAMP, no mips - for the VT page pool (binding 14 in the VT variant).
+			// Clamp (not repeat): the pool is an atlas of unrelated pages; per-page borders handle
+			// intra-page filtering, and wrapping would bleed across tiles. Single-mip pool -> mip
+			// filtering unused (sampleVirtual blends VT mips manually).
+	RID vt_indirection_sampler; // Nearest, clamp - for the VT indirection array (binding 16). texelFetch
+			// ignores filtering, but a combined-sampler binding still requires a sampler RID.
 
 	RD::FramebufferFormatID cached_framebuffer_format = RD::INVALID_FORMAT_ID;
 	RID cached_pipeline;
 	RD::FramebufferFormatID cached_depth_only_framebuffer_format = RD::INVALID_FORMAT_ID;
 	RID cached_depth_only_pipeline;
+	RD::FramebufferFormatID cached_vt_framebuffer_format = RD::INVALID_FORMAT_ID;
+	RID cached_vt_pipeline; // VT color variant (version 2).
 
-	void _ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only);
+	void _ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only, bool p_virtual_textures);
 
 public:
 	static MeshletRenderer *get_singleton();

@@ -351,13 +351,88 @@ svogi_nodes;
 layout(set = 0, binding = 11) uniform texture2DArray radiance_octmap;
 layout(set = 0, binding = 12) uniform sampler radiance_sampler;
 
-// Per-material PBR textures (albedo/normal/ORM), indexed per-fragment by the material's
-// *_texture_index. Fixed-size descriptor array - MUST equal MeshletStorage::MAX_MATERIAL_TEXTURES
-// (the renderer binds exactly that many, padding unused slots with a default white texture). The
-// index is the per-instance-flat material_id's field, so it's dynamically uniform per draw the same
-// way Forward+ indexes lightmap_textures[] - no nonuniformEXT needed.
+// Per-material PBR textures. Two binding layouts, chosen at compile time so the default build is
+// untouched by virtual texturing:
+//  * Default: the direct material_textures[] descriptor array (bindings 13/14), exactly as before.
+//  * MESHLET_USE_VIRTUAL_TEXTURES: the *_texture_index fields are vt_ids, and albedo/normal/ORM are
+//    fetched through VirtualTextureStorage's page pool + indirection page table via sampleVirtual().
+#ifdef MESHLET_USE_VIRTUAL_TEXTURES
+
+// MUST match VirtualTextureStorage's constants (virtual_texture_storage.h).
+#define VT_PAGE_SIZE 128.0
+#define VT_PAGE_BORDER 4.0
+#define VT_STORED_PAGE_SIZE 136.0
+#define VT_POOL_TILES_X 64
+#define VT_INDIRECTION_MIPS 7
+
+layout(set = 0, binding = 13) uniform texture2D vt_page_pool;
+layout(set = 0, binding = 14) uniform sampler vt_pool_sampler; // linear, clamp
+layout(set = 0, binding = 15) uniform utexture2DArray vt_indirection;
+layout(set = 0, binding = 16) uniform sampler vt_point_sampler; // nearest (texelFetch ignores it)
+
+struct VTMeta {
+	uint width;
+	uint height;
+	uint mip_count;
+	uint resident_mip_floor;
+};
+layout(set = 0, binding = 17, std430) restrict readonly buffer VTMetadata {
+	VTMeta data[];
+}
+vt_meta;
+
+const float VT_POOL_TEXELS = float(VT_POOL_TILES_X) * VT_STORED_PAGE_SIZE; // pool is square.
+
+// Samples one integer VT mip: page-table (indirection) lookup -> physical page in the pool -> sample.
+// UV is wrapped with fract() to emulate the REPEAT addressing StandardMaterial3D textures use by
+// default (the direct path's material_sampler is REPEAT); a 1-texel seam can appear at the exact
+// wrap boundary, acceptable for S0a (none in the no-op content).
+vec4 vt_sample_mip(uint vt_id, vec2 uv, int mip) {
+	VTMeta m = vt_meta.data[vt_id];
+	int max_mip = int(min(m.mip_count, uint(VT_INDIRECTION_MIPS))) - 1;
+	mip = clamp(mip, int(m.resident_mip_floor), max(max_mip, 0));
+
+	vec2 mip_size = vec2(max(ivec2(int(m.width) >> mip, int(m.height) >> mip), ivec2(1)));
+	vec2 texel_coord = fract(uv) * mip_size; // fractional texel position within the mip
+	ivec2 page = ivec2(texel_coord) / int(VT_PAGE_SIZE);
+
+	uvec4 entry = texelFetch(usampler2DArray(vt_indirection, vt_point_sampler), ivec3(page, int(vt_id)), mip);
+	// entry.z == 0 -> not resident. S0a keeps everything resident, so this is only reached if the pool
+	// overflowed at registration; sampling tile (entry.xy) then is harmless. S0c walks to a coarser
+	// resident mip here instead.
+
+	vec2 in_page = texel_coord - vec2(page * int(VT_PAGE_SIZE)); // [0, VT_PAGE_SIZE), fractional kept
+	vec2 pool_texel = vec2(entry.xy) * VT_STORED_PAGE_SIZE + vec2(VT_PAGE_BORDER) + in_page;
+	return textureLod(sampler2D(vt_page_pool, vt_pool_sampler), pool_texel / VT_POOL_TEXELS, 0.0);
+}
+
+// Trilinear virtual-texture sample: derivative-based LOD (matching what hardware would pick for the
+// full-resolution source texture), blending the two bracketing VT mips.
+vec4 sampleVirtual(uint vt_id, vec2 uv) {
+	VTMeta m = vt_meta.data[vt_id];
+	vec2 tex_size = vec2(max(m.width, 1u), max(m.height, 1u));
+	vec2 dx = dFdx(uv) * tex_size;
+	vec2 dy = dFdy(uv) * tex_size;
+	float lod = max(0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-8)), 0.0);
+	int mip_lo = int(floor(lod));
+	float f = lod - float(mip_lo);
+	return mix(vt_sample_mip(vt_id, uv, mip_lo), vt_sample_mip(vt_id, uv, mip_lo + 1), f);
+}
+
+#define SAMPLE_MATERIAL_TEX(m_idx, m_uv) sampleVirtual(m_idx, m_uv)
+
+#else // !MESHLET_USE_VIRTUAL_TEXTURES
+
+// Fixed-size descriptor array - MUST equal MeshletStorage::MAX_MATERIAL_TEXTURES (the renderer binds
+// exactly that many, padding unused slots with a default white texture). The index is the
+// per-instance-flat material_id's field, so it's dynamically uniform per draw the same way Forward+
+// indexes lightmap_textures[] - no nonuniformEXT needed.
 layout(set = 0, binding = 13) uniform texture2D material_textures[256];
 layout(set = 0, binding = 14) uniform sampler material_sampler;
+
+#define SAMPLE_MATERIAL_TEX(m_idx, m_uv) texture(sampler2D(material_textures[m_idx], material_sampler), m_uv)
+
+#endif // MESHLET_USE_VIRTUAL_TEXTURES
 
 const float M_PI = 3.14159265358979323846;
 const uint MESHLET_TEXTURE_NONE = 0xFFFFFFFFu;
@@ -659,13 +734,13 @@ void main() {
 	// Albedo texture modulates the base color factor.
 	vec3 albedo = mat.albedo.rgb;
 	if (mat.albedo_texture_index != MESHLET_TEXTURE_NONE) {
-		albedo *= texture(sampler2D(material_textures[mat.albedo_texture_index], material_sampler), muv).rgb;
+		albedo *= SAMPLE_MATERIAL_TEX(mat.albedo_texture_index, muv).rgb;
 	}
 
 	// Normal map -> world normal via the derivative-built TBN (no stored vertex tangents). Unpack the
 	// tangent-space normal (xyz: [0,1] -> [-1,1], blue = z), apply the material's normal_scale to xy.
 	if (mat.normal_texture_index != MESHLET_TEXTURE_NONE) {
-		vec3 nm = texture(sampler2D(material_textures[mat.normal_texture_index], material_sampler), muv).xyz * 2.0 - 1.0;
+		vec3 nm = SAMPLE_MATERIAL_TEX(mat.normal_texture_index, muv).xyz * 2.0 - 1.0;
 		nm.xy *= mat.normal_scale;
 		N = perturb_normal(N, world_pos_interp, muv, normalize(nm));
 	}
@@ -674,7 +749,7 @@ void main() {
 	// the scalar roughness/metallic factors; occlusion is applied to indirect light below.
 	float ao = 1.0;
 	if (mat.orm_texture_index != MESHLET_TEXTURE_NONE) {
-		vec3 orm = texture(sampler2D(material_textures[mat.orm_texture_index], material_sampler), muv).rgb;
+		vec3 orm = SAMPLE_MATERIAL_TEX(mat.orm_texture_index, muv).rgb;
 		ao = orm.r;
 		mat.roughness *= orm.g;
 		mat.metallic *= orm.b;

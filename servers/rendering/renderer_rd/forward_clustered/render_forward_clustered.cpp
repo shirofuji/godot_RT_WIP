@@ -41,6 +41,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_default.h"
@@ -1873,12 +1874,22 @@ uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_mater
 		// (param unset / no texture). texture_orm is only present on ORM-packed materials; separate
 		// metallic/roughness/AO maps aren't folded here yet (the scalar factors stand in for them).
 		RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+		// When virtual texturing is enabled, the *_texture_index fields hold vt_ids (resolved by the
+		// VT shader variant's sampleVirtual()) instead of direct material_textures[] slots; the
+		// resolution is otherwise identical. is_enabled() is the same kill-switch the renderer's
+		// shader-variant/binding selection consults, so the index space always matches what the shader
+		// expects. (Resolved once per scan via the cached static in is_enabled().)
+		const bool use_virtual_textures = RendererRD::VirtualTextureStorage::is_enabled();
 		auto register_param_texture = [&](const StringName &p_param) -> uint32_t {
 			Variant tv = material_storage->material_get_param(material_rid, p_param);
 			if (tv.get_type() != Variant::RID) {
 				return 0xFFFFFFFF;
 			}
-			return meshlet_storage->register_material_texture(texture_storage->texture_get_rd_texture((RID)tv));
+			RID rd_tex = texture_storage->texture_get_rd_texture((RID)tv);
+			if (use_virtual_textures) {
+				return RendererRD::VirtualTextureStorage::get_singleton()->register_virtual_texture(rd_tex);
+			}
+			return meshlet_storage->register_material_texture(rd_tex);
 		};
 		data.albedo_texture_index = register_param_texture("texture_albedo");
 		data.normal_texture_index = register_param_texture("texture_normal");

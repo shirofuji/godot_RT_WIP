@@ -41,6 +41,7 @@
 #include "servers/rendering/renderer_rd/meshlet_renderer.h"
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
+#include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
 
 namespace {
 
@@ -953,6 +954,134 @@ void test_meshlet_material_lookup_vs_cpu_reference() {
 	}
 }
 
+// S0a virtual-texturing proof: registers a known source texture as a virtual texture (which, in
+// S0a, synchronously blits every page into the physical pool and fills the indirection page table),
+// then reads both back from the GPU and verifies against a CPU reference. This validates the core
+// SVT machinery - tile allocation, the page blit (content + replicated borders), and the page
+// table - independent of the render path. Runs regardless of the --vt-enable flag (it calls
+// VirtualTextureStorage directly), so it exercises the VT backend even in a default-off build.
+void test_virtual_texture_blit_and_indirection() {
+	RendererRD::VirtualTextureStorage *vts = RendererRD::VirtualTextureStorage::get_singleton();
+	check(vts != nullptr, "VirtualTextureStorage singleton exists");
+	if (vts == nullptr) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+
+	// Source: 256x256, single mip, a per-texel pattern distinct per channel and per axis so a
+	// transposed/swizzled/duplicated blit would be caught (r = x, g = y, b = (3x + y)).
+	const uint32_t W = 256;
+	const uint32_t H = 256;
+	Vector<uint8_t> src_data;
+	src_data.resize_initialized(W * H * 4);
+	{
+		uint8_t *p = src_data.ptrw();
+		for (uint32_t y = 0; y < H; y++) {
+			for (uint32_t x = 0; x < W; x++) {
+				uint8_t *t = p + (y * W + x) * 4;
+				t[0] = uint8_t(x);
+				t[1] = uint8_t(y);
+				t[2] = uint8_t((x * 3 + y) & 0xFF);
+				t[3] = 255;
+			}
+		}
+	}
+	RD::TextureFormat tf;
+	tf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	tf.width = W;
+	tf.height = H;
+	tf.texture_type = RD::TEXTURE_TYPE_2D;
+	tf.mipmaps = 1;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT;
+	Vector<Vector<uint8_t>> src_layers;
+	src_layers.push_back(src_data);
+	RID source = rd->texture_create(tf, RD::TextureView(), src_layers);
+	check(source.is_valid(), "VT test: source texture created");
+	if (source.is_null()) {
+		return;
+	}
+
+	uint32_t vt_id = vts->register_virtual_texture(source);
+	check(vt_id != 0xFFFFFFFFu, "register_virtual_texture returned a valid vt_id");
+	if (vt_id == 0xFFFFFFFFu) {
+		rd->free_rid(source);
+		return;
+	}
+
+	// Page table: read back this vt's indirection layer (all mips packed; mip 0 is the first
+	// INDIRECTION_DIM^2 RGBA8_UINT texels). 256x256 => a 2x2 mip-0 page grid, all resident in S0a.
+	const uint32_t IND_DIM = RendererRD::VirtualTextureStorage::INDIRECTION_DIM;
+	Vector<uint8_t> ind = rd->texture_get_data(vts->get_indirection_texture_rid(), vt_id);
+	bool ind_size_ok = (uint32_t)ind.size() >= IND_DIM * IND_DIM * 4;
+	check(ind_size_ok, "VT test: indirection layer read back at expected size");
+	if (!ind_size_ok) {
+		vts->free_virtual_texture(vt_id);
+		rd->free_rid(source);
+		return;
+	}
+	const uint8_t *ip = ind.ptr();
+	auto ind_entry = [&](uint32_t px, uint32_t py, int ch) -> uint32_t {
+		return ip[(py * IND_DIM + px) * 4 + ch];
+	};
+
+	bool all_resident = true;
+	for (uint32_t py = 0; py < 2; py++) {
+		for (uint32_t px = 0; px < 2; px++) {
+			if (ind_entry(px, py, 2) != 1u) { // channel 2 = resident flag
+				all_resident = false;
+			}
+		}
+	}
+	check(all_resident, "all 4 mip-0 pages of the 256x256 VT are marked resident in the page table");
+
+	// Copy page (0,0)'s physical pool tile out and verify its content + a border texel.
+	const uint32_t STORED = RendererRD::VirtualTextureStorage::STORED_PAGE_SIZE;
+	const uint32_t BORDER = RendererRD::VirtualTextureStorage::PAGE_BORDER;
+	uint32_t tile_x = ind_entry(0, 0, 0);
+	uint32_t tile_y = ind_entry(0, 0, 1);
+
+	RD::TextureFormat ttf;
+	ttf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	ttf.width = STORED;
+	ttf.height = STORED;
+	ttf.texture_type = RD::TEXTURE_TYPE_2D;
+	ttf.mipmaps = 1;
+	ttf.usage_bits = RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+	RID tile_tex = rd->texture_create(ttf, RD::TextureView());
+	rd->texture_copy(vts->get_page_pool_texture_rid(), tile_tex, Vector3(tile_x * STORED, tile_y * STORED, 0), Vector3(0, 0, 0), Vector3(STORED, STORED, 1), 0, 0, 0, 0);
+	Vector<uint8_t> tile_data = rd->texture_get_data(tile_tex, 0);
+	const uint8_t *tp = tile_data.ptr();
+	auto tile_texel = [&](uint32_t x, uint32_t y, int ch) -> int {
+		return tp[(y * STORED + x) * 4 + ch];
+	};
+
+	// Content: stored (BORDER + ix, BORDER + iy) must equal source(ix, iy) for page (0,0). The blit is
+	// a plain texelFetch -> imageStore (no filtering), so require an exact byte match.
+	bool content_ok = ((uint32_t)tile_data.size() == STORED * STORED * 4);
+	const uint32_t samples[5][2] = { { 0, 0 }, { 64, 64 }, { 127, 127 }, { 0, 127 }, { 127, 0 } };
+	for (uint32_t s = 0; s < 5 && content_ok; s++) {
+		uint32_t ix = samples[s][0];
+		uint32_t iy = samples[s][1];
+		int r = tile_texel(BORDER + ix, BORDER + iy, 0);
+		int g = tile_texel(BORDER + ix, BORDER + iy, 1);
+		int b = tile_texel(BORDER + ix, BORDER + iy, 2);
+		if (r != (int)(ix & 0xFF) || g != (int)(iy & 0xFF) || b != (int)((ix * 3 + iy) & 0xFF)) {
+			content_ok = false;
+		}
+	}
+	check(content_ok, "pool tile content exactly matches the source texels (blit correctness)");
+
+	// Border: page (0,0)'s left border at stored (0, BORDER + iy) replicates the clamped source edge
+	// texel source(0, iy) = (0, iy, iy) - this is what makes intra-page filtering seamless.
+	uint32_t biy = 10;
+	bool border_ok = (tile_texel(0, BORDER + biy, 0) == 0 && tile_texel(0, BORDER + biy, 1) == (int)biy);
+	check(border_ok, "pool tile border replicates the clamped source edge texel (seamless filtering)");
+
+	rd->free_rid(tile_tex);
+	vts->free_virtual_texture(vt_id);
+	rd->free_rid(source);
+}
+
 } // namespace
 
 void run_meshlet_selftest_if_requested() {
@@ -968,6 +1097,7 @@ void run_meshlet_selftest_if_requested() {
 	test_temporal_hiz_two_pass_disocclusion_recovery();
 	test_meshlet_render_visual_proof();
 	test_meshlet_material_lookup_vs_cpu_reference();
+	test_virtual_texture_blit_and_indirection();
 	if (g_failures == 0) {
 		print_line("MESHLET_SELFTEST: all checks passed");
 	} else {

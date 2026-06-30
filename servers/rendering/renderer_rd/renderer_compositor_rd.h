@@ -44,6 +44,7 @@
 #include "servers/rendering/renderer_rd/meshlet_renderer.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/utilities.h"
@@ -62,6 +63,7 @@ protected:
 	RendererRD::MaterialStorage *material_storage = nullptr;
 	RendererRD::MeshStorage *mesh_storage = nullptr;
 	RendererRD::MeshletStorage *meshlet_storage = nullptr;
+	RendererRD::VirtualTextureStorage *virtual_texture_storage = nullptr;
 	RendererRD::MeshletCuller *meshlet_culler = nullptr;
 	RendererRD::MeshletRenderer *meshlet_renderer = nullptr;
 	class MeshletSoftwareRasterizer *meshlet_software_rasterizer = nullptr;

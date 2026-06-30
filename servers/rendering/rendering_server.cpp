@@ -3879,6 +3879,16 @@ void RenderingServer::init() {
 	// since already-baked meshes keep their existing data until recreated.
 	GLOBAL_DEF_RST("rendering/meshlet/bake_lod_dag", true);
 
+	// Software virtual texturing / streaming VRAM residency manager (see project plan/memory). When
+	// enabled, qualifying meshlet-path PBR textures are sampled through a bounded physical page pool
+	// instead of being held fully resident, so a scene can carry far more 4K material sets than fit in
+	// VRAM at once. EXPERIMENTAL and OFF by default - it's a parallel, fully-separable path from the
+	// proven renderer (mirrors how the meshlet path itself was kept opt-in): with this false, nothing
+	// about VT is created, bound, or sampled and the renderer behaves exactly as before. The
+	// --vt-enable / --vt-disable cmdline flags layer on top as developer overrides (force on / force
+	// off regardless of this setting). Restart-to-apply.
+	GLOBAL_DEF_RST("rendering/virtual_texture/enabled", false);
+
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);
 

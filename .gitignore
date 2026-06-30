@@ -397,3 +397,15 @@ $RECYCLE.BIN/
 *.lnk
 *.generated.props
 /.selftest_project/.godot/
+
+# Likha local scratch / dev artifacts (transcript reconstruction, one-off tests) - not for commit
+/dump.py
+/reconstruct.py
+/reconstruct_best.py
+/reconstruct_full.py
+/reconstructed.cpp
+/reconstructed_best.cpp
+/reconstructed_full.cpp
+/test_shader.gd
+/views.txt
+/.selftest_project/stress_test.gd
