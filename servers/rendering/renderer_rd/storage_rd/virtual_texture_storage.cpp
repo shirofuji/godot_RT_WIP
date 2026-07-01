@@ -31,6 +31,7 @@
 #include "virtual_texture_storage.h"
 
 #include "core/config/project_settings.h"
+#include "core/object/callable_mp.h" // callable_mp_static for the async readback callback.
 #include "core/os/os.h"
 #include "core/templates/hash_set.h"
 
@@ -420,14 +421,12 @@ void VirtualTextureStorage::clear_feedback() {
 	RD::get_singleton()->texture_update(feedback_image, 0, clear_data);
 }
 
-Vector<VirtualTextureStorage::PageRequest> VirtualTextureStorage::read_feedback_requests() {
-	Vector<PageRequest> requests;
-	if (feedback_image.is_null()) {
-		return requests;
-	}
-	Vector<uint8_t> data = RD::get_singleton()->texture_get_data(feedback_image, 0);
-	const uint32_t *p = (const uint32_t *)data.ptr();
-	uint32_t count = (uint32_t)data.size() / 4;
+// Decode a raw r32ui feedback readback (one packed (vt_id,mip,page) per screen tile) into the deduped
+// page-request set. Shared by the synchronous read_feedback_requests() and the async drain.
+static Vector<VirtualTextureStorage::PageRequest> _decode_feedback_bytes(const uint8_t *p_bytes, uint32_t p_byte_count) {
+	Vector<VirtualTextureStorage::PageRequest> requests;
+	const uint32_t *p = (const uint32_t *)p_bytes;
+	uint32_t count = p_byte_count / 4;
 	HashSet<uint32_t> seen; // Dedup identical (vt_id,mip,page) packed values across tiles.
 	for (uint32_t i = 0; i < count; i++) {
 		uint32_t v = p[i];
@@ -435,7 +434,7 @@ Vector<VirtualTextureStorage::PageRequest> VirtualTextureStorage::read_feedback_
 			continue;
 		}
 		seen.insert(v);
-		PageRequest r;
+		VirtualTextureStorage::PageRequest r;
 		r.page_x = v & 0x3Fu;
 		r.page_y = (v >> 6) & 0x3Fu;
 		r.vt_id = (v >> 12) & 0xFFu;
@@ -443,6 +442,56 @@ Vector<VirtualTextureStorage::PageRequest> VirtualTextureStorage::read_feedback_
 		requests.push_back(r);
 	}
 	return requests;
+}
+
+Vector<VirtualTextureStorage::PageRequest> VirtualTextureStorage::read_feedback_requests() {
+	Vector<PageRequest> requests;
+	if (feedback_image.is_null()) {
+		return requests;
+	}
+	Vector<uint8_t> data = RD::get_singleton()->texture_get_data(feedback_image, 0); // synchronous stall.
+	return _decode_feedback_bytes(data.ptr(), (uint32_t)data.size());
+}
+
+void VirtualTextureStorage::request_feedback_async() {
+	// Queue THIS frame's feedback texture for asynchronous readback. The GPU-side copy is ordered after
+	// the VT color draw that just wrote it, so it captures this frame's data; the CPU never waits. Only
+	// one request is kept in flight (feedback_async_in_flight) to avoid piling up staging copies.
+	if (feedback_image.is_null() || feedback_async_in_flight) {
+		return;
+	}
+	Error err = RD::get_singleton()->texture_get_data_async(feedback_image, 0, callable_mp_static(VirtualTextureStorage::_feedback_async_callback));
+	if (err == OK) {
+		feedback_async_in_flight = true;
+	}
+}
+
+void VirtualTextureStorage::_feedback_async_callback(const PackedByteArray &p_data) {
+	// Fires on the render thread at the normal frame-fence point (RenderingDevice::_stall_for_frame),
+	// a few frames after request_feedback_async(). CPU-only work: decode into pending_stream_requests;
+	// the actual streaming GPU work happens in the next poll_pending_streams() at a valid command point.
+	VirtualTextureStorage *self = get_singleton();
+	if (self) {
+		self->_ingest_feedback_data(p_data);
+	}
+}
+
+void VirtualTextureStorage::_ingest_feedback_data(const PackedByteArray &p_data) {
+	feedback_async_in_flight = false;
+	pending_stream_requests = _decode_feedback_bytes(p_data.ptr(), (uint32_t)p_data.size());
+	pending_stream_valid = true;
+}
+
+void VirtualTextureStorage::poll_pending_streams() {
+	// Apply the most recently completed async feedback readback (if any). Runs where the synchronous
+	// drain used to - a valid point for update_streaming's GPU work - but on already-available data,
+	// so there is no readback stall.
+	if (!pending_stream_valid) {
+		return;
+	}
+	pending_stream_valid = false;
+	update_streaming(pending_stream_requests);
+	pending_stream_requests.clear();
 }
 
 uint64_t VirtualTextureStorage::_page_key(uint32_t p_vt_id, uint32_t p_mip, uint32_t p_page_x, uint32_t p_page_y) {

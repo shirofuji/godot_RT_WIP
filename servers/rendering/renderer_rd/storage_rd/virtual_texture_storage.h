@@ -152,7 +152,18 @@ public:
 	// frame's to avoid the stall.
 	RID get_feedback_image(const Size2i &p_render_size);
 	void clear_feedback();
-	Vector<PageRequest> read_feedback_requests();
+	Vector<PageRequest> read_feedback_requests(); // SYNCHRONOUS readback (stalls) - used by selftests.
+
+	// Stall-free per-frame feedback drain (replaces the synchronous read_feedback_requests()+
+	// update_streaming() in the render path). Call once per frame after the VT color draw:
+	//   poll_pending_streams(); // apply any async readback that has completed (GPU work, safe point)
+	//   request_feedback_async(); // queue THIS frame's feedback for async readback (no CPU stall)
+	// The async readback's callback (fires ~2-3 frames later, render thread, at the normal frame fence)
+	// only DECODES into pending_stream_requests (CPU only); the actual streaming GPU work runs in the
+	// next frame's poll_pending_streams() at a valid command point. Net: VT paging is a few frames
+	// latent (fine for texture streaming) but never blocks the pipeline.
+	void request_feedback_async();
+	void poll_pending_streams();
 
 	// S0c: the per-frame residency drain. Given the page set the frame sampled (read_feedback_requests),
 	// streams in any requested fine (non-base) pages not yet resident - blitting them into the pool and
@@ -189,6 +200,14 @@ private:
 
 	RID feedback_image; // S0b: r32ui, render size / FEEDBACK_TILE; one (vt_id,mip,page) per tile.
 	Size2i feedback_dims; // Current feedback image dimensions, in tiles.
+
+	// Async feedback drain state (see request_feedback_async/poll_pending_streams). Render-thread only,
+	// so no locking. feedback_async_in_flight bounds it to one outstanding readback at a time.
+	bool feedback_async_in_flight = false;
+	bool pending_stream_valid = false;
+	Vector<PageRequest> pending_stream_requests;
+	static void _feedback_async_callback(const PackedByteArray &p_data); // fires on the render thread.
+	void _ingest_feedback_data(const PackedByteArray &p_data); // decode -> pending_stream_requests.
 
 	// Blit pipeline (virtual_texture_blit.glsl): copies a source page -> a pool tile with borders.
 	VirtualTextureBlitShaderRD blit_shader;
