@@ -200,6 +200,7 @@ private:
 		RID mesh;
 		uint32_t surface_index = 0;
 		PackedVector3Array vertices; // base (full-res) positions for the DAG bake.
+		PackedVector3Array normals; // parallel to vertices - reference for winding normalization.
 		PackedInt32Array indices; // base (full-res) index buffer.
 	};
 	struct CompletedMeshletBake {
@@ -214,7 +215,7 @@ private:
 	Mutex meshlet_bake_mutex;
 	LocalVector<CompletedMeshletBake> meshlet_bakes_completed; // guarded by meshlet_bake_mutex.
 
-	void _enqueue_meshlet_dag_bake(RID p_mesh, uint32_t p_surface, const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices);
+	void _enqueue_meshlet_dag_bake(RID p_mesh, uint32_t p_surface, const PackedVector3Array &p_vertices, const PackedVector3Array &p_normals, const PackedInt32Array &p_indices);
 	static void _meshlet_dag_bake_task(void *p_userdata); // runs on a WorkerThreadPool thread.
 
 	/* Mesh Instance API */

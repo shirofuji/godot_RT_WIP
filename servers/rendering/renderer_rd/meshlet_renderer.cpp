@@ -213,7 +213,14 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	// standard CCW-front convention) - that would remove the need for this cull-mode workaround
 	// and its negative-scale blind spot entirely - but that's a separate, larger undertaking.
 	RD::PipelineRasterizationState rs;
-	rs.cull_mode = RD::POLYGON_CULL_FRONT;
+	// CULL_BACK, not CULL_FRONT. The history above blamed "inconsistent meshlet winding," but
+	// meshopt_buildMeshlets only PARTITIONS the source index buffer - it never reorders a triangle's
+	// three vertices - so meshlet winding equals the source mesh's, which for Godot meshes is standard
+	// CCW-front. Single-mesh primitives (BoxMesh/SphereMesh, StandardMaterial3D) rendered inside-out
+	// under CULL_FRONT - exactly what a backwards cull mode does to correctly-wound geometry - and
+	// switching to CULL_BACK fixed them with nothing else inverting (verified in a real scene). The
+	// old "holes" the comment blamed on winding were most likely the since-removed local-Z normal flip.
+	rs.cull_mode = RD::POLYGON_CULL_BACK;
 
 	// Depth bias is handled manually in the vertex shader (see meshlet_render.glsl), not via
 	// RD::PipelineRasterizationState's depth_bias_* fields - those scale by Vulkan's own per-

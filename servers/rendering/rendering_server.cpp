@@ -3889,6 +3889,15 @@ void RenderingServer::init() {
 	// off regardless of this setting). Restart-to-apply.
 	GLOBAL_DEF_RST("rendering/virtual_texture/enabled", false);
 
+	// MultiMesh continuous LOD: when enabled, opaque/alpha-scissor MultiMeshInstance3D instances are
+	// expanded into the meshlet cull/CLOD pipeline (one per-instance transform each), so flora and
+	// other instanced geometry get the same Nanite-style per-instance LOD cut as plain meshes instead
+	// of always rendering full-detail. Independent sub-toggle of the main meshlet path
+	// (rendering/meshlet/enabled) so it can be turned off alone if a project regresses. CPU-expands
+	// per frame, sized for up to a few thousand visible instances per MultiMesh; larger ones fall back
+	// to full-detail Forward+. Re-evaluated each frame (no restart needed).
+	GLOBAL_DEF_RST("rendering/meshlet/multimesh_lod", true);
+
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);
 

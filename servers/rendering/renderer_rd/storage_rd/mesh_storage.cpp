@@ -44,6 +44,55 @@ MeshStorage *MeshStorage::get_singleton() {
 	return singleton;
 }
 
+// Normalize meshlet triangle winding so every triangle is outward-facing (its geometric normal
+// agrees with the interpolated vertex normals). meshopt only partitions the index buffer, but the
+// source winding is not reliably uniform across the meshlets produced for a surface, so the meshlet
+// render pipeline's single static CULL_BACK correctly draws the majority yet culls the front faces
+// of the inverted minority - the "holes" bug on opaque meshlet primitives. Flipping the odd ones out
+// here (swap two of the triangle's three local indices) makes CULL_BACK correct for all of them.
+// meshlet_triangles: 3 uint8 local indices per triangle; meshlet_vertices: local->global remap;
+// positions/normals indexed by the global id. No-op when normals are absent.
+static void _normalize_meshlet_winding(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedInt32Array &p_meshlet_vertices, PackedByteArray &r_meshlet_triangles, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets) {
+	if (p_normals.size() != p_positions.size() || p_positions.is_empty() || r_meshlet_triangles.is_empty()) {
+		return;
+	}
+	const Vector3 *positions = p_positions.ptr();
+	const Vector3 *normals = p_normals.ptr();
+	const int32_t *remap = p_meshlet_vertices.ptr();
+	uint8_t *tris = r_meshlet_triangles.ptrw();
+	const int remap_count = p_meshlet_vertices.size();
+	const int vertex_count = p_positions.size();
+	for (int mi = 0; mi < p_meshlets.size(); mi++) {
+		const RenderingServerTypes::MeshletInfo &m = p_meshlets[mi];
+		for (uint32_t t = 0; t < m.triangle_count; t++) {
+			uint32_t off = m.triangle_offset + t * 3;
+			uint32_t l0 = tris[off + 0];
+			uint32_t l1 = tris[off + 1];
+			uint32_t l2 = tris[off + 2];
+			uint32_t r0 = m.vertex_offset + l0;
+			uint32_t r1 = m.vertex_offset + l1;
+			uint32_t r2 = m.vertex_offset + l2;
+			if ((int)r0 >= remap_count || (int)r1 >= remap_count || (int)r2 >= remap_count) {
+				continue;
+			}
+			int32_t g0 = remap[r0];
+			int32_t g1 = remap[r1];
+			int32_t g2 = remap[r2];
+			if (g0 < 0 || g1 < 0 || g2 < 0 || g0 >= vertex_count || g1 >= vertex_count || g2 >= vertex_count) {
+				continue;
+			}
+			Vector3 face_n = (positions[g1] - positions[g0]).cross(positions[g2] - positions[g0]);
+			Vector3 vert_n = normals[g0] + normals[g1] + normals[g2];
+			if (face_n.dot(vert_n) < 0.0f) {
+				// Reverse winding: swap the last two local indices.
+				uint8_t tmp = tris[off + 1];
+				tris[off + 1] = tris[off + 2];
+				tris[off + 2] = tmp;
+			}
+		}
+	}
+}
+
 MeshStorage::MeshStorage() {
 	singleton = this;
 
@@ -442,6 +491,16 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		// source vertex array - see RenderingServer::mesh_create_surface_data_from_arrays()).
 		RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
 		if (meshlet_storage && new_surface.meshlets.size() > 0) {
+			// Make every meshlet's winding uniformly outward so the render pipeline's static CULL_BACK
+			// draws all of them (fixes the front-face-culled "holes"). Base + each LOD share the same
+			// vertex positions/normals.
+			_normalize_meshlet_winding(new_surface.meshlet_positions, new_surface.meshlet_normals, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlets);
+			for (int i = 0; i < new_surface.lods.size(); i++) {
+				if (new_surface.lods[i].meshlets.size() > 0) {
+					RenderingServerTypes::SurfaceData::LOD &lod = new_surface.lods.write[i];
+					_normalize_meshlet_winding(new_surface.meshlet_positions, new_surface.meshlet_normals, lod.meshlet_vertices, lod.meshlet_triangles, lod.meshlets);
+				}
+			}
 			MeshletStorage::Range vertex_range = meshlet_storage->upload_vertices(new_surface.meshlet_positions, new_surface.meshlet_normals, new_surface.meshlet_uvs);
 			if (vertex_range.is_valid()) {
 				s->meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.meshlets, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlet_bounds, new_surface.meshlet_lods);
@@ -540,7 +599,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 				bw[i] = (int)ip[i];
 			}
 		}
-		_enqueue_meshlet_dag_bake(p_mesh, mesh->surface_count - 1, new_surface.meshlet_positions, base_indices);
+		_enqueue_meshlet_dag_bake(p_mesh, mesh->surface_count - 1, new_surface.meshlet_positions, new_surface.meshlet_normals, base_indices);
 	}
 
 	for (MeshInstance *mi : mesh->instances) {
@@ -558,11 +617,12 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	mesh->material_cache.clear();
 }
 
-void MeshStorage::_enqueue_meshlet_dag_bake(RID p_mesh, uint32_t p_surface, const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices) {
+void MeshStorage::_enqueue_meshlet_dag_bake(RID p_mesh, uint32_t p_surface, const PackedVector3Array &p_vertices, const PackedVector3Array &p_normals, const PackedInt32Array &p_indices) {
 	PendingMeshletBake *pending = memnew(PendingMeshletBake);
 	pending->mesh = p_mesh;
 	pending->surface_index = p_surface;
 	pending->vertices = p_vertices;
+	pending->normals = p_normals;
 	pending->indices = p_indices;
 	WorkerThreadPool::get_singleton()->add_native_task(&MeshStorage::_meshlet_dag_bake_task, pending, false, "Meshlet cluster-LOD DAG bake");
 }
@@ -573,6 +633,13 @@ void MeshStorage::_meshlet_dag_bake_task(void *p_userdata) {
 	completed.mesh = pending->mesh;
 	completed.surface_index = pending->surface_index;
 	bool ok = RenderingServer::bake_meshlet_dag(pending->vertices, pending->indices, completed.meshlets, completed.meshlet_vertices, completed.meshlet_triangles, completed.bounds, completed.lods);
+	if (ok && !completed.meshlets.is_empty()) {
+		// Same winding normalization the synchronous path applies (see mesh_create_surface's call) -
+		// the DAG's meshlet_vertices remap into the same vertex set, so pending->normals is the winding
+		// reference. Done here on the worker thread (no shared state touched), before the completed set
+		// is queued for the render-thread swap. One call covers all LODs (unified DAG cluster set).
+		_normalize_meshlet_winding(pending->vertices, pending->normals, completed.meshlet_vertices, completed.meshlet_triangles, completed.meshlets);
+	}
 	memdelete(pending);
 	if (!ok || completed.meshlets.is_empty()) {
 		return; // DAG not bakeable - keep the single-level meshlets the surface already has.
