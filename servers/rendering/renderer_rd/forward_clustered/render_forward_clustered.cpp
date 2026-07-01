@@ -1905,6 +1905,11 @@ uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_mater
 		data.albedo_texture_index = register_param_texture("texture_albedo");
 		data.normal_texture_index = register_param_texture("texture_normal");
 		data.orm_texture_index = register_param_texture("texture_orm");
+		if (use_virtual_textures) {
+			// GPU feedback reports only the albedo VT; link its normal/ORM siblings so streaming an
+			// albedo page brings the material's full PBR set resident together (they share UV/pages).
+			RendererRD::VirtualTextureStorage::get_singleton()->link_material_siblings(data.albedo_texture_index, data.normal_texture_index, data.orm_texture_index);
+		}
 
 		Variant normal_scale_v = material_storage->material_get_param(material_rid, "normal_scale");
 		if (normal_scale_v.get_type() != Variant::NIL) {

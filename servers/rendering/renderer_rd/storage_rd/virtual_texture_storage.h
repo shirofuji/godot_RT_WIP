@@ -73,12 +73,18 @@ public:
 	// What's actually stored per page in the atlas (content + both borders).
 	static constexpr uint32_t STORED_PAGE_SIZE = PAGE_SIZE + 2 * PAGE_BORDER; // 136
 
-	// Pool atlas dimensions in TILES. The physical pool texture is (POOL_TILES_X * STORED_PAGE_SIZE)
-	// wide. S0a sizes this large enough to hold the test content fully resident; S0c replaces the
-	// constant with a `rendering/virtual_texture/pool_size_mb` project setting (the pool size IS the
-	// VRAM budget). Tile coords are packed into the indirection texel as bytes, so each axis <= 255.
-	static constexpr uint32_t POOL_TILES_X = 64;
-	static constexpr uint32_t POOL_TILES_Y = 64; // 64*64 = 4096 tiles * (128^2) ~= 67M texels of content.
+	// Pool atlas dimensions in TILES. The physical pool texture is (dim * STORED_PAGE_SIZE) square; the
+	// pool size IS the VRAM budget. Derived at init from the `rendering/virtual_texture/pool_size_mb`
+	// project setting via get_pool_tiles_dim() (both this storage's allocation AND the meshlet VT
+	// shader variant's VT_POOL_TILES_X define read that one accessor, so they always agree). Tile
+	// coords are packed into the indirection texel as bytes, so the dim is clamped to [8, 255].
+	// Bytes per stored tile (RGBA8). Default 64x64 tiles ~= 289 MB.
+	static constexpr uint32_t POOL_TILE_BYTES = STORED_PAGE_SIZE * STORED_PAGE_SIZE * 4;
+	static constexpr uint32_t POOL_TILES_DIM_MIN = 8;
+	static constexpr uint32_t POOL_TILES_DIM_MAX = 255; // indirection stores tile x/y as uint8.
+	// Reads the project setting and returns the pool tiles-per-side (square). Static so the meshlet
+	// renderer can inject the matching VT_POOL_TILES_X shader define without needing the instance.
+	static uint32_t get_pool_tiles_dim();
 
 	// Max distinct virtual textures = layers in the indirection array. Matches the old
 	// MeshletStorage::MAX_MATERIAL_TEXTURES so the meshlet binding model (one bounded array) carries
@@ -129,6 +135,11 @@ public:
 	// writes the indirection texels. The returned vt_id is what a material stores in place of the old
 	// per-texture slot index, and what the shader passes to the VT-sample helper.
 	uint32_t register_virtual_texture(const RID &p_source_rd_texture);
+
+	// Records that p_normal_vt and p_orm_vt are the same material's normal/ORM siblings of the albedo
+	// p_albedo_vt, so update_streaming() streams their matching pages together (GPU feedback only
+	// reports albedo). Invalid/0xFFFFFFFF sibling ids are skipped. Idempotent per registration.
+	void link_material_siblings(uint32_t p_albedo_vt, uint32_t p_normal_vt, uint32_t p_orm_vt);
 
 	// Releases a virtual texture's pool tiles and clears its indirection layer. Safe to call on an
 	// unregistered/invalid vt_id (no-op).
@@ -194,7 +205,9 @@ private:
 	bool _ensure_initialized();
 	bool initialized = false;
 
-	RID page_pool_texture; // 2D, (POOL_TILES_X*STORED_PAGE_SIZE) x (POOL_TILES_Y*STORED_PAGE_SIZE).
+	uint32_t pool_tiles_dim = 64; // Pool tiles per side (square). Set from get_pool_tiles_dim() at init.
+
+	RID page_pool_texture; // 2D, (pool_tiles_dim*STORED_PAGE_SIZE) square.
 	RID indirection_texture; // 2D_ARRAY, MAX_VIRTUAL_TEXTURES layers, mipped to the page-grid chain.
 	RID vt_metadata_buffer; // Storage buffer of VTMetadataGPU[MAX_VIRTUAL_TEXTURES].
 
@@ -231,6 +244,11 @@ private:
 		uint32_t resident_mip_floor = 0; // Mips >= this are the always-resident base (never evicted).
 		LocalVector<uint32_t> resident_tiles; // Base pool tiles, released in free_virtual_texture().
 		Vector<uint8_t> indirection_cpu; // CPU shadow of this layer's page table, for per-page patching.
+		// Sibling VTs of the SAME material (albedo's siblings = its normal + ORM). GPU feedback only
+		// reports the albedo VT (one per screen tile), but siblings share the same UV -> same
+		// (mip,page), so streaming an albedo page also streams its siblings' matching pages, keeping a
+		// material's PBR set resident together. Empty for non-albedo VTs. See link_material_siblings().
+		LocalVector<uint32_t> siblings;
 	};
 	LocalVector<VirtualTexture> virtual_textures; // Indexed by vt_id.
 	HashMap<RID, uint32_t> source_rid_to_vt_id; // Dedup.

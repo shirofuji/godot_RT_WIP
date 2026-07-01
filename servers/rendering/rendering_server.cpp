@@ -3889,6 +3889,12 @@ void RenderingServer::init() {
 	// off regardless of this setting). Restart-to-apply.
 	GLOBAL_DEF_RST("rendering/virtual_texture/enabled", false);
 
+	// Physical page-pool size in MB - the VT VRAM budget (the pool holds the resident/streamed pages;
+	// everything else falls back to a coarser resident mip). Derived to a square tile grid (clamped so
+	// each tile axis fits the indirection's uint8, i.e. <= 255 tiles/side). Default ~289 = 64x64 tiles.
+	// Restart-to-apply (sizes GPU textures + bakes into the VT shader variant at startup).
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/virtual_texture/pool_size_mb", PROPERTY_HINT_RANGE, "16,4096,1"), 289);
+
 	// MultiMesh continuous LOD: when enabled, opaque/alpha-scissor MultiMeshInstance3D instances are
 	// expanded into the meshlet cull/CLOD pipeline (one per-instance transform each), so flora and
 	// other instanced geometry get the same Nanite-style per-instance LOD cut as plain meshes instead

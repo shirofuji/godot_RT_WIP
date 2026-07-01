@@ -374,7 +374,12 @@ layout(set = 0, binding = 12) uniform sampler radiance_sampler;
 #define VT_PAGE_SIZE 128.0
 #define VT_PAGE_BORDER 4.0
 #define VT_STORED_PAGE_SIZE 136.0
+// VT_POOL_TILES_X is injected into this variant's version string by MeshletRenderer from
+// VirtualTextureStorage::get_pool_tiles_dim() (the pool_size_mb setting), so it matches the runtime
+// pool allocation. This #ifndef default only applies if that injection is ever absent.
+#ifndef VT_POOL_TILES_X
 #define VT_POOL_TILES_X 64
+#endif
 #define VT_INDIRECTION_MIPS 7
 
 layout(set = 0, binding = 13) uniform texture2D vt_page_pool;

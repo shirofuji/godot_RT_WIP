@@ -89,6 +89,26 @@ bool VirtualTextureStorage::is_enabled() {
 	return enabled;
 }
 
+uint32_t VirtualTextureStorage::get_pool_tiles_dim() {
+	// pool_size_mb -> square tiles-per-side. Clamped to [MIN, MAX] (MAX 255 because the indirection
+	// texel stores each tile axis as a uint8). Both this storage's allocation and the meshlet VT
+	// shader's VT_POOL_TILES_X define call this. Cached on first call (the setting is restart-to-apply)
+	// so those two callers get an IDENTICAL value regardless of read order - a mismatch would break the
+	// shader's virtual->physical UV mapping.
+	static uint32_t cached_dim = 0;
+	if (cached_dim != 0) {
+		return cached_dim;
+	}
+	int mb = (int)GLOBAL_GET("rendering/virtual_texture/pool_size_mb");
+	if (mb <= 0) {
+		mb = 289; // default ~ 64x64 tiles
+	}
+	uint64_t total_tiles = (uint64_t(mb) * 1024ull * 1024ull) / uint64_t(POOL_TILE_BYTES);
+	uint32_t dim = (uint32_t)Math::floor(Math::sqrt((double)total_tiles));
+	cached_dim = CLAMP(dim, POOL_TILES_DIM_MIN, POOL_TILES_DIM_MAX);
+	return cached_dim;
+}
+
 bool VirtualTextureStorage::_ensure_initialized() {
 	if (initialized) {
 		return true;
@@ -97,6 +117,7 @@ bool VirtualTextureStorage::_ensure_initialized() {
 	if (rd == nullptr) {
 		return false; // Headless without a real device (e.g. doctest) - VT is unavailable.
 	}
+	pool_tiles_dim = get_pool_tiles_dim();
 
 	// Blit compute pipeline.
 	Vector<String> versions;
@@ -112,8 +133,8 @@ bool VirtualTextureStorage::_ensure_initialized() {
 	{
 		RD::TextureFormat tf;
 		tf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
-		tf.width = POOL_TILES_X * STORED_PAGE_SIZE;
-		tf.height = POOL_TILES_Y * STORED_PAGE_SIZE;
+		tf.width = pool_tiles_dim * STORED_PAGE_SIZE;
+		tf.height = pool_tiles_dim * STORED_PAGE_SIZE;
 		tf.texture_type = RD::TEXTURE_TYPE_2D;
 		tf.mipmaps = 1;
 		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
@@ -146,7 +167,7 @@ bool VirtualTextureStorage::_ensure_initialized() {
 	}
 
 	// Free-list of pool tiles (all free initially). Popped from the back.
-	const uint32_t tile_count = POOL_TILES_X * POOL_TILES_Y;
+	const uint32_t tile_count = pool_tiles_dim * pool_tiles_dim;
 	free_tiles.resize(tile_count);
 	for (uint32_t i = 0; i < tile_count; i++) {
 		free_tiles[i] = (tile_count - 1) - i; // So index 0 is popped first.
@@ -198,6 +219,20 @@ void VirtualTextureStorage::_write_indirection(uint32_t p_vt_id, uint32_t p_mip,
 	(void)p_page_x;
 	(void)p_page_y;
 	(void)p_tile_index;
+}
+
+void VirtualTextureStorage::link_material_siblings(uint32_t p_albedo_vt, uint32_t p_normal_vt, uint32_t p_orm_vt) {
+	if (p_albedo_vt == 0xFFFFFFFF || p_albedo_vt >= virtual_textures.size()) {
+		return;
+	}
+	VirtualTexture &vt = virtual_textures[p_albedo_vt];
+	vt.siblings.clear();
+	uint32_t sibs[2] = { p_normal_vt, p_orm_vt };
+	for (uint32_t s = 0; s < 2; s++) {
+		if (sibs[s] != 0xFFFFFFFF && sibs[s] < virtual_textures.size() && sibs[s] != p_albedo_vt) {
+			vt.siblings.push_back(sibs[s]);
+		}
+	}
 }
 
 uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_texture) {
@@ -310,8 +345,8 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 				}
 				vt.resident_tiles.push_back(tile);
 
-				uint32_t tile_x = tile % POOL_TILES_X;
-				uint32_t tile_y = tile / POOL_TILES_X;
+				uint32_t tile_x = tile % pool_tiles_dim;
+				uint32_t tile_y = tile / pool_tiles_dim;
 
 				BlitPush push;
 				push.src_page_origin[0] = int32_t(px * PAGE_SIZE);
@@ -519,8 +554,8 @@ void VirtualTextureStorage::_set_page_indirection(uint32_t p_vt_id, uint32_t p_m
 	}
 	uint8_t *texel = vt.indirection_cpu.ptrw() + offset;
 	if (p_resident) {
-		texel[0] = uint8_t(p_tile % POOL_TILES_X);
-		texel[1] = uint8_t(p_tile / POOL_TILES_X);
+		texel[0] = uint8_t(p_tile % pool_tiles_dim);
+		texel[1] = uint8_t(p_tile / pool_tiles_dim);
 		texel[2] = 1; // resident
 		texel[3] = 0;
 	} else {
@@ -578,8 +613,26 @@ void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_reques
 	LocalVector<StreamOp> ops;
 	uint32_t streamed = 0;
 
+	// Expand each feedback request (albedo only) with the same (mip,page) for its material siblings
+	// (normal + ORM), which share the albedo's UV and page layout - so a material's full PBR set
+	// streams in together instead of leaving normal/ORM stuck at the coarse resident floor.
+	LocalVector<PageRequest> expanded;
+	expanded.reserve(p_requests.size() * 3);
 	for (int i = 0; i < p_requests.size(); i++) {
 		const PageRequest &req = p_requests[i];
+		expanded.push_back(req);
+		if (req.vt_id < virtual_textures.size()) {
+			const LocalVector<uint32_t> &sibs = virtual_textures[req.vt_id].siblings;
+			for (uint32_t s = 0; s < sibs.size(); s++) {
+				PageRequest sr = req;
+				sr.vt_id = sibs[s];
+				expanded.push_back(sr);
+			}
+		}
+	}
+
+	for (uint32_t i = 0; i < expanded.size(); i++) {
+		const PageRequest &req = expanded[i];
 		if (req.vt_id >= virtual_textures.size()) {
 			continue;
 		}
@@ -646,8 +699,8 @@ void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_reques
 		rd->compute_list_bind_compute_pipeline(cl, blit_pipeline);
 		for (uint32_t i = 0; i < ops.size(); i++) {
 			rd->compute_list_bind_uniform_set(cl, source_sets[ops[i].source], 0);
-			uint32_t tile_x = ops[i].tile % POOL_TILES_X;
-			uint32_t tile_y = ops[i].tile / POOL_TILES_X;
+			uint32_t tile_x = ops[i].tile % pool_tiles_dim;
+			uint32_t tile_y = ops[i].tile / pool_tiles_dim;
 			BlitPush push;
 			push.src_page_origin[0] = int32_t(ops[i].page_x * PAGE_SIZE);
 			push.src_page_origin[1] = int32_t(ops[i].page_y * PAGE_SIZE);

@@ -48,7 +48,10 @@ MeshletRenderer::MeshletRenderer() {
 	Vector<String> versions;
 	versions.push_back(""); // Version 0: normal (direct material_textures[] sampling + depth).
 	versions.push_back("\n#define MESHLET_DEPTH_ONLY\n"); // Version 1: no fragment color output.
-	versions.push_back("\n#define MESHLET_USE_VIRTUAL_TEXTURES\n"); // Version 2: VT-sampled color.
+	// Version 2: VT-sampled color. Inject VT_POOL_TILES_X to match VirtualTextureStorage's runtime pool
+	// allocation (from the rendering/virtual_texture/pool_size_mb setting) so the shader's virtual->
+	// physical UV mapping uses the correct pool geometry.
+	versions.push_back(vformat("\n#define MESHLET_USE_VIRTUAL_TEXTURES\n#define VT_POOL_TILES_X %d\n", (int)VirtualTextureStorage::get_pool_tiles_dim()));
 	render_shader.initialize(versions);
 	render_shader_version = render_shader.version_create();
 	render_shader_rid = render_shader.version_get_shader(render_shader_version, 0);
