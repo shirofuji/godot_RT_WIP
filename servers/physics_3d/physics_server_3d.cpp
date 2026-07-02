@@ -798,6 +798,16 @@ void PhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("body_set_param", "body", "param", "value"), &PhysicsServer3D::body_set_param);
 	ClassDB::bind_method(D_METHOD("body_get_param", "body", "param"), &PhysicsServer3D::body_get_param);
 
+	ClassDB::bind_method(D_METHOD("meshlet_collider_create"), &PhysicsServer3D::meshlet_collider_create);
+	ClassDB::bind_method(D_METHOD("meshlet_collider_set_data", "collider", "mesh", "transform"), &PhysicsServer3D::meshlet_collider_set_data, DEFVAL(Transform3D()));
+	ClassDB::bind_method(D_METHOD("meshlet_collider_set_transform", "collider", "transform"), &PhysicsServer3D::meshlet_collider_set_transform);
+	ClassDB::bind_method(D_METHOD("meshlet_collider_clear", "collider"), &PhysicsServer3D::meshlet_collider_clear);
+
+	ClassDB::bind_method(D_METHOD("bulk_body_create", "count"), &PhysicsServer3D::bulk_body_create);
+	ClassDB::bind_method(D_METHOD("bulk_body_scatter", "handle", "region"), &PhysicsServer3D::bulk_body_scatter);
+	ClassDB::bind_method(D_METHOD("bulk_body_set_multimesh", "handle", "multimesh"), &PhysicsServer3D::bulk_body_set_multimesh);
+	ClassDB::bind_method(D_METHOD("bulk_body_free", "handle"), &PhysicsServer3D::bulk_body_free);
+
 	ClassDB::bind_method(D_METHOD("body_reset_mass_properties", "body"), &PhysicsServer3D::body_reset_mass_properties);
 
 	ClassDB::bind_method(D_METHOD("body_set_state", "body", "state", "value"), &PhysicsServer3D::body_set_state);

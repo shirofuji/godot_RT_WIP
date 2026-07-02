@@ -339,6 +339,18 @@ public:
 	FUNC3(soft_body_pin_point, RID, int, bool);
 	FUNC2RC(bool, soft_body_is_point_pinned, RID, int);
 
+	/* MESHLET COLLIDER API */
+
+	FUNCRID(meshlet_collider)
+	FUNC3(meshlet_collider_set_data, RID, RID, const Transform3D &)
+	FUNC2(meshlet_collider_set_transform, RID, const Transform3D &)
+	FUNC1(meshlet_collider_clear, RID)
+
+	FUNC1R(int, bulk_body_create, int)
+	FUNC2(bulk_body_scatter, int, const AABB &)
+	FUNC2(bulk_body_set_multimesh, int, RID)
+	FUNC1(bulk_body_free, int)
+
 	/* JOINT API */
 
 	FUNCRID(joint)

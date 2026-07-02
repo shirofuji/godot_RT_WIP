@@ -479,6 +479,13 @@ public:
 	EXBIND2(soft_body_apply_central_impulse, RID, const Vector3 &)
 	EXBIND2(soft_body_apply_central_force, RID, const Vector3 &)
 
+	/* MESHLET COLLIDER API */
+
+	EXBIND0R(RID, meshlet_collider_create)
+	EXBIND3(meshlet_collider_set_data, RID, RID, const Transform3D &)
+	EXBIND2(meshlet_collider_set_transform, RID, const Transform3D &)
+	EXBIND1(meshlet_collider_clear, RID)
+
 	/* JOINT API */
 
 	EXBIND0R(RID, joint_create)

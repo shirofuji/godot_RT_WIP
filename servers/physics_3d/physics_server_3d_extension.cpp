@@ -374,6 +374,13 @@ void PhysicsServer3DExtension::_bind_methods() {
 	GDVIRTUAL_BIND(_soft_body_apply_central_impulse, "body", "impulse");
 	GDVIRTUAL_BIND(_soft_body_apply_central_force, "body", "force");
 
+	/* MESHLET COLLIDER API */
+
+	GDVIRTUAL_BIND(_meshlet_collider_create);
+	GDVIRTUAL_BIND(_meshlet_collider_set_data, "collider", "mesh", "transform");
+	GDVIRTUAL_BIND(_meshlet_collider_set_transform, "collider", "transform");
+	GDVIRTUAL_BIND(_meshlet_collider_clear, "collider");
+
 	/* JOINT API */
 
 	GDVIRTUAL_BIND(_joint_create);
