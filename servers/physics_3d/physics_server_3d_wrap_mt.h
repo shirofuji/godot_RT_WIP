@@ -350,6 +350,7 @@ public:
 	FUNC2(bulk_body_scatter, int, const AABB &)
 	FUNC2(bulk_body_set_multimesh, int, RID)
 	FUNC1(bulk_body_free, int)
+	FUNC4(bulk_set_collision, bool, real_t, real_t, int)
 
 	/* JOINT API */
 

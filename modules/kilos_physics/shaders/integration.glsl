@@ -43,6 +43,11 @@ void main() {
     // Static bodies have mass == 0
     if (body.linear_velocity.w == 0.0) return;
 
+    // Save the pre-integration position (PBD "previous" position). The collision
+    // solve corrects .position in place, then the finalize pass recovers velocity
+    // as (position - center_of_mass) / dt. Harmless when collision is disabled.
+    body.center_of_mass.xyz = body.position.xyz;
+
     // Apply Gravity
     body.linear_velocity.xyz += params.gravity.xyz * params.delta_time;
 

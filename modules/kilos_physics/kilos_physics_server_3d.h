@@ -169,6 +169,13 @@ private:
 	Vector<uint32_t> tracked_slots; // slots whose GPU state we read back
 	Vector<RID> active_bodies; // bodies with a state-sync callback, iterated in flush_queries
 
+	// === Collision config (P3) ===
+	bool collision_enabled = false;
+	float body_radius = 0.5f;
+	float ground_y = 0.0f;
+	int solve_iterations = 4;
+	float velocity_damping = 2.0f; // per-second linear damping, helps piles settle
+
 	uint32_t _alloc_slot();
 	void _free_slot(uint32_t p_slot);
 	void _mark_dirty(uint32_t p_slot);
@@ -211,6 +218,11 @@ private:
 		LocalVector<uint32_t> tracked;
 		LocalVector<RangeUpload> range_uploads; // one-shot contiguous uploads (bulk spawn)
 		LocalVector<BulkBind> bulk_binds; // ranges to convert into their MultiMesh this frame
+		// collision snapshot (P3)
+		bool collision_enabled = false;
+		float radius = 0.5f;
+		float ground_y = 0.0f;
+		uint32_t solve_iterations = 4;
 	};
 	Mutex job_mutex;
 	List<StepJob> job_queue;
@@ -229,6 +241,21 @@ private:
 	RID body_uniform_set;
 	uint32_t gpu_capacity = 0;
 	LocalVector<RID> buffers_to_free; // old pool buffers, freed one step after growth
+
+	// PBD collision solve (render thread)
+	bool rt_solve_ready = false;
+	RID solve_shader;
+	RID solve_pipeline;
+	RID finalize_shader;
+	RID finalize_pipeline;
+	// Spatial-hash broad phase (P3b)
+	RID grid_build_shader;
+	RID grid_build_pipeline;
+	RID grid_counts_buffer; // table_size uints
+	RID grid_bodies_buffer; // table_size * max_per_cell uints
+	RID grid_uniform_set; // set 1: binding 0 = counts, binding 1 = bodies
+	uint32_t grid_table_size = 1u << 20; // power of two
+	uint32_t grid_max_per_cell = 16;
 
 	// body->multimesh conversion (render thread)
 	bool rt_convert_ready = false;
@@ -253,6 +280,8 @@ private:
 	void _rt_on_readback(const PackedByteArray &p_data, uint32_t p_slot);
 	void _rt_ensure_convert_pipeline();
 	void _rt_convert_to_multimesh(const BulkBind &p_bind);
+	void _rt_ensure_solve_pipeline();
+	void _rt_dispatch_collision(const StepJob &p_job);
 
 public:
 	virtual RID world_boundary_shape_create() override;
@@ -418,6 +447,8 @@ public:
 	virtual void bulk_body_scatter(int p_handle, const AABB &p_region) override;
 	virtual void bulk_body_set_multimesh(int p_handle, RID p_multimesh) override;
 	virtual void bulk_body_free(int p_handle) override;
+	/* COLLISION CONFIG (P3) */
+	virtual void bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) override;
 
 	virtual RID joint_create() override;
 	virtual void joint_clear(RID p_joint) override;

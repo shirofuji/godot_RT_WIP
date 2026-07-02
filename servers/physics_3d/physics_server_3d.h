@@ -651,6 +651,9 @@ public:
 	virtual void bulk_body_scatter(int p_handle, const AABB &p_region) {}
 	virtual void bulk_body_set_multimesh(int p_handle, RID p_multimesh) {}
 	virtual void bulk_body_free(int p_handle) {}
+	// Enables GPU body-body + ground collision for bulk bodies (radius, ground height,
+	// PBD solve iterations). No-op on servers that don't support it.
+	virtual void bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) {}
 
 	/* JOINT API */
 

@@ -4,7 +4,10 @@
 #include "core/object/object_id.h"
 
 #include "shaders/body_to_multimesh.glsl.gen.h"
+#include "shaders/grid_build.glsl.gen.h"
 #include "shaders/integration.glsl.gen.h"
+#include "shaders/pbd_finalize.glsl.gen.h"
+#include "shaders/pbd_solve.glsl.gen.h"
 
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/rendering_device_binds.h"
@@ -265,6 +268,13 @@ void KilosPhysicsServer3D::bulk_body_free(int p_handle) {
 	r.count = bulk->count;
 	dirty_ranges.push_back(r);
 	bulk_ranges.erase(p_handle);
+}
+
+void KilosPhysicsServer3D::bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) {
+	collision_enabled = p_enabled;
+	body_radius = MAX(0.001f, (float)p_radius);
+	ground_y = (float)p_ground_y;
+	solve_iterations = MAX(1, p_iterations);
 }
 
 Vector3 KilosPhysicsServer3D::_debug_slot_position(int p_slot) const {
@@ -941,6 +951,10 @@ void KilosPhysicsServer3D::step(real_t p_step) {
 	job.dt = p_step;
 	job.body_count = body_high_water;
 	job.required_capacity = body_high_water;
+	job.collision_enabled = collision_enabled;
+	job.radius = body_radius;
+	job.ground_y = ground_y;
+	job.solve_iterations = (uint32_t)solve_iterations;
 
 	// Snapshot the slots written since the last step. A slot may appear more
 	// than once; the render thread applies them in order, last write wins.
@@ -1229,6 +1243,134 @@ void KilosPhysicsServer3D::_rt_convert_to_multimesh(const BulkBind &p_bind) {
 	rd->compute_list_end();
 }
 
+void KilosPhysicsServer3D::_rt_ensure_solve_pipeline() {
+	if (rt_solve_ready || !rd) {
+		return;
+	}
+	auto build = [&](const String &p_src, RID &r_shader, RID &r_pipeline, const char *p_label) -> bool {
+		Ref<RDShaderFile> sf;
+		sf.instantiate();
+		Error err = sf->parse_versions_from_text(p_src);
+		if (err != OK) {
+			sf->print_errors(p_label);
+			return false;
+		}
+		Vector<RD::ShaderStageSPIRVData> stages = sf->get_spirv_stages("");
+		r_shader = rd->shader_create_from_spirv(stages);
+		if (!r_shader.is_valid()) {
+			return false;
+		}
+		r_pipeline = rd->compute_pipeline_create(r_shader);
+		return r_pipeline.is_valid();
+	};
+	bool ok = build(String(pbd_solve_shader_glsl), solve_shader, solve_pipeline, "KilosPhysics pbd_solve shader");
+	ok = ok && build(String(pbd_finalize_shader_glsl), finalize_shader, finalize_pipeline, "KilosPhysics pbd_finalize shader");
+	ok = ok && build(String(grid_build_shader_glsl), grid_build_shader, grid_build_pipeline, "KilosPhysics grid_build shader");
+	if (!ok) {
+		return;
+	}
+
+	// Spatial-hash grid buffers (fixed size, allocated once).
+	grid_counts_buffer = rd->storage_buffer_create(grid_table_size * sizeof(uint32_t));
+	grid_bodies_buffer = rd->storage_buffer_create((uint64_t)grid_table_size * grid_max_per_cell * sizeof(uint32_t));
+
+	// set 1 = { counts, bodies }, built against solve_shader (shared with grid_build).
+	Vector<RD::Uniform> gu;
+	RD::Uniform uc;
+	uc.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+	uc.binding = 0;
+	uc.append_id(grid_counts_buffer);
+	gu.push_back(uc);
+	RD::Uniform ub;
+	ub.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+	ub.binding = 1;
+	ub.append_id(grid_bodies_buffer);
+	gu.push_back(ub);
+	grid_uniform_set = rd->uniform_set_create(gu, solve_shader, 1);
+
+	rt_solve_ready = grid_uniform_set.is_valid();
+}
+
+void KilosPhysicsServer3D::_rt_dispatch_collision(const StepJob &p_job) {
+	// body_uniform_set (built against integrate_shader) and grid_uniform_set (set 1)
+	// are layout-compatible with all of these pipelines: identical set formats.
+	const uint32_t groups = (p_job.body_count + 63) / 64;
+	const float cell_size = 2.0f * p_job.radius;
+	const uint32_t table_mask = grid_table_size - 1u;
+
+	// 1) Clear per-cell counts (GPU-side memset).
+	rd->buffer_clear(grid_counts_buffer, 0, grid_table_size * sizeof(uint32_t));
+
+	// 2) Build the spatial hash from the predicted positions.
+	struct GridParams {
+		float cell_size;
+		uint32_t table_mask;
+		uint32_t max_per_cell;
+		uint32_t body_count;
+	} gp;
+	gp.cell_size = cell_size;
+	gp.table_mask = table_mask;
+	gp.max_per_cell = grid_max_per_cell;
+	gp.body_count = p_job.body_count;
+	{
+		RD::ComputeListID cl = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(cl, grid_build_pipeline);
+		rd->compute_list_bind_uniform_set(cl, body_uniform_set, 0);
+		rd->compute_list_bind_uniform_set(cl, grid_uniform_set, 1);
+		rd->compute_list_set_push_constant(cl, &gp, sizeof(GridParams));
+		rd->compute_list_dispatch(cl, groups, 1, 1);
+		rd->compute_list_end();
+	}
+
+	// 3) PBD relaxation iterations (body-body + ground).
+	struct SolveParams {
+		float radius;
+		float ground_y;
+		float cell_size;
+		uint32_t body_count;
+		uint32_t table_mask;
+		uint32_t max_per_cell;
+		uint32_t pad0;
+		uint32_t pad1;
+	} sp;
+	sp.radius = p_job.radius;
+	sp.ground_y = p_job.ground_y;
+	sp.cell_size = cell_size;
+	sp.body_count = p_job.body_count;
+	sp.table_mask = table_mask;
+	sp.max_per_cell = grid_max_per_cell;
+	sp.pad0 = 0;
+	sp.pad1 = 0;
+	for (uint32_t it = 0; it < p_job.solve_iterations; it++) {
+		RD::ComputeListID cl = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(cl, solve_pipeline);
+		rd->compute_list_bind_uniform_set(cl, body_uniform_set, 0);
+		rd->compute_list_bind_uniform_set(cl, grid_uniform_set, 1);
+		rd->compute_list_set_push_constant(cl, &sp, sizeof(SolveParams));
+		rd->compute_list_dispatch(cl, groups, 1, 1);
+		rd->compute_list_end();
+	}
+
+	// 4) Recover velocity from the corrected position (with light damping).
+	struct FinParams {
+		float inv_dt;
+		float damping_factor;
+		uint32_t body_count;
+		uint32_t pad1;
+	} fp;
+	fp.inv_dt = (p_job.dt > 0.0) ? (float)(1.0 / p_job.dt) : 0.0f;
+	fp.damping_factor = MAX(0.0f, 1.0f - velocity_damping * (float)p_job.dt);
+	fp.body_count = p_job.body_count;
+	fp.pad1 = 0;
+
+	RD::ComputeListID cl = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(cl, finalize_pipeline);
+	rd->compute_list_bind_uniform_set(cl, body_uniform_set, 0);
+	rd->compute_list_set_push_constant(cl, &fp, sizeof(FinParams));
+	rd->compute_list_dispatch(cl, groups, 1, 1);
+	rd->compute_list_end();
+}
+
 void KilosPhysicsServer3D::_render_process_step() {
 	// Runs on the render thread with the global RD in hand.
 	_rt_ensure_pipeline();
@@ -1284,6 +1426,14 @@ void KilosPhysicsServer3D::_render_process_step() {
 	}
 
 	_rt_dispatch_integrate(job);
+
+	// PBD collision: correct the predicted positions in place, then recover velocity.
+	if (job.collision_enabled) {
+		_rt_ensure_solve_pipeline();
+		if (rt_solve_ready) {
+			_rt_dispatch_collision(job);
+		}
+	}
 
 	// GPU->GPU: write integrated transforms straight into each bound MultiMesh.
 	if (!job.bulk_binds.is_empty()) {
@@ -1348,6 +1498,30 @@ KilosPhysicsServer3D::~KilosPhysicsServer3D() {
 		}
 		if (convert_shader.is_valid()) {
 			rd->free_rid(convert_shader);
+		}
+		if (solve_pipeline.is_valid()) {
+			rd->free_rid(solve_pipeline);
+		}
+		if (solve_shader.is_valid()) {
+			rd->free_rid(solve_shader);
+		}
+		if (finalize_pipeline.is_valid()) {
+			rd->free_rid(finalize_pipeline);
+		}
+		if (finalize_shader.is_valid()) {
+			rd->free_rid(finalize_shader);
+		}
+		if (grid_build_pipeline.is_valid()) {
+			rd->free_rid(grid_build_pipeline);
+		}
+		if (grid_build_shader.is_valid()) {
+			rd->free_rid(grid_build_shader);
+		}
+		if (grid_counts_buffer.is_valid()) {
+			rd->free_rid(grid_counts_buffer);
+		}
+		if (grid_bodies_buffer.is_valid()) {
+			rd->free_rid(grid_bodies_buffer);
 		}
 	}
 }

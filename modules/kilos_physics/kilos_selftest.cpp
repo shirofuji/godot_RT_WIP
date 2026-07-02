@@ -158,6 +158,89 @@ void test_bulk_render_from_buffer() {
 	memdelete(server);
 }
 
+void test_ground_rest() {
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	const float RADIUS = 0.5f;
+	const float GROUND_Y = 0.0f;
+	server->bulk_set_collision(true, RADIUS, GROUND_Y, 4);
+
+	const int N = 100;
+	const double DT = 1.0 / 60.0;
+	const double START_Y = 10.0;
+
+	int handle = server->bulk_body_create(N);
+	// Flat plane at START_Y (size.y = 0) so every body starts at the same height.
+	server->bulk_body_scatter(handle, AABB(Vector3(-20, START_Y, -20), Vector3(40, 0, 40)));
+
+	// ~3s: plenty to fall 9.5m and settle.
+	for (int s = 0; s < 180; s++) {
+		server->step(DT);
+	}
+	server->_debug_sync_readback();
+
+	const double rest_y = GROUND_Y + RADIUS;
+	bool all_rest = true;
+	double worst = 0.0;
+	for (int i = 0; i < N; i += 7) {
+		Vector3 p = server->_debug_slot_position(handle + i);
+		worst = MAX(worst, Math::abs(p.y - rest_y));
+		if (Math::abs(p.y - rest_y) > 0.01) {
+			all_rest = false;
+		}
+	}
+	check(all_rest, vformat("Bodies fall and rest on the ground plane at y=%.2f (worst dy=%.4f)", rest_y, worst));
+
+	server->bulk_body_free(handle);
+	memdelete(server);
+}
+
+void test_pile_no_interpenetration() {
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	const float RADIUS = 0.5f;
+	const float GROUND_Y = 0.0f;
+	server->bulk_set_collision(true, RADIUS, GROUND_Y, 8);
+	const double DT = 1.0 / 60.0;
+
+	// Drop a cluster into a modest volume above the ground; they collide, spread,
+	// and pile on the floor. This is the realistic scenario (small per-frame
+	// overlaps), unlike an artificial deep initial penetration.
+	const int N = 64;
+	int handle = server->bulk_body_create(N);
+	server->bulk_body_scatter(handle, AABB(Vector3(-2, 3, -2), Vector3(4, 6, 4)));
+
+	for (int s = 0; s < 480; s++) { // ~8s to settle
+		server->step(DT);
+	}
+	server->_debug_sync_readback();
+
+	// (1) Everything is on or above the ground.
+	bool above_ground = true;
+	double lowest = 1e9;
+	for (int i = 0; i < N; i++) {
+		double y = server->_debug_slot_position(handle + i).y;
+		lowest = MIN(lowest, y);
+		if (y < GROUND_Y + RADIUS - 0.05) {
+			above_ground = false;
+		}
+	}
+	check(above_ground, vformat("All %d bodies rest on/above the ground (lowest y=%.3f, floor=%.3f)", N, lowest, GROUND_Y + RADIUS));
+
+	// (2) No significant interpenetration: min pairwise centre distance stays near 2*R.
+	double min_dist = 1e9;
+	for (int i = 0; i < N; i++) {
+		Vector3 pi = server->_debug_slot_position(handle + i);
+		for (int j = i + 1; j < N; j++) {
+			double d = pi.distance_to(server->_debug_slot_position(handle + j));
+			min_dist = MIN(min_dist, d);
+		}
+	}
+	// Approximate solver: allow up to ~20% penetration.
+	check(min_dist >= 0.8 * (2.0 * RADIUS), vformat("Settled pile has no significant interpenetration (min pair dist=%.4f, 2*R=%.2f)", min_dist, 2.0 * RADIUS));
+
+	server->bulk_body_free(handle);
+	memdelete(server);
+}
+
 } // namespace
 
 void run_kilos_selftest_if_requested() {
@@ -169,6 +252,8 @@ void run_kilos_selftest_if_requested() {
 	g_failures = 0;
 	test_gpu_integration_free_fall();
 	test_bulk_render_from_buffer();
+	test_ground_rest();
+	test_pile_no_interpenetration();
 	if (g_failures == 0) {
 		print_line("KILOS_SELFTEST: all checks passed");
 	} else {

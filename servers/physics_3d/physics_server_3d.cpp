@@ -807,6 +807,7 @@ void PhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("bulk_body_scatter", "handle", "region"), &PhysicsServer3D::bulk_body_scatter);
 	ClassDB::bind_method(D_METHOD("bulk_body_set_multimesh", "handle", "multimesh"), &PhysicsServer3D::bulk_body_set_multimesh);
 	ClassDB::bind_method(D_METHOD("bulk_body_free", "handle"), &PhysicsServer3D::bulk_body_free);
+	ClassDB::bind_method(D_METHOD("bulk_set_collision", "enabled", "radius", "ground_y", "iterations"), &PhysicsServer3D::bulk_set_collision);
 
 	ClassDB::bind_method(D_METHOD("body_reset_mass_properties", "body"), &PhysicsServer3D::body_reset_mass_properties);
 

@@ -6,7 +6,9 @@ extends Node3D
 # Bodies free-fall (collision lands in P3); we periodically re-scatter so it loops.
 
 const N := 300000
-const RESPAWN_EVERY := 6.0
+const RESPAWN_EVERY := 12.0
+const RADIUS := 0.5
+const GROUND_Y := 0.0
 
 var _handle := -1
 var _accum := 0.0
@@ -32,14 +34,20 @@ func _ready() -> void:
 	# is zero, so set a large custom AABB or the whole batch gets frustum-culled away.
 	mmi.custom_aabb = AABB(Vector3(-500, -2000, -500), Vector3(1000, 3000, 1000))
 
+	# Enable GPU body-body + ground collision (spatial-hash broad phase + PBD solve).
+	PhysicsServer3D.bulk_set_collision(true, RADIUS, GROUND_Y, 4)
+
 	_handle = PhysicsServer3D.bulk_body_create(N)
 	_scatter()
 	PhysicsServer3D.bulk_body_set_multimesh(_handle, mm.get_rid())
 
-	print("STRESS: spawned ", N, " GPU bodies, handle=", _handle)
+	$Camera3D.look_at(Vector3(0, 10, 0), Vector3.UP)
+
+	print("STRESS: spawned ", N, " GPU bodies (collision on), handle=", _handle)
 
 func _scatter() -> void:
-	PhysicsServer3D.bulk_body_scatter(_handle, AABB(Vector3(-150, 40, -150), Vector3(300, 400, 300)))
+	# Rain down over a wide floor area so they pile a few bodies deep.
+	PhysicsServer3D.bulk_body_scatter(_handle, AABB(Vector3(-160, 30, -160), Vector3(320, 120, 320)))
 
 func _process(dt: float) -> void:
 	_accum += dt
