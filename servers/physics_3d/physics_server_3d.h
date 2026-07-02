@@ -654,6 +654,9 @@ public:
 	// Enables GPU body-body + ground collision for bulk bodies (radius, ground height,
 	// PBD solve iterations). No-op on servers that don't support it.
 	virtual void bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) {}
+	// Binds a static-world signed distance field (an RD 3D texture, world units,
+	// positive outside solid) covering p_bounds, for bulk bodies to collide against.
+	virtual void bulk_set_sdf(RID p_sdf_texture, const AABB &p_bounds) {}
 
 	/* JOINT API */
 

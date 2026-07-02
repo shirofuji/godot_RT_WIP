@@ -277,6 +277,11 @@ void KilosPhysicsServer3D::bulk_set_collision(bool p_enabled, real_t p_radius, r
 	solve_iterations = MAX(1, p_iterations);
 }
 
+void KilosPhysicsServer3D::bulk_set_sdf(RID p_sdf_texture, const AABB &p_bounds) {
+	sdf_texture = p_sdf_texture;
+	sdf_bounds = p_bounds;
+}
+
 Vector3 KilosPhysicsServer3D::_debug_slot_position(int p_slot) const {
 	if (p_slot < 0 || (uint32_t)p_slot >= (uint32_t)body_data.size()) {
 		return Vector3();
@@ -955,6 +960,8 @@ void KilosPhysicsServer3D::step(real_t p_step) {
 	job.radius = body_radius;
 	job.ground_y = ground_y;
 	job.solve_iterations = (uint32_t)solve_iterations;
+	job.sdf_texture = sdf_texture;
+	job.sdf_bounds = sdf_bounds;
 
 	// Snapshot the slots written since the last step. A slot may appear more
 	// than once; the render thread applies them in order, last write wins.
@@ -1288,7 +1295,43 @@ void KilosPhysicsServer3D::_rt_ensure_solve_pipeline() {
 	gu.push_back(ub);
 	grid_uniform_set = rd->uniform_set_create(gu, solve_shader, 1);
 
-	rt_solve_ready = grid_uniform_set.is_valid();
+	// SDF sampler + 1^3 dummy texture (bound to set 2 when no real SDF is set).
+	RD::SamplerState ss;
+	ss.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+	ss.min_filter = RD::SAMPLER_FILTER_LINEAR;
+	ss.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	ss.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	ss.repeat_w = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	sdf_sampler = rd->sampler_create(ss);
+
+	RD::TextureFormat tf;
+	tf.format = RD::DATA_FORMAT_R32_SFLOAT;
+	tf.width = 1;
+	tf.height = 1;
+	tf.depth = 1;
+	tf.texture_type = RD::TEXTURE_TYPE_3D;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+	float far_val = 1.0e9f; // large positive distance => "empty space"
+	Vector<uint8_t> px;
+	px.resize(sizeof(float));
+	memcpy(px.ptrw(), &far_val, sizeof(float));
+	Vector<Vector<uint8_t>> tdata;
+	tdata.push_back(px);
+	sdf_dummy_texture = rd->texture_create(tf, RD::TextureView(), tdata);
+
+	rt_solve_ready = grid_uniform_set.is_valid() && sdf_sampler.is_valid() && sdf_dummy_texture.is_valid();
+}
+
+RID KilosPhysicsServer3D::_rt_get_sdf_uniform_set(RID p_texture) {
+	RID tex = p_texture.is_valid() ? p_texture : sdf_dummy_texture;
+	if (sdf_uniform_set.is_valid() && sdf_uniform_set_texture == tex && rd->uniform_set_is_valid(sdf_uniform_set)) {
+		return sdf_uniform_set;
+	}
+	Vector<RD::Uniform> u;
+	u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sdf_sampler, tex })));
+	sdf_uniform_set = rd->uniform_set_create(u, solve_shader, 2);
+	sdf_uniform_set_texture = tex;
+	return sdf_uniform_set;
 }
 
 void KilosPhysicsServer3D::_rt_dispatch_collision(const StepJob &p_job) {
@@ -1322,7 +1365,9 @@ void KilosPhysicsServer3D::_rt_dispatch_collision(const StepJob &p_job) {
 		rd->compute_list_end();
 	}
 
-	// 3) PBD relaxation iterations (body-body + ground).
+	// 3) PBD relaxation iterations (body-body + optional SDF world + ground).
+	RID sdf_set = _rt_get_sdf_uniform_set(p_job.sdf_texture);
+	const bool sdf_on = p_job.sdf_texture.is_valid();
 	struct SolveParams {
 		float radius;
 		float ground_y;
@@ -1330,8 +1375,10 @@ void KilosPhysicsServer3D::_rt_dispatch_collision(const StepJob &p_job) {
 		uint32_t body_count;
 		uint32_t table_mask;
 		uint32_t max_per_cell;
+		uint32_t sdf_enabled;
 		uint32_t pad0;
-		uint32_t pad1;
+		float sdf_min[4];
+		float sdf_size[4];
 	} sp;
 	sp.radius = p_job.radius;
 	sp.ground_y = p_job.ground_y;
@@ -1339,13 +1386,22 @@ void KilosPhysicsServer3D::_rt_dispatch_collision(const StepJob &p_job) {
 	sp.body_count = p_job.body_count;
 	sp.table_mask = table_mask;
 	sp.max_per_cell = grid_max_per_cell;
+	sp.sdf_enabled = sdf_on ? 1u : 0u;
 	sp.pad0 = 0;
-	sp.pad1 = 0;
+	sp.sdf_min[0] = p_job.sdf_bounds.position.x;
+	sp.sdf_min[1] = p_job.sdf_bounds.position.y;
+	sp.sdf_min[2] = p_job.sdf_bounds.position.z;
+	sp.sdf_min[3] = 0.0f;
+	sp.sdf_size[0] = p_job.sdf_bounds.size.x;
+	sp.sdf_size[1] = p_job.sdf_bounds.size.y;
+	sp.sdf_size[2] = p_job.sdf_bounds.size.z;
+	sp.sdf_size[3] = 0.0f;
 	for (uint32_t it = 0; it < p_job.solve_iterations; it++) {
 		RD::ComputeListID cl = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(cl, solve_pipeline);
 		rd->compute_list_bind_uniform_set(cl, body_uniform_set, 0);
 		rd->compute_list_bind_uniform_set(cl, grid_uniform_set, 1);
+		rd->compute_list_bind_uniform_set(cl, sdf_set, 2);
 		rd->compute_list_set_push_constant(cl, &sp, sizeof(SolveParams));
 		rd->compute_list_dispatch(cl, groups, 1, 1);
 		rd->compute_list_end();
@@ -1522,6 +1578,12 @@ KilosPhysicsServer3D::~KilosPhysicsServer3D() {
 		}
 		if (grid_bodies_buffer.is_valid()) {
 			rd->free_rid(grid_bodies_buffer);
+		}
+		if (sdf_dummy_texture.is_valid()) {
+			rd->free_rid(sdf_dummy_texture);
+		}
+		if (sdf_sampler.is_valid()) {
+			rd->free_rid(sdf_sampler);
 		}
 	}
 }

@@ -241,6 +241,79 @@ void test_pile_no_interpenetration() {
 	memdelete(server);
 }
 
+void test_sdf_dome() {
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (!rd) {
+		check(false, "RenderingDevice available for SDF test");
+		return;
+	}
+
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	const float RADIUS = 0.5f;
+	// Ground far below so the body only interacts with the SDF dome.
+	server->bulk_set_collision(true, RADIUS, -1000.0f, 4);
+	const double DT = 1.0 / 60.0;
+
+	// Bake a solid-sphere SDF (world distance) into a 128^3 R32F 3D texture.
+	const int DIM = 128;
+	const Vector3 CENTER(0, 0, 0);
+	const float SPHERE_R = 20.0f;
+	const AABB bounds(Vector3(-32, -32, -32), Vector3(64, 64, 64));
+
+	Vector<float> sdf;
+	sdf.resize(DIM * DIM * DIM);
+	float *w = sdf.ptrw();
+	for (int z = 0; z < DIM; z++) {
+		for (int y = 0; y < DIM; y++) {
+			for (int x = 0; x < DIM; x++) {
+				Vector3 uvw((x + 0.5f) / DIM, (y + 0.5f) / DIM, (z + 0.5f) / DIM);
+				Vector3 p = bounds.position + uvw * bounds.size;
+				w[(z * DIM + y) * DIM + x] = (float)(p.distance_to(CENTER) - SPHERE_R);
+			}
+		}
+	}
+	Vector<uint8_t> bytes;
+	bytes.resize((int64_t)sdf.size() * sizeof(float));
+	memcpy(bytes.ptrw(), sdf.ptr(), bytes.size());
+
+	RenderingDevice::TextureFormat tf;
+	tf.format = RenderingDevice::DATA_FORMAT_R32_SFLOAT;
+	tf.width = DIM;
+	tf.height = DIM;
+	tf.depth = DIM;
+	tf.texture_type = RenderingDevice::TEXTURE_TYPE_3D;
+	tf.usage_bits = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT;
+	Vector<Vector<uint8_t>> tdata;
+	tdata.push_back(bytes);
+	RID sdf_tex = rd->texture_create(tf, RenderingDevice::TextureView(), tdata);
+
+	server->bulk_set_sdf(sdf_tex, bounds);
+
+	// Drop a body just above the top of the dome (top is at y = SPHERE_R = 20).
+	RID b = server->body_create();
+	server->body_set_mode(b, PhysicsServer3D::BODY_MODE_RIGID);
+	server->body_set_param(b, PhysicsServer3D::BODY_PARAM_MASS, 1.0);
+	server->body_set_state(b, PhysicsServer3D::BODY_STATE_TRANSFORM, Transform3D(Basis(), Vector3(0, 22, 0)));
+
+	for (int s = 0; s < 200; s++) {
+		server->step(DT);
+	}
+	server->_debug_sync_readback();
+
+	Transform3D t = server->body_get_state(b, PhysicsServer3D::BODY_STATE_TRANSFORM);
+	double dist = t.origin.distance_to(CENTER);
+	double expected = SPHERE_R + RADIUS; // 20.5
+
+	check(dist > expected - 0.5 && dist < expected + 0.5,
+			vformat("Body rests on the SDF dome surface (dist from centre=%.3f, expected ~%.2f)", dist, expected));
+	check(t.origin.y > SPHERE_R - 0.5,
+			vformat("Body stayed near the top of the dome (y=%.3f, dome top=%.1f)", t.origin.y, SPHERE_R));
+
+	server->free_rid(b);
+	rd->free_rid(sdf_tex);
+	memdelete(server);
+}
+
 } // namespace
 
 void run_kilos_selftest_if_requested() {
@@ -254,6 +327,7 @@ void run_kilos_selftest_if_requested() {
 	test_bulk_render_from_buffer();
 	test_ground_rest();
 	test_pile_no_interpenetration();
+	test_sdf_dome();
 	if (g_failures == 0) {
 		print_line("KILOS_SELFTEST: all checks passed");
 	} else {

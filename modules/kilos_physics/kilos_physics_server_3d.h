@@ -175,6 +175,10 @@ private:
 	float ground_y = 0.0f;
 	int solve_iterations = 4;
 	float velocity_damping = 2.0f; // per-second linear damping, helps piles settle
+	// Static-world SDF (P4). sdf_texture is an RD 3D texture RID; sdf_bounds is the
+	// world-space region it covers.
+	RID sdf_texture;
+	AABB sdf_bounds;
 
 	uint32_t _alloc_slot();
 	void _free_slot(uint32_t p_slot);
@@ -223,6 +227,9 @@ private:
 		float radius = 0.5f;
 		float ground_y = 0.0f;
 		uint32_t solve_iterations = 4;
+		// SDF snapshot (P4)
+		RID sdf_texture;
+		AABB sdf_bounds;
 	};
 	Mutex job_mutex;
 	List<StepJob> job_queue;
@@ -256,6 +263,11 @@ private:
 	RID grid_uniform_set; // set 1: binding 0 = counts, binding 1 = bodies
 	uint32_t grid_table_size = 1u << 20; // power of two
 	uint32_t grid_max_per_cell = 16;
+	// SDF sampling (set 2 of the solve shader)
+	RID sdf_sampler;
+	RID sdf_dummy_texture; // 1^3, bound when no SDF is set (sampling gated by flag)
+	RID sdf_uniform_set;
+	RID sdf_uniform_set_texture; // texture the current sdf_uniform_set was built against
 
 	// body->multimesh conversion (render thread)
 	bool rt_convert_ready = false;
@@ -282,6 +294,7 @@ private:
 	void _rt_convert_to_multimesh(const BulkBind &p_bind);
 	void _rt_ensure_solve_pipeline();
 	void _rt_dispatch_collision(const StepJob &p_job);
+	RID _rt_get_sdf_uniform_set(RID p_texture);
 
 public:
 	virtual RID world_boundary_shape_create() override;
@@ -447,8 +460,9 @@ public:
 	virtual void bulk_body_scatter(int p_handle, const AABB &p_region) override;
 	virtual void bulk_body_set_multimesh(int p_handle, RID p_multimesh) override;
 	virtual void bulk_body_free(int p_handle) override;
-	/* COLLISION CONFIG (P3) */
+	/* COLLISION CONFIG (P3/P4) */
 	virtual void bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) override;
+	virtual void bulk_set_sdf(RID p_sdf_texture, const AABB &p_bounds) override;
 
 	virtual RID joint_create() override;
 	virtual void joint_clear(RID p_joint) override;

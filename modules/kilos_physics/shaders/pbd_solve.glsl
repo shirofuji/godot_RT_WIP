@@ -26,6 +26,10 @@ layout(set = 1, binding = 1, std430) restrict buffer GridBodies {
     uint data[];
 } grid;
 
+// Static-world signed distance field (world units; positive = outside solid).
+// A 1x1x1 dummy is bound when no SDF is set; sampling is gated by sdf_enabled.
+layout(set = 2, binding = 0) uniform sampler3D sdf_tex;
+
 layout(push_constant, std430) uniform Params {
     float radius;
     float ground_y;
@@ -33,8 +37,10 @@ layout(push_constant, std430) uniform Params {
     uint body_count;
     uint table_mask;    // table_size - 1
     uint max_per_cell;
+    uint sdf_enabled;
     uint pad0;
-    uint pad1;
+    vec4 sdf_min;       // xyz = world-space min corner of the SDF volume
+    vec4 sdf_size;      // xyz = world-space extent of the SDF volume
 } params;
 
 uint hash_cell(ivec3 c) {
@@ -59,7 +65,6 @@ void main() {
     const float min_dist = 2.0 * params.radius;
 
     // Body-body: scan the 27-cell neighbourhood, push apart overlapping spheres.
-    // Jacobi-style: read neighbours, accumulate, write self once.
     vec3 correction = vec3(0.0);
     ivec3 base_cell = ivec3(floor(p / params.cell_size));
     for (int dz = -1; dz <= 1; dz++) {
@@ -84,7 +89,26 @@ void main() {
     }
     p += correction;
 
-    // Ground-plane constraint.
+    // Static-world collision: push the sphere out of the SDF along its gradient.
+    if (params.sdf_enabled != 0u) {
+        vec3 uvw = (p - params.sdf_min.xyz) / params.sdf_size.xyz;
+        if (all(greaterThanEqual(uvw, vec3(0.0))) && all(lessThanEqual(uvw, vec3(1.0)))) {
+            float sd = texture(sdf_tex, uvw).r;
+            if (sd < params.radius) {
+                vec3 texel = vec3(1.0) / vec3(textureSize(sdf_tex, 0));
+                float gx = texture(sdf_tex, uvw + vec3(texel.x, 0.0, 0.0)).r - texture(sdf_tex, uvw - vec3(texel.x, 0.0, 0.0)).r;
+                float gy = texture(sdf_tex, uvw + vec3(0.0, texel.y, 0.0)).r - texture(sdf_tex, uvw - vec3(0.0, texel.y, 0.0)).r;
+                float gz = texture(sdf_tex, uvw + vec3(0.0, 0.0, texel.z)).r - texture(sdf_tex, uvw - vec3(0.0, 0.0, texel.z)).r;
+                vec3 n = vec3(gx, gy, gz);
+                float nl = length(n);
+                if (nl > 1e-6) {
+                    p += (n / nl) * (params.radius - sd);
+                }
+            }
+        }
+    }
+
+    // Ground-plane constraint (fallback / simple floor).
     float min_y = params.ground_y + params.radius;
     if (p.y < min_y) {
         p.y = min_y;
