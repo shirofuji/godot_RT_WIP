@@ -15,6 +15,15 @@ size = Vector2(400, 400)
 [sub_resource type="StandardMaterial3D" id="3"]
 albedo_color = Color(0.15, 0.16, 0.2, 1)
 
+[sub_resource type="SphereMesh" id="4"]
+radius = 40.0
+height = 80.0
+radial_segments = 48
+rings = 24
+
+[sub_resource type="StandardMaterial3D" id="5"]
+albedo_color = Color(0.22, 0.2, 0.18, 1)
+
 [node name="Root" type="Node3D"]
 script = ExtResource("1")
 
@@ -32,6 +41,11 @@ transform = Transform3D(0.707, -0.5, 0.5, 0, 0.707, 0.707, -0.707, -0.5, 0.5, 0,
 [node name="Floor" type="MeshInstance3D" parent="."]
 mesh = SubResource("2")
 material_override = SubResource("3")
+
+[node name="Mountain" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -8, 0)
+mesh = SubResource("4")
+material_override = SubResource("5")
 
 [node name="Bodies" type="MultiMeshInstance3D" parent="."]
 
