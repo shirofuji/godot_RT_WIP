@@ -202,6 +202,10 @@ private:
 
 	GrowableBuffer vertex_position_buffer; // vec4 per vertex (xyz + pad).
 	GrowableBuffer vertex_attribute_buffer; // vec4 per vertex (octahedral normal.xy + uv.xy).
+	GrowableBuffer vertex_color_buffer; // packed RGBA8 (uint32) per vertex - per-vertex COLOR, only
+			// meaningful for surfaces that carried ARRAY_COLOR (the terrain meshlet variant reads it;
+			// everything else uploads a default and never samples it). RGBA8 not float4 to keep this
+			// parallel-to-positions buffer ~4x cheaper - terrain COLOR is rgb tint + a=block_id (0-255).
 	GrowableBuffer meshlet_vertex_buffer; // uint32 remap indices into the vertex buffers above.
 	GrowableBuffer meshlet_triangle_buffer; // packed uint8 local triangle indices.
 	GrowableBuffer meshlet_descriptor_buffer; // MeshletDescriptorGPU per meshlet.
@@ -240,7 +244,7 @@ public:
 	// the same source vertex array: upload_vertices() is called once per surface, and
 	// upload_meshlets() once per LOD (including the base/full-resolution one), reusing the same
 	// vertex_range instead of re-uploading duplicate vertex data per LOD.
-	Range upload_vertices(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs);
+	Range upload_vertices(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs, const PackedColorArray &p_colors = PackedColorArray());
 	void free_vertices(const Range &p_vertex_range);
 	UploadResult upload_meshlets(const Range &p_vertex_range, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets, const PackedInt32Array &p_meshlet_vertices, const PackedByteArray &p_meshlet_triangles, const Vector<RenderingServerTypes::MeshletBoundsInfo> &p_bounds, const Vector<RenderingServerTypes::MeshletLODInfo> &p_lods = Vector<RenderingServerTypes::MeshletLODInfo>());
 	// Frees only the meshlet-side ranges of p_result (vertex_range is owned by upload_vertices()'s
@@ -264,6 +268,7 @@ public:
 
 	RID get_vertex_position_buffer_rid() const { return vertex_position_buffer.rid; }
 	RID get_vertex_attribute_buffer_rid() const { return vertex_attribute_buffer.rid; }
+	RID get_vertex_color_buffer_rid() const { return vertex_color_buffer.rid; }
 	RID get_meshlet_vertex_buffer_rid() const { return meshlet_vertex_buffer.rid; }
 	RID get_meshlet_triangle_buffer_rid() const { return meshlet_triangle_buffer.rid; }
 	RID get_meshlet_descriptor_buffer_rid() const { return meshlet_descriptor_buffer.rid; }

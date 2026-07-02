@@ -486,29 +486,33 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 			}
 		}
 
-		// Upload meshlets for the base surface and every LOD into the global meshlet buffers,
-		// sharing one uploaded vertex range across all of them (they all index into the same
-		// source vertex array - see RenderingServer::mesh_create_surface_data_from_arrays()).
-		RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
-		if (meshlet_storage && new_surface.meshlets.size() > 0) {
-			// Make every meshlet's winding uniformly outward so the render pipeline's static CULL_BACK
-			// draws all of them (fixes the front-face-culled "holes"). Base + each LOD share the same
-			// vertex positions/normals.
-			_normalize_meshlet_winding(new_surface.meshlet_positions, new_surface.meshlet_normals, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlets);
+	}
+
+	// Upload meshlets into the global meshlet buffers, sharing one uploaded vertex range across the base
+	// surface and every LOD (they all index into the same source vertex array - see
+	// RenderingServer::mesh_create_surface_data_from_arrays()). This runs for BOTH normally-indexed meshes
+	// AND position-welded non-indexed triangle soups (which carry meshlets built from welded indices but
+	// have index_count == 0). It used to be nested inside `if (new_surface.index_count)` above, which
+	// silently skipped meshletization for the soup terrain - the T2 blocker. Gate only on meshlets existing.
+	RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
+	if (meshlet_storage && new_surface.meshlets.size() > 0) {
+		// Make every meshlet's winding uniformly outward so the render pipeline's static CULL_BACK
+		// draws all of them (fixes the front-face-culled "holes"). Base + each LOD share the same
+		// vertex positions/normals.
+		_normalize_meshlet_winding(new_surface.meshlet_positions, new_surface.meshlet_normals, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlets);
+		for (int i = 0; i < new_surface.lods.size(); i++) {
+			if (new_surface.lods[i].meshlets.size() > 0) {
+				RenderingServerTypes::SurfaceData::LOD &lod = new_surface.lods.write[i];
+				_normalize_meshlet_winding(new_surface.meshlet_positions, new_surface.meshlet_normals, lod.meshlet_vertices, lod.meshlet_triangles, lod.meshlets);
+			}
+		}
+		MeshletStorage::Range vertex_range = meshlet_storage->upload_vertices(new_surface.meshlet_positions, new_surface.meshlet_normals, new_surface.meshlet_uvs, new_surface.meshlet_colors);
+		if (vertex_range.is_valid()) {
+			s->meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.meshlets, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlet_bounds, new_surface.meshlet_lods);
+
 			for (int i = 0; i < new_surface.lods.size(); i++) {
 				if (new_surface.lods[i].meshlets.size() > 0) {
-					RenderingServerTypes::SurfaceData::LOD &lod = new_surface.lods.write[i];
-					_normalize_meshlet_winding(new_surface.meshlet_positions, new_surface.meshlet_normals, lod.meshlet_vertices, lod.meshlet_triangles, lod.meshlets);
-				}
-			}
-			MeshletStorage::Range vertex_range = meshlet_storage->upload_vertices(new_surface.meshlet_positions, new_surface.meshlet_normals, new_surface.meshlet_uvs);
-			if (vertex_range.is_valid()) {
-				s->meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.meshlets, new_surface.meshlet_vertices, new_surface.meshlet_triangles, new_surface.meshlet_bounds, new_surface.meshlet_lods);
-
-				for (int i = 0; i < new_surface.lods.size(); i++) {
-					if (new_surface.lods[i].meshlets.size() > 0) {
-						s->lods[i].meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.lods[i].meshlets, new_surface.lods[i].meshlet_vertices, new_surface.lods[i].meshlet_triangles, new_surface.lods[i].meshlet_bounds);
-					}
+					s->lods[i].meshlet_upload = meshlet_storage->upload_meshlets(vertex_range, new_surface.lods[i].meshlets, new_surface.lods[i].meshlet_vertices, new_surface.lods[i].meshlet_triangles, new_surface.lods[i].meshlet_bounds);
 				}
 			}
 		}
@@ -584,19 +588,27 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	// DAG; process_pending_meshlet_bakes() later swaps it into s->meshlet_upload, reusing the vertex
 	// range. Until then the surface renders at full detail (leaf-only). Reconstruct the full-res index
 	// list from the surface's index data (16- or 32-bit, by vertex count) for the bake.
-	if (s->meshlet_upload.vertex_range.is_valid() && new_surface.meshlet_positions.size() > 0 && new_surface.index_count > 0 && GLOBAL_GET_CACHED(bool, "rendering/meshlet/bake_lod_dag")) {
+	// The DAG needs the flat index list the meshlets were built from. Normally-indexed surfaces
+	// reconstruct it from index_data; a position-welded triangle soup has no index_data and instead
+	// carries its welded indices in meshlet_indices (see rendering_server's meshlet build).
+	const bool have_soup_indices = new_surface.meshlet_indices.size() >= 3;
+	if (s->meshlet_upload.vertex_range.is_valid() && new_surface.meshlet_positions.size() > 0 && (new_surface.index_count > 0 || have_soup_indices) && GLOBAL_GET_CACHED(bool, "rendering/meshlet/bake_lod_dag")) {
 		PackedInt32Array base_indices;
-		base_indices.resize(new_surface.index_count);
-		int *bw = base_indices.ptrw();
-		if (new_surface.vertex_count <= 65536) {
-			const uint16_t *ip = (const uint16_t *)new_surface.index_data.ptr();
-			for (uint32_t i = 0; i < new_surface.index_count; i++) {
-				bw[i] = ip[i];
-			}
+		if (have_soup_indices) {
+			base_indices = new_surface.meshlet_indices;
 		} else {
-			const uint32_t *ip = (const uint32_t *)new_surface.index_data.ptr();
-			for (uint32_t i = 0; i < new_surface.index_count; i++) {
-				bw[i] = (int)ip[i];
+			base_indices.resize(new_surface.index_count);
+			int *bw = base_indices.ptrw();
+			if (new_surface.vertex_count <= 65536) {
+				const uint16_t *ip = (const uint16_t *)new_surface.index_data.ptr();
+				for (uint32_t i = 0; i < new_surface.index_count; i++) {
+					bw[i] = ip[i];
+				}
+			} else {
+				const uint32_t *ip = (const uint32_t *)new_surface.index_data.ptr();
+				for (uint32_t i = 0; i < new_surface.index_count; i++) {
+					bw[i] = (int)ip[i];
+				}
 			}
 		}
 		_enqueue_meshlet_dag_bake(p_mesh, mesh->surface_count - 1, new_surface.meshlet_positions, new_surface.meshlet_normals, base_indices);

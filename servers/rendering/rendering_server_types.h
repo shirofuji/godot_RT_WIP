@@ -162,6 +162,16 @@ struct SurfaceData {
 	PackedVector3Array meshlet_positions;
 	PackedVector3Array meshlet_normals;
 	PackedVector2Array meshlet_uvs;
+	// Optional per-vertex COLOR, parallel to meshlet_positions. Non-empty only when the source
+	// surface carried ARRAY_COLOR (e.g. the procedural terrain, which packs rgb tint + a=block_id).
+	// Threaded into MeshletStorage's global color buffer so the terrain meshlet variant can shade.
+	PackedColorArray meshlet_colors;
+
+	// Flat welded index list the meshlets were built from, but ONLY set when the source surface had no
+	// ARRAY_INDEX and was position-welded from a triangle soup (see rendering_server's meshlet build).
+	// Lets the async LOD-DAG bake use these welded indices instead of the (empty) surface index_data.
+	// Empty for normally-indexed surfaces - those still feed the DAG from index_data as before.
+	PackedInt32Array meshlet_indices;
 
 	// Transforms used in runtime bone AABBs compute.
 	// Since bone AABBs is saved in Mesh space, but bones is in Skeleton space.

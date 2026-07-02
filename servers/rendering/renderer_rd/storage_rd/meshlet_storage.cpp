@@ -152,6 +152,7 @@ MeshletStorage::MeshletStorage() {
 
 	vertex_position_buffer.init(sizeof(float) * 4, initial_vertices);
 	vertex_attribute_buffer.init(sizeof(float) * 4, initial_vertices);
+	vertex_color_buffer.init(sizeof(uint32_t), initial_vertices);
 	meshlet_vertex_buffer.init(sizeof(uint32_t), initial_meshlet_vertices);
 	meshlet_triangle_buffer.init(sizeof(uint8_t), initial_meshlet_triangle_bytes);
 	meshlet_descriptor_buffer.init(sizeof(MeshletDescriptorGPU), initial_meshlets);
@@ -167,6 +168,7 @@ MeshletStorage::MeshletStorage() {
 MeshletStorage::~MeshletStorage() {
 	vertex_position_buffer.free();
 	vertex_attribute_buffer.free();
+	vertex_color_buffer.free();
 	meshlet_vertex_buffer.free();
 	meshlet_triangle_buffer.free();
 	meshlet_descriptor_buffer.free();
@@ -254,10 +256,11 @@ void MeshletStorage::free_mesh_meshlets(const UploadResult &p_result) {
 	free_meshlets(p_result);
 }
 
-MeshletStorage::Range MeshletStorage::upload_vertices(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs) {
+MeshletStorage::Range MeshletStorage::upload_vertices(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs, const PackedColorArray &p_colors) {
 	ERR_FAIL_COND_V(p_positions.is_empty(), Range());
 	ERR_FAIL_COND_V(!p_normals.is_empty() && p_normals.size() != p_positions.size(), Range());
 	ERR_FAIL_COND_V(!p_uvs.is_empty() && p_uvs.size() != p_positions.size(), Range());
+	ERR_FAIL_COND_V(!p_colors.is_empty() && p_colors.size() != p_positions.size(), Range());
 
 	const uint32_t vertex_count = (uint32_t)p_positions.size();
 
@@ -268,11 +271,14 @@ MeshletStorage::Range MeshletStorage::upload_vertices(const PackedVector3Array &
 	}
 	vertex_position_buffer.ensure_capacity(vertex_allocator.get_capacity());
 	vertex_attribute_buffer.ensure_capacity(vertex_allocator.get_capacity());
+	vertex_color_buffer.ensure_capacity(vertex_allocator.get_capacity());
 
 	LocalVector<float> positions;
 	positions.resize(vertex_count * 4);
 	LocalVector<float> attributes;
 	attributes.resize(vertex_count * 4);
+	LocalVector<uint32_t> colors;
+	colors.resize(vertex_count);
 	for (uint32_t i = 0; i < vertex_count; i++) {
 		positions[i * 4 + 0] = p_positions[i].x;
 		positions[i * 4 + 1] = p_positions[i].y;
@@ -285,9 +291,23 @@ MeshletStorage::Range MeshletStorage::upload_vertices(const PackedVector3Array &
 		attributes[i * 4 + 1] = oct.y;
 		attributes[i * 4 + 2] = uv.x;
 		attributes[i * 4 + 3] = uv.y;
+
+		// Pack COLOR as RGBA8 (matches the shader's unpackUnorm4x8). Default to opaque white when the
+		// surface has no per-vertex color; those vertices are never sampled as color by the shader.
+		if (p_colors.is_empty()) {
+			colors[i] = 0xFFFFFFFF;
+		} else {
+			const Color &c = p_colors[i];
+			uint32_t r = (uint32_t)CLAMP(Math::round(c.r * 255.0f), 0.0f, 255.0f);
+			uint32_t g = (uint32_t)CLAMP(Math::round(c.g * 255.0f), 0.0f, 255.0f);
+			uint32_t b = (uint32_t)CLAMP(Math::round(c.b * 255.0f), 0.0f, 255.0f);
+			uint32_t a = (uint32_t)CLAMP(Math::round(c.a * 255.0f), 0.0f, 255.0f);
+			colors[i] = r | (g << 8) | (b << 16) | (a << 24);
+		}
 	}
 	vertex_position_buffer.upload(vertex_range.offset, positions.ptr(), vertex_count);
 	vertex_attribute_buffer.upload(vertex_range.offset, attributes.ptr(), vertex_count);
+	vertex_color_buffer.upload(vertex_range.offset, colors.ptr(), vertex_count);
 
 	return vertex_range;
 }

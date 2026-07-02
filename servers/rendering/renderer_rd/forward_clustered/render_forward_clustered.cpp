@@ -1830,6 +1830,23 @@ static void _meshlet_debug_transform_to_mat4_columns(const Transform3D &p_transf
 	r_out[15] = 1.0f;
 }
 
+bool RenderForwardClustered::_meshlet_material_is_terrain(const RID &p_material_rid) {
+	// Opt-in terrain recognition by shader signature: the project's terrain.gdshader is the only
+	// material carrying BOTH a `texture_albedo_array` (sampler2DArray) and a `block_mapping` uniform.
+	// Probing two distinctive names (vs one) guards against an unrelated ShaderMaterial being mistaken
+	// for terrain. No game-side registration needed; the terrain_lod setting still gates use of this.
+	if (!p_material_rid.is_valid()) {
+		return false;
+	}
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	if (!material_storage) {
+		return false;
+	}
+	Variant albedo_array_v = material_storage->material_get_param(p_material_rid, "texture_albedo_array");
+	Variant block_mapping_v = material_storage->material_get_param(p_material_rid, "block_mapping");
+	return albedo_array_v.get_type() != Variant::NIL && block_mapping_v.get_type() != Variant::NIL;
+}
+
 uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_material_rid, bool &r_qualifies) {
 	r_qualifies = true; // No material assigned at all is a normal, qualifying case (default white).
 	RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
@@ -2036,6 +2053,8 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 	meshlet_scan_ranges.clear();
 	meshlet_replace_skip_set.clear();
 	meshlet_replace_default_active = false;
+	meshlet_terrain_scan_instance_transforms.clear();
+	meshlet_terrain_scan_ranges.clear();
 
 	// B6 (rollout milestone): rendering/meshlet/enabled is the real per-project kill-switch
 	// (default true - meshlet replacement is the unconditional default for qualifying meshes once
@@ -2061,6 +2080,18 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 	bool multimesh_lod_enabled = replace_enabled && bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/multimesh_lod"));
 	const uint32_t MESHLET_MULTIMESH_MAX_INSTANCES = 1 << 14; // 16384
 
+	// T2: terrain CLOD sub-toggle. When on, the procedural-terrain ShaderMaterial (recognized by
+	// _meshlet_material_is_terrain) is diverted into the separate terrain scan stream instead of being
+	// rejected as a non-qualifying custom shader. Default off until the terrain draw pass ships - see
+	// the header note; collecting alone changes nothing visible (terrain stays on Forward+).
+	bool terrain_lod_enabled = replace_enabled && bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/terrain_lod"));
+
+	// T2 verification instrumentation (only active with --meshlet-terrain-diag): breaks down why terrain
+	// is/isn't captured so a missing diag line is unambiguous - scanned meshes, how many carry the
+	// terrain shader signature, and how many of those lack a meshlet range (i.e. weren't meshletized).
+	static bool terrain_diag = OS::get_singleton()->get_cmdline_args().find("--meshlet-terrain-diag") != nullptr;
+	uint32_t diag_mesh_scanned = 0, diag_terrain_shaped = 0, diag_terrain_no_range = 0;
+
 	// Real per-frame instance/meshlet-range list, built from the real opaque render list - each
 	// element is one already-CPU-frustum-visible (instance, surface) pair (see
 	// GeometryInstanceSurfaceDataCache). RSE::INSTANCE_MESH instances are included directly;
@@ -2082,7 +2113,30 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		if (base_mesh_rid.is_null()) {
 			continue;
 		}
+		// Resolve the material with Godot's real precedence: instance material_override, then this
+		// instance's per-surface override, then the MESH's own surface material. (Moved above the
+		// meshlet-range check so the terrain-shape probe/diagnostic can see it even for a surface that
+		// turns out to have no meshlet range.) This is a pure RID pick, no side effects.
+		RID surface_material_rid;
+		if (inst->data->material_override.is_valid()) {
+			surface_material_rid = inst->data->material_override;
+		} else if (sdcache->surface_index < inst->data->surface_materials.size() && inst->data->surface_materials[sdcache->surface_index].is_valid()) {
+			surface_material_rid = inst->data->surface_materials[sdcache->surface_index];
+		} else {
+			surface_material_rid = mesh_storage->mesh_surface_get_material(base_mesh_rid, sdcache->surface_index);
+		}
+		const bool is_terrain_shaped = terrain_lod_enabled && is_mesh && _meshlet_material_is_terrain(surface_material_rid);
+
 		RendererRD::MeshletStorage::Range range = mesh_storage->mesh_surface_get_meshlet_range(base_mesh_rid, sdcache->surface_index);
+		if (terrain_diag && is_mesh) {
+			diag_mesh_scanned++;
+			if (is_terrain_shaped) {
+				diag_terrain_shaped++;
+				if (range.count == 0) {
+					diag_terrain_no_range++;
+				}
+			}
+		}
 		if (range.count == 0) {
 			continue;
 		}
@@ -2108,19 +2162,21 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		// opaque pass's own framebuffer object are the exact same RID/attachment set, and whether the
 		// late pass's two mid-frame Hi-Z rebuilds (hiz_builder->build_into(), which dispatch compute
 		// work) insert a correct barrier before the following sky/color-load-bearing draws.
-		// Resolve the material with Godot's real precedence: instance material_override, then this
-		// instance's per-surface override, then the MESH's own surface material. The mesh-surface
-		// fallback was missing - a material set on the MeshInstance's *mesh* (e.g. CapsuleMesh.material /
-		// any mesh whose surface carries its own material, the common case) resolved to an invalid RID
-		// and the meshlet path rendered it flat default-white instead of the real albedo.
-		RID surface_material_rid;
-		if (inst->data->material_override.is_valid()) {
-			surface_material_rid = inst->data->material_override;
-		} else if (sdcache->surface_index < inst->data->surface_materials.size() && inst->data->surface_materials[sdcache->surface_index].is_valid()) {
-			surface_material_rid = inst->data->surface_materials[sdcache->surface_index];
-		} else {
-			surface_material_rid = mesh_storage->mesh_surface_get_material(base_mesh_rid, sdcache->surface_index);
+		// (surface_material_rid + is_terrain_shaped were resolved above, before the range check.)
+		// T2: divert terrain (a non-qualifying custom shader) into its own stream BEFORE the qualify
+		// reject below. Only plain INSTANCE_MESH terrain chunks (terrain isn't a MultiMesh). The terrain
+		// stream is culled/drawn by the dedicated terrain shader variant; until that draw pass lands
+		// nothing consumes it and terrain keeps rendering via Forward+ (no skip_set insert here).
+		if (is_terrain_shaped) {
+			RendererRD::MeshletCuller::InstanceMeshletRange r;
+			r.instance_index = (uint32_t)meshlet_terrain_scan_instance_transforms.size();
+			r.meshlet_offset = range.offset;
+			r.meshlet_count = range.count;
+			meshlet_terrain_scan_instance_transforms.push_back(inst->transform);
+			meshlet_terrain_scan_ranges.push_back(r);
+			continue;
 		}
+
 		bool material_qualifies = true;
 		uint32_t material_id = _meshlet_resolve_material_id(surface_material_rid, material_qualifies);
 
@@ -2182,6 +2238,26 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 				meshlet_scan_ranges.push_back(r);
 			}
 			meshlet_replace_skip_set.insert(sdcache);
+		}
+	}
+
+	// T2 verification hook: with --meshlet-terrain-diag, print an UNCONDITIONAL per-scan breakdown (even
+	// all-zero) so "no line" means only "flag didn't reach the process", never "silently zero". Only on
+	// the primary opaque list (RENDER_LIST_OPAQUE) to avoid double-printing for the shadow/secondary scans.
+	if (terrain_diag && p_list_type == RENDER_LIST_OPAQUE) {
+		uint32_t total_meshlets = 0;
+		for (const RendererRD::MeshletCuller::InstanceMeshletRange &r : meshlet_terrain_scan_ranges) {
+			total_meshlets += r.meshlet_count;
+		}
+		// Print only when the numbers change (terrain streams in over many frames) so this doesn't spam
+		// every frame and bury the one-shot MESHLET_SOUP_* startup lines.
+		static uint32_t last_key = 0xFFFFFFFFu;
+		uint32_t key = diag_mesh_scanned ^ (diag_terrain_shaped << 4) ^ (diag_terrain_no_range << 8) ^ ((uint32_t)meshlet_terrain_scan_ranges.size() << 16);
+		if (key != last_key) {
+			last_key = key;
+			print_line(vformat("MESHLET_TERRAIN_DIAG: enabled=%d meshes_scanned=%d terrain_shaped=%d terrain_no_meshlet_range=%d captured_chunks=%d meshlet_ranges_total=%d",
+					(int)terrain_lod_enabled, (int)diag_mesh_scanned, (int)diag_terrain_shaped, (int)diag_terrain_no_range,
+					(int)meshlet_terrain_scan_ranges.size(), (int)total_meshlets));
 		}
 	}
 }

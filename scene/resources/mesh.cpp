@@ -1827,17 +1827,31 @@ void ArrayMesh::add_surface_from_arrays(PrimitiveType p_primitive, const Array &
 	Error err = RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface, (RSE::PrimitiveType)p_primitive, p_arrays, p_blend_shapes, p_lods, p_flags);
 	ERR_FAIL_COND(err != OK);
 
-	/* Debug code.
-	print_line("format: " + itos(surface.format));
-	print_line("aabb: " + surface.aabb);
-	print_line("array size: " + itos(surface.vertex_data.size()));
-	print_line("vertex count: " + itos(surface.vertex_count));
-	print_line("index size: " + itos(surface.index_data.size()));
-	print_line("index count: " + itos(surface.index_count));
-	print_line("primitive: " + itos(surface.primitive));
-	*/
+	// Deliver the FULL surface (including the meshlet fields mesh_create_surface_data_from_arrays just
+	// built) straight to the server. Previously this routed through add_surface(), which rebuilds a
+	// SurfaceData from only the basic byte arrays and silently drops every meshlet_* field - so an
+	// ArrayMesh (e.g. the procedural terrain) never delivered its meshlets to the GPU-driven meshlet
+	// path, even though they were generated. PrimitiveMesh doesn't hit this because it calls
+	// mesh_add_surface() with the full SurfaceData directly. Bookkeeping below mirrors add_surface().
+	ERR_FAIL_COND(surfaces.size() == RSE::MAX_MESH_SURFACES);
+	_create_if_empty();
 
-	add_surface(surface.format, PrimitiveType(surface.primitive), surface.vertex_data, surface.attribute_data, surface.skin_data, surface.vertex_count, surface.index_data, surface.index_count, surface.aabb, surface.blend_shape_data, surface.bone_aabbs, surface.lods, surface.uv_scale);
+	Surface s;
+	s.aabb = surface.aabb;
+	s.is_2d = surface.format & ARRAY_FLAG_USE_2D_VERTICES;
+	s.primitive = PrimitiveType(surface.primitive);
+	s.array_length = surface.vertex_count;
+	s.index_array_length = surface.index_count;
+	s.format = surface.format;
+
+	surfaces.push_back(s);
+	_recompute_aabb();
+
+	RenderingServer::get_singleton()->mesh_add_surface(mesh, surface);
+
+	clear_cache();
+	notify_property_list_changed();
+	emit_changed();
 }
 
 Array ArrayMesh::surface_get_arrays(int p_surface) const {

@@ -1214,6 +1214,65 @@ static Vector<RenderingServerTypes::MeshletLODInfo> _meshlet_lod_convert(const L
 	return dst;
 }
 
+// Position-welds a non-indexed triangle soup (as produced by e.g. a marching-cubes mesher that skips
+// indexing for meshing speed) into shared-vertex topology, so the meshlet clusterizer + LOD-DAG
+// simplifier have the connectivity they need (an identity/soup index buffer has no shared edges and
+// simplifies to nothing). Rewrites the parallel attribute arrays IN PLACE to the unique welded set and
+// fills r_indices (one entry per original soup vertex, in triangle order). Welds by POSITION only
+// (snapped to a fine grid so shared-edge verts differing by a few ULPs still merge); at a weld the
+// last-written normal/uv/color wins - per-face attribute variation at block boundaries is intentionally
+// smoothed here (accepted first-cut tradeoff, see the T2 terrain-meshlet plan). No-op (leaves r_indices
+// empty) if meshoptimizer isn't available, matching the old "skip un-indexed meshes" behavior.
+static void _meshlet_weld_triangle_soup(PackedVector3Array &r_positions, PackedVector3Array &r_normals, PackedVector2Array &r_uvs, PackedColorArray &r_colors, PackedInt32Array &r_indices) {
+	const int vcount = r_positions.size();
+	if (vcount < 3 || (vcount % 3) != 0 || !SurfaceTool::generate_remap_func || !SurfaceTool::remap_vertex_func) {
+		return;
+	}
+	// Build the weld remap on a quantized COPY of the positions (so near-identical shared-edge verts
+	// merge), but apply it to the real, unquantized attribute streams.
+	const real_t WELD_GRID = 0.0001;
+	PackedVector3Array snapped;
+	snapped.resize(vcount);
+	{
+		const Vector3 *src = r_positions.ptr();
+		Vector3 *dst = snapped.ptrw();
+		const Vector3 grid(WELD_GRID, WELD_GRID, WELD_GRID);
+		for (int i = 0; i < vcount; i++) {
+			dst[i] = src[i].snapped(grid);
+		}
+	}
+	Vector<uint32_t> remap;
+	remap.resize(vcount);
+	// indices == nullptr: meshopt treats the vertex buffer as the unindexed sequence 0..vcount-1.
+	size_t unique = SurfaceTool::generate_remap_func(remap.ptrw(), nullptr, (size_t)vcount, snapped.ptr(), (size_t)vcount, sizeof(Vector3));
+
+	// The triangle-ordered index buffer is exactly the remap (soup vertex i -> welded slot remap[i]).
+	r_indices.resize(vcount);
+	{
+		int *ip = r_indices.ptrw();
+		const uint32_t *rp = remap.ptr();
+		for (int i = 0; i < vcount; i++) {
+			ip[i] = (int)rp[i];
+		}
+	}
+	// Compact each stream into the unique set with the same remap. remap[i] <= i (first-occurrence
+	// order), so the in-place forward write never clobbers unread source - same as SurfaceTool does.
+	SurfaceTool::remap_vertex_func(r_positions.ptrw(), r_positions.ptr(), (size_t)vcount, sizeof(Vector3), remap.ptr());
+	r_positions.resize((int)unique);
+	if (r_normals.size() == vcount) {
+		SurfaceTool::remap_vertex_func(r_normals.ptrw(), r_normals.ptr(), (size_t)vcount, sizeof(Vector3), remap.ptr());
+		r_normals.resize((int)unique);
+	}
+	if (r_uvs.size() == vcount) {
+		SurfaceTool::remap_vertex_func(r_uvs.ptrw(), r_uvs.ptr(), (size_t)vcount, sizeof(Vector2), remap.ptr());
+		r_uvs.resize((int)unique);
+	}
+	if (r_colors.size() == vcount) {
+		SurfaceTool::remap_vertex_func(r_colors.ptrw(), r_colors.ptr(), (size_t)vcount, sizeof(Color), remap.ptr());
+		r_colors.resize((int)unique);
+	}
+}
+
 bool RenderingServer::bake_meshlet_dag(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices, Vector<RenderingServerTypes::MeshletInfo> &r_meshlets, PackedInt32Array &r_meshlet_vertices, PackedByteArray &r_meshlet_triangles, Vector<RenderingServerTypes::MeshletBoundsInfo> &r_bounds, Vector<RenderingServerTypes::MeshletLODInfo> &r_lods) {
 	// Bake the Nanite-style cluster-LOD DAG for one surface (multi-level meshlet pool + per-cluster
 	// LOD-cut records). Pure CPU, no engine state touched, so it's safe to run on a WorkerThreadPool
@@ -1455,12 +1514,24 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	PackedVector3Array base_vertices;
 	PackedVector3Array base_normals;
 	PackedVector2Array base_uvs;
-	if (SurfaceTool::build_meshlets_func && p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && !(format & RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
+	PackedColorArray base_colors;
+	// Welded index list to hand the LOD-DAG bake, but ONLY when this surface was a non-indexed soup we
+	// position-welded (below). Stays empty for normally-indexed surfaces (their DAG uses index_data).
+	PackedInt32Array base_meshlet_soup_indices;
+	// Meshletize triangle surfaces. Indexed meshes use their ARRAY_INDEX directly; a non-indexed
+	// triangle soup (index_array_len == 0, e.g. the procedural terrain mesher) is position-welded into
+	// shared-vertex topology first so the clusterizer/LOD-DAG have connectivity to work with.
+	if (SurfaceTool::build_meshlets_func && p_primitive == RSE::PRIMITIVE_TRIANGLES && array_len >= 3 && !(format & RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
 		base_vertices = p_arrays[RSE::ARRAY_VERTEX];
 		base_normals = p_arrays[RSE::ARRAY_NORMAL];
 		base_uvs = p_arrays[RSE::ARRAY_TEX_UV];
+		base_colors = p_arrays[RSE::ARRAY_COLOR];
 		PackedInt32Array base_indices = p_arrays[RSE::ARRAY_INDEX];
-		if (base_indices.size() % 3 == 0) {
+		if (base_indices.is_empty()) {
+			_meshlet_weld_triangle_soup(base_vertices, base_normals, base_uvs, base_colors, base_indices);
+			base_meshlet_soup_indices = base_indices;
+		}
+		if (base_indices.size() >= 3 && base_indices.size() % 3 == 0) {
 			// Surface creation always produces a cheap single-level (LOD-0) meshlet split here, so it
 			// never blocks on the heavy work. The Nanite cluster-LOD DAG (continuous LOD) is baked
 			// ASYNCHRONOUSLY on a WorkerThreadPool thread after the surface exists, then swapped in when
@@ -1518,6 +1589,13 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	surface_data.meshlet_positions = base_vertices;
 	surface_data.meshlet_normals = base_normals;
 	surface_data.meshlet_uvs = base_uvs;
+	// Only carry COLOR when its count matches the vertex count; build_meshlets reindexes by geometry
+	// (position/index), and per-vertex COLOR is indexed by the same global vertex id, so an aligned
+	// array stays aligned. A mismatched/empty COLOR stays empty (non-terrain meshes shade as before).
+	if (base_colors.size() == base_vertices.size()) {
+		surface_data.meshlet_colors = base_colors;
+	}
+	surface_data.meshlet_indices = base_meshlet_soup_indices; // Non-empty only for welded soups.
 
 	return OK;
 }
@@ -3903,6 +3981,13 @@ void RenderingServer::init() {
 	// per frame, sized for up to a few thousand visible instances per MultiMesh; larger ones fall back
 	// to full-detail Forward+. Re-evaluated each frame (no restart needed).
 	GLOBAL_DEF_RST("rendering/meshlet/multimesh_lod", true);
+
+	// T2 terrain CLOD: when enabled, a mesh carrying the project's terrain shader (recognized by its
+	// texture_albedo_array + block_mapping uniforms) is routed into a dedicated terrain meshlet variant
+	// + draw pass so the procedural terrain gets per-cluster continuous LOD + GPU occlusion instead of
+	// rendering full-resolution through Forward+. Independent sub-toggle of the main meshlet path.
+	// Default off until the terrain draw pass is complete (collection alone is a visible no-op).
+	GLOBAL_DEF_RST("rendering/meshlet/terrain_lod", false);
 
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);

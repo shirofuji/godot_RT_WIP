@@ -872,6 +872,19 @@ private:
 	Vector<Transform3D> meshlet_scan_instance_transforms;
 	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> meshlet_scan_ranges;
 
+	// T2 (terrain meshlet variant): a SEPARATE scan stream for the procedural terrain, whose custom
+	// triplanar ShaderMaterial can't be flattened into MeshletMaterialGPU and so needs its own shader
+	// variant + draw pass (it can't share the default meshlet material pipeline the arrays above feed).
+	// Populated in _meshlet_scan_render_list when rendering/meshlet/terrain_lod is on and a scanned
+	// INSTANCE_MESH carries the terrain shader. Culled + drawn separately; until the terrain draw pass
+	// lands these are collected (for the --meshlet-terrain-diag count) but terrain still renders via
+	// Forward+ (not added to meshlet_replace_skip_set), so this is a no-op for the visible result.
+	Vector<Transform3D> meshlet_terrain_scan_instance_transforms;
+	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> meshlet_terrain_scan_ranges;
+	// True when the resolved material is the project's terrain shader (probed by signature uniforms:
+	// texture_albedo_array + block_mapping). Cheap per-material check; terrain is opt-in via setting.
+	static bool _meshlet_material_is_terrain(const RID &p_material_rid);
+
 	// Temporal two-pass Hi-Z occlusion state (see project plan/memory for the full design): an
 	// early pass culls against *last* frame's Hi-Z (so the real depth pre-pass can skip
 	// meshlet-replaceable instances entirely), a late pass re-tests everything against a
