@@ -168,6 +168,7 @@ private:
 		Vector<int> tri_order; // triangle index per BVH leaf entry
 		// Primitives.
 		Vector3 box_half;
+		Vector3 center; // local centre offset (non-zero for convex-as-box)
 		real_t radius = 0.5;
 		real_t height = 1.0;
 		AABB local_aabb;

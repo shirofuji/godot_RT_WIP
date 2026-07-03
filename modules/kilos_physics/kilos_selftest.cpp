@@ -423,6 +423,62 @@ void test_capsule_motion() {
 	memdelete(server);
 }
 
+void test_raycast_primitives() {
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	RID space = server->space_create();
+
+	// A box (half-extents 1) at the origin.
+	RID box_shape = server->box_shape_create();
+	server->shape_set_data(box_shape, Vector3(1, 1, 1));
+	RID box_body = server->body_create();
+	server->body_set_mode(box_body, PhysicsServer3D::BODY_MODE_STATIC);
+	server->body_add_shape(box_body, box_shape, Transform3D(), false);
+	server->body_set_space(box_body, space);
+
+	// A cylinder (radius 1, height 4, axis Y) at x=10 (like a tree trunk).
+	RID cyl_shape = server->cylinder_shape_create();
+	Dictionary cyd;
+	cyd["radius"] = 1.0;
+	cyd["height"] = 4.0;
+	server->shape_set_data(cyl_shape, cyd);
+	RID cyl_body = server->body_create();
+	server->body_set_mode(cyl_body, PhysicsServer3D::BODY_MODE_STATIC);
+	server->body_add_shape(cyl_body, cyl_shape, Transform3D(Basis(), Vector3(10, 0, 0)), false);
+	server->body_set_space(cyl_body, space);
+
+	PhysicsDirectSpaceState3D *ss = server->space_get_direct_state(space);
+
+	// Ray into the box from +X.
+	PhysicsDirectSpaceState3D::RayParameters rp;
+	rp.from = Vector3(5, 0, 0);
+	rp.to = Vector3(-5, 0, 0);
+	PhysicsDirectSpaceState3D::RayResult rr;
+	bool hit = ss->intersect_ray(rp, rr);
+	check(hit && Math::abs(rr.position.x - 1.0) < 0.01 && rr.normal.x > 0.99,
+			vformat("Ray hits box face at x=1 with +X normal (x=%.3f, n.x=%.3f)", hit ? rr.position.x : 0.0, hit ? rr.normal.x : 0.0));
+
+	// Ray into the cylinder trunk from +Z.
+	rp.from = Vector3(10, 0, 5);
+	rp.to = Vector3(10, 0, -5);
+	PhysicsDirectSpaceState3D::RayResult rr2;
+	bool hit2 = ss->intersect_ray(rp, rr2);
+	check(hit2 && Math::abs(rr2.position.z - 1.0) < 0.02 && rr2.normal.z > 0.98,
+			vformat("Ray hits cylinder trunk side at z=1 (z=%.3f, n.z=%.3f)", hit2 ? rr2.position.z : 0.0, hit2 ? rr2.normal.z : 0.0));
+
+	// Ray passing over the top of the box (y=5) must miss both.
+	rp.from = Vector3(5, 5, 0);
+	rp.to = Vector3(-5, 5, 0);
+	PhysicsDirectSpaceState3D::RayResult rr3;
+	check(!ss->intersect_ray(rp, rr3), "Ray above the primitives misses");
+
+	server->free_rid(box_body);
+	server->free_rid(box_shape);
+	server->free_rid(cyl_body);
+	server->free_rid(cyl_shape);
+	server->free_rid(space);
+	memdelete(server);
+}
+
 } // namespace
 
 void run_kilos_selftest_if_requested() {
@@ -438,6 +494,7 @@ void run_kilos_selftest_if_requested() {
 	test_pile_no_interpenetration();
 	test_sdf_dome();
 	test_raycast_trimesh();
+	test_raycast_primitives();
 	test_capsule_motion();
 	if (g_failures == 0) {
 		print_line("KILOS_SELFTEST: all checks passed");

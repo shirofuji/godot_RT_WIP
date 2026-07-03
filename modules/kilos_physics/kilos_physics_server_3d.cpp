@@ -114,7 +114,32 @@ void KilosPhysicsServer3D::shape_set_data(RID p_shape, const Variant &p_data) {
 		case SHAPE_CAPSULE: {
 			Dictionary d = p_data;
 			s->radius = d.has("radius") ? (real_t)d["radius"] : 0.5;
+			s->height = d.has("height") ? (real_t)d["height"] : 1.0; // total height incl. caps
+			real_t r = s->radius, hh = MAX(s->height * 0.5, r);
+			s->local_aabb = AABB(Vector3(-r, -hh, -r), Vector3(2 * r, 2 * hh, 2 * r));
+		} break;
+		case SHAPE_CYLINDER: {
+			Dictionary d = p_data;
+			s->radius = d.has("radius") ? (real_t)d["radius"] : 0.5;
 			s->height = d.has("height") ? (real_t)d["height"] : 1.0;
+			real_t r = s->radius, hh = s->height * 0.5;
+			s->local_aabb = AABB(Vector3(-r, -hh, -r), Vector3(2 * r, 2 * hh, 2 * r));
+		} break;
+		case SHAPE_CONVEX_POLYGON: {
+			// Approximated by its AABB (treated as a box) for queries.
+			PackedVector3Array pts = p_data;
+			AABB bounds;
+			const Vector3 *r = pts.ptr();
+			for (int i = 0; i < pts.size(); i++) {
+				if (i == 0) {
+					bounds.position = r[0];
+				} else {
+					bounds.expand_to(r[i]);
+				}
+			}
+			s->local_aabb = bounds;
+			s->box_half = bounds.size * 0.5;
+			s->center = bounds.position + bounds.size * 0.5;
 		} break;
 		default:
 			break;
@@ -1895,6 +1920,165 @@ bool segment_triangle(const Vector3 &from, const Vector3 &dir, real_t seg_len,
 	return true;
 }
 
+bool ray_sphere(const Vector3 &from, const Vector3 &dir, real_t seg_len, const Vector3 &center, real_t r, real_t &r_t, Vector3 &r_n) {
+	Vector3 oc = from - center;
+	real_t b = oc.dot(dir);
+	real_t c = oc.dot(oc) - r * r;
+	real_t disc = b * b - c;
+	if (disc < 0.0) {
+		return false;
+	}
+	real_t sq = Math::sqrt(disc);
+	real_t t = -b - sq;
+	if (t < 0.0) {
+		t = -b + sq; // ray starts inside
+	}
+	if (t < 0.0 || t > seg_len) {
+		return false;
+	}
+	r_t = t;
+	r_n = ((from + dir * t) - center).normalized();
+	return true;
+}
+
+bool ray_box(const Vector3 &from0, const Vector3 &dir, real_t seg_len, const Vector3 &center, const Vector3 &he, real_t &r_t, Vector3 &r_n) {
+	Vector3 from = from0 - center;
+	real_t tmin = 0.0;
+	real_t tmax = seg_len;
+	Vector3 n;
+	for (int a = 0; a < 3; a++) {
+		if (Math::abs(dir[a]) < 1e-9) {
+			if (from[a] < -he[a] || from[a] > he[a]) {
+				return false;
+			}
+		} else {
+			real_t inv = 1.0 / dir[a];
+			real_t t1 = (-he[a] - from[a]) * inv;
+			real_t t2 = (he[a] - from[a]) * inv;
+			real_t sign = -1.0;
+			if (t1 > t2) {
+				SWAP(t1, t2);
+				sign = 1.0;
+			}
+			if (t1 > tmin) {
+				tmin = t1;
+				n = Vector3();
+				n[a] = sign;
+			}
+			if (t2 < tmax) {
+				tmax = t2;
+			}
+			if (tmin > tmax) {
+				return false;
+			}
+		}
+	}
+	if (tmin > seg_len) {
+		return false;
+	}
+	r_t = tmin;
+	r_n = n;
+	return true;
+}
+
+// Finite cylinder along local Y, radius r, half-height hh, centred at origin.
+bool ray_cylinder(const Vector3 &from, const Vector3 &dir, real_t seg_len, real_t r, real_t hh, real_t &r_t, Vector3 &r_n) {
+	real_t best_t = seg_len + 1.0;
+	Vector3 best_n;
+	bool got = false;
+	const real_t a = dir.x * dir.x + dir.z * dir.z;
+	if (a > 1e-12) {
+		const real_t b = 2.0 * (from.x * dir.x + from.z * dir.z);
+		const real_t c = from.x * from.x + from.z * from.z - r * r;
+		const real_t disc = b * b - 4.0 * a * c;
+		if (disc >= 0.0) {
+			const real_t sq = Math::sqrt(disc);
+			for (int s = 0; s < 2; s++) {
+				const real_t t = (s == 0) ? (-b - sq) / (2.0 * a) : (-b + sq) / (2.0 * a);
+				if (t >= 0.0 && t <= seg_len) {
+					const real_t y = from.y + dir.y * t;
+					if (y >= -hh && y <= hh) {
+						Vector3 h = from + dir * t;
+						best_t = t;
+						best_n = Vector3(h.x, 0, h.z).normalized();
+						got = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+	for (int s = 0; s < 2; s++) {
+		const real_t cy = (s == 0) ? hh : -hh;
+		if (Math::abs(dir.y) > 1e-9) {
+			const real_t t = (cy - from.y) / dir.y;
+			if (t >= 0.0 && t <= seg_len && t < best_t) {
+				Vector3 h = from + dir * t;
+				if (h.x * h.x + h.z * h.z <= r * r) {
+					best_t = t;
+					best_n = Vector3(0, (s == 0) ? 1 : -1, 0);
+					got = true;
+				}
+			}
+		}
+	}
+	if (!got) {
+		return false;
+	}
+	r_t = best_t;
+	r_n = best_n;
+	return true;
+}
+
+// Capsule along local Y: radius r, cylinder half-height chh, spheres at y=±chh.
+bool ray_capsule(const Vector3 &from, const Vector3 &dir, real_t seg_len, real_t r, real_t chh, real_t &r_t, Vector3 &r_n) {
+	real_t best_t = seg_len + 1.0;
+	Vector3 best_n;
+	bool got = false;
+	const real_t a = dir.x * dir.x + dir.z * dir.z;
+	if (a > 1e-12) {
+		const real_t b = 2.0 * (from.x * dir.x + from.z * dir.z);
+		const real_t c = from.x * from.x + from.z * from.z - r * r;
+		const real_t disc = b * b - 4.0 * a * c;
+		if (disc >= 0.0) {
+			const real_t sq = Math::sqrt(disc);
+			for (int s = 0; s < 2; s++) {
+				const real_t t = (s == 0) ? (-b - sq) / (2.0 * a) : (-b + sq) / (2.0 * a);
+				if (t >= 0.0 && t <= seg_len) {
+					const real_t y = from.y + dir.y * t;
+					if (y >= -chh && y <= chh) {
+						Vector3 h = from + dir * t;
+						best_t = t;
+						best_n = Vector3(h.x, 0, h.z).normalized();
+						got = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+	for (int s = 0; s < 2; s++) {
+		const real_t cy = (s == 0) ? chh : -chh;
+		real_t t;
+		Vector3 n;
+		if (ray_sphere(from, dir, seg_len, Vector3(0, cy, 0), r, t, n)) {
+			// Only accept the hemispherical caps (beyond the cylinder section).
+			const real_t hy = from.y + dir.y * t;
+			if (((s == 0 && hy >= chh) || (s == 1 && hy <= -chh)) && t < best_t) {
+				best_t = t;
+				best_n = n;
+				got = true;
+			}
+		}
+	}
+	if (!got) {
+		return false;
+	}
+	r_t = best_t;
+	r_n = best_n;
+	return true;
+}
+
 // Slab test for segment [0, seg_len] along unit dir (inv_dir = 1/dir per axis).
 bool ray_aabb(const Vector3 &from, const Vector3 &inv_dir, real_t seg_len, const AABB &box, real_t &r_tmin) {
 	Vector3 bmax = box.position + box.size;
@@ -2021,14 +2205,8 @@ bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid
 			continue;
 		}
 		KilosShape *shape = shape_owner.get_or_null(bs.shape);
-		if (!shape || shape->type != SHAPE_CONCAVE_POLYGON) {
-			continue; // P5a supports concave (trimesh) only
-		}
-		if (shape->bvh.is_empty()) {
-			if (shape->faces.is_empty()) {
-				continue;
-			}
-			_build_shape_bvh(shape); // lazy: first raycast against this chunk
+		if (!shape) {
+			continue;
 		}
 
 		const Transform3D world_xform = p_body->transform * bs.xform;
@@ -2041,56 +2219,91 @@ bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid
 			continue;
 		}
 		const Vector3 ldir = lseg / lseg_len;
-		Vector3 inv_dir(
-				Math::abs(ldir.x) < 1e-9 ? 1e30 : 1.0 / ldir.x,
-				Math::abs(ldir.y) < 1e-9 ? 1e30 : 1.0 / ldir.y,
-				Math::abs(ldir.z) < 1e-9 ? 1e30 : 1.0 / ldir.z);
 
-		const bool hit_back = p_hit_back || shape->backface;
-		const Vector3 *faces = shape->faces.ptr();
-		const int *tri_order = shape->tri_order.ptr();
-
-		// Iterative BVH traversal; prune by the current closest fraction.
-		int node_stack[64];
-		int sp = 0;
-		node_stack[sp++] = 0;
-		while (sp > 0) {
-			const BVHNode &node = shape->bvh[node_stack[--sp]];
-			real_t node_tmin;
-			real_t local_cutoff = r_closest_t * lseg_len;
-			if (!ray_aabb(lfrom, inv_dir, local_cutoff, node.bounds, node_tmin)) {
-				continue;
+		// Records a local-space hit (t along ldir, local normal) if it's the closest so far.
+		auto record = [&](real_t p_t_local, const Vector3 &p_n_local, int p_face) {
+			const real_t frac = p_t_local / lseg_len;
+			if (frac >= r_closest_t) {
+				return;
 			}
-			if (node.left < 0) {
-				for (int k = 0; k < node.tri_count; k++) {
-					const int tri = tri_order[node.tri_start + k];
-					real_t t_local;
-					Vector3 n_local;
-					if (segment_triangle(lfrom, ldir, lseg_len, faces[tri * 3 + 0], faces[tri * 3 + 1], faces[tri * 3 + 2], hit_back, t_local, n_local)) {
-						const real_t frac = t_local / lseg_len;
-						if (frac < r_closest_t) {
-							r_closest_t = frac;
-							hit_any = true;
-							r_result.position = p_from + world_seg * frac;
-							Vector3 wn = world_xform.basis.xform(n_local).normalized(); // rigid terrain xform => basis maps normals
-							if (wn.dot(world_seg) > 0.0) {
-								wn = -wn;
+			r_closest_t = frac;
+			hit_any = true;
+			r_result.position = p_from + world_seg * frac;
+			Vector3 wn = world_xform.basis.xform(p_n_local).normalized();
+			if (wn.dot(world_seg) > 0.0) {
+				wn = -wn;
+			}
+			r_result.normal = wn;
+			r_result.rid = p_body_rid;
+			r_result.collider_id = p_body->instance_id;
+			r_result.collider = ObjectDB::get_instance(p_body->instance_id);
+			r_result.shape = si;
+			r_result.face_index = p_face;
+		};
+
+		real_t t_local;
+		Vector3 n_local;
+		switch (shape->type) {
+			case SHAPE_CONCAVE_POLYGON: {
+				if (shape->bvh.is_empty()) {
+					if (shape->faces.is_empty()) {
+						break;
+					}
+					_build_shape_bvh(shape); // lazy: first raycast against this chunk
+				}
+				const Vector3 inv_dir(
+						Math::abs(ldir.x) < 1e-9 ? 1e30 : 1.0 / ldir.x,
+						Math::abs(ldir.y) < 1e-9 ? 1e30 : 1.0 / ldir.y,
+						Math::abs(ldir.z) < 1e-9 ? 1e30 : 1.0 / ldir.z);
+				const bool hit_back = p_hit_back || shape->backface;
+				const Vector3 *faces = shape->faces.ptr();
+				const int *tri_order = shape->tri_order.ptr();
+				int node_stack[64];
+				int sp = 0;
+				node_stack[sp++] = 0;
+				while (sp > 0) {
+					const BVHNode &node = shape->bvh[node_stack[--sp]];
+					real_t node_tmin;
+					if (!ray_aabb(lfrom, inv_dir, r_closest_t * lseg_len, node.bounds, node_tmin)) {
+						continue;
+					}
+					if (node.left < 0) {
+						for (int k = 0; k < node.tri_count; k++) {
+							const int tri = tri_order[node.tri_start + k];
+							if (segment_triangle(lfrom, ldir, lseg_len, faces[tri * 3 + 0], faces[tri * 3 + 1], faces[tri * 3 + 2], hit_back, t_local, n_local)) {
+								record(t_local, n_local, tri);
 							}
-							r_result.normal = wn;
-							r_result.rid = p_body_rid;
-							r_result.collider_id = p_body->instance_id;
-							r_result.collider = ObjectDB::get_instance(p_body->instance_id);
-							r_result.shape = si;
-							r_result.face_index = tri;
 						}
+					} else if (sp < 62) {
+						node_stack[sp++] = node.left;
+						node_stack[sp++] = node.right;
 					}
 				}
-			} else {
-				if (sp < 62) {
-					node_stack[sp++] = node.left;
-					node_stack[sp++] = node.right;
+			} break;
+			case SHAPE_SPHERE: {
+				if (ray_sphere(lfrom, ldir, lseg_len, Vector3(), shape->radius, t_local, n_local)) {
+					record(t_local, n_local, -1);
 				}
-			}
+			} break;
+			case SHAPE_BOX:
+			case SHAPE_CONVEX_POLYGON: {
+				if (ray_box(lfrom, ldir, lseg_len, shape->center, shape->box_half, t_local, n_local)) {
+					record(t_local, n_local, -1);
+				}
+			} break;
+			case SHAPE_CYLINDER: {
+				if (ray_cylinder(lfrom, ldir, lseg_len, shape->radius, shape->height * 0.5, t_local, n_local)) {
+					record(t_local, n_local, -1);
+				}
+			} break;
+			case SHAPE_CAPSULE: {
+				const real_t chh = MAX((real_t)0.0, shape->height * 0.5 - shape->radius);
+				if (ray_capsule(lfrom, ldir, lseg_len, shape->radius, chh, t_local, n_local)) {
+					record(t_local, n_local, -1);
+				}
+			} break;
+			default:
+				break;
 		}
 	}
 	return hit_any;
