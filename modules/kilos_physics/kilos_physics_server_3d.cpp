@@ -965,12 +965,29 @@ bool KilosPhysicsServer3D::body_test_motion(RID p_body, const MotionParameters &
 	const Vector3 centers_local[2] = { Vector3(0, half, 0), Vector3(0, -half, 0) };
 	const Vector3 dir = motion / motion_len;
 
+	// Recovery (depenetration): push the capsule out of any geometry it's already
+	// sunk into before sweeping. This is what stops the player sinking into terrain.
+	Vector3 recover;
+	Vector3 recover_normal;
+	for (int it = 0; it < 4; it++) {
+		const Vector3 A = world.xform(centers_local[0]) + recover;
+		const Vector3 B = world.xform(centers_local[1]) + recover;
+		Vector3 rn;
+		Vector3 push = _recover_capsule(body->space, p_body, A, B, radius + margin, body->collision_mask, rn);
+		if (push.length() < 1e-4) {
+			break;
+		}
+		recover += push;
+		recover_normal = rn;
+	}
+	const bool recovered = recover.length_squared() > 1e-8;
+
 	real_t best_safe = 1.0;
 	bool any_hit = false;
 	PhysicsServer3D::MotionCollision best_col;
 
 	for (int i = 0; i < 2; i++) {
-		const Vector3 c = world.xform(centers_local[i]);
+		const Vector3 c = world.xform(centers_local[i]) + recover;
 		PhysicsDirectSpaceState3D::RayParameters rp;
 		rp.from = c;
 		rp.to = c + dir * (motion_len + radius + margin);
@@ -1005,19 +1022,28 @@ bool KilosPhysicsServer3D::body_test_motion(RID p_body, const MotionParameters &
 
 	best_safe = CLAMP(best_safe, (real_t)0.0, (real_t)1.0);
 	if (r_result) {
-		r_result->travel = motion * best_safe;
-		r_result->remainder = motion - r_result->travel;
+		r_result->travel = recover + motion * best_safe;
+		r_result->remainder = motion - motion * best_safe;
 		r_result->collision_safe_fraction = best_safe;
 		r_result->collision_unsafe_fraction = best_safe;
 		r_result->collision_depth = margin;
 		if (any_hit) {
 			r_result->collisions[0] = best_col;
 			r_result->collision_count = 1;
+		} else if (recovered) {
+			// Report the recovery push as a contact so is_on_floor works at rest.
+			PhysicsServer3D::MotionCollision col;
+			col.normal = recover_normal;
+			col.position = world.xform(centers_local[1]) + recover;
+			col.depth = recover.length();
+			col.local_shape = 0;
+			r_result->collisions[0] = col;
+			r_result->collision_count = 1;
 		} else {
 			r_result->collision_count = 0;
 		}
 	}
-	return any_hit;
+	return any_hit || recovered;
 }
 
 PhysicsDirectBodyState3D * KilosPhysicsServer3D::body_get_direct_state(RID p_body) {
@@ -1919,6 +1945,39 @@ struct CentroidSorter {
 	}
 };
 
+// Closest point on triangle (a,b,c) to point p (Ericson, RTCD).
+Vector3 closest_point_on_triangle(const Vector3 &p, const Vector3 &a, const Vector3 &b, const Vector3 &c) {
+	const Vector3 ab = b - a, ac = c - a, ap = p - a;
+	const real_t d1 = ab.dot(ap), d2 = ac.dot(ap);
+	if (d1 <= 0 && d2 <= 0) {
+		return a;
+	}
+	const Vector3 bp = p - b;
+	const real_t d3 = ab.dot(bp), d4 = ac.dot(bp);
+	if (d3 >= 0 && d4 <= d3) {
+		return b;
+	}
+	const real_t vc = d1 * d4 - d3 * d2;
+	if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+		return a + ab * (d1 / (d1 - d3));
+	}
+	const Vector3 cp = p - c;
+	const real_t d5 = ab.dot(cp), d6 = ac.dot(cp);
+	if (d6 >= 0 && d5 <= d6) {
+		return c;
+	}
+	const real_t vb = d5 * d2 - d1 * d6;
+	if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+		return a + ac * (d2 / (d2 - d6));
+	}
+	const real_t va = d3 * d6 - d5 * d4;
+	if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
+		return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+	}
+	const real_t denom = 1.0 / (va + vb + vc);
+	return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
 // Dequantize a 16-bit vertex (3 uint16) back to world/local space via the AABB.
 _FORCE_INLINE_ Vector3 dequant(const uint16_t *q, const AABB &box) {
 	const real_t k = 1.0 / 65535.0;
@@ -2470,6 +2529,124 @@ void KilosPhysicsServer3D::_build_space_bvh(KilosSpace *space) {
 bool KilosPhysicsServer3D::_intersect_ray(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result) {
 	MutexLock lock(collision_mutex);
 	return _intersect_ray_unlocked(p_space, p_parameters, r_result);
+}
+
+Vector3 KilosPhysicsServer3D::_recover_capsule(RID p_space, RID p_exclude, const Vector3 &p_a, const Vector3 &p_b, real_t p_radius, uint32_t p_mask, Vector3 &r_normal) const {
+	r_normal = Vector3();
+	KilosSpace *space = space_owner.get_or_null(p_space);
+	if (!space || space->bvh.is_empty()) {
+		return Vector3();
+	}
+
+	const Vector3 samples[3] = { p_a, (p_a + p_b) * 0.5, p_b };
+	AABB cap_aabb(p_a, Vector3());
+	cap_aabb.expand_to(p_b);
+	cap_aabb = cap_aabb.grow(p_radius);
+
+	real_t best_pen = 0.0;
+	Vector3 best_push;
+	Vector3 best_normal;
+
+	// Depenetrate the capsule samples against one body's concave shapes.
+	auto process_body = [&](RID p_brid) {
+		if (p_brid == p_exclude) {
+			return;
+		}
+		KilosBody *body = body_owner.get_or_null(p_brid);
+		if (!body || !(body->collision_layer & p_mask)) {
+			return;
+		}
+		for (int si = 0; si < body->shapes.size(); si++) {
+			const KilosBody::BodyShape &bs = body->shapes[si];
+			if (bs.disabled) {
+				continue;
+			}
+			KilosShape *shape = shape_owner.get_or_null(bs.shape);
+			if (!shape || shape->type != SHAPE_CONCAVE_POLYGON) {
+				continue;
+			}
+			if (shape->bvh.is_empty()) {
+				if (shape->qfaces.is_empty()) {
+					continue;
+				}
+				_build_shape_bvh(shape);
+			}
+			const Transform3D world_xform = body->transform * bs.xform;
+			const Transform3D inv = world_xform.affine_inverse();
+			Vector3 ls[3];
+			AABB laabb;
+			for (int m = 0; m < 3; m++) {
+				ls[m] = inv.xform(samples[m]);
+				if (m == 0) {
+					laabb = AABB(ls[0], Vector3());
+				} else {
+					laabb.expand_to(ls[m]);
+				}
+			}
+			laabb = laabb.grow(p_radius);
+			const uint16_t *qf = shape->qfaces.ptr();
+			const AABB &qbox = shape->local_aabb;
+			const int *tri_order = shape->tri_order.ptr();
+			int ts[64];
+			int tsp = 0;
+			ts[tsp++] = 0;
+			while (tsp > 0) {
+				const BVHNode &tn = shape->bvh[ts[--tsp]];
+				if (!tn.bounds.intersects(laabb)) {
+					continue;
+				}
+				if (tn.left < 0) {
+					for (int j = 0; j < tn.tri_count; j++) {
+						const int tri = tri_order[tn.tri_start + j];
+						const Vector3 A = dequant(qf + tri * 9 + 0, qbox);
+						const Vector3 B = dequant(qf + tri * 9 + 3, qbox);
+						const Vector3 C = dequant(qf + tri * 9 + 6, qbox);
+						for (int m = 0; m < 3; m++) {
+							const Vector3 cp = closest_point_on_triangle(ls[m], A, B, C);
+							const Vector3 d = ls[m] - cp;
+							const real_t dist = d.length();
+							if (dist < p_radius && dist > 1e-6) {
+								const real_t pen = p_radius - dist;
+								if (pen > best_pen) {
+									best_pen = pen;
+									best_normal = world_xform.basis.xform(d / dist).normalized();
+									best_push = best_normal * pen;
+								}
+							}
+						}
+					}
+				} else if (tsp < 62) {
+					ts[tsp++] = tn.left;
+					ts[tsp++] = tn.right;
+				}
+			}
+		}
+	};
+
+	// Broadphase: bodies whose node AABB overlaps the capsule.
+	int stack[128];
+	int sp = 0;
+	stack[sp++] = 0;
+	while (sp > 0) {
+		const BVHNode &node = space->bvh[stack[--sp]];
+		if (!node.bounds.intersects(cap_aabb)) {
+			continue;
+		}
+		if (node.left < 0) {
+			for (int k = 0; k < node.tri_count; k++) {
+				process_body(space->bvh_bodies[space->bvh_order[node.tri_start + k]]);
+			}
+		} else if (sp < 126) {
+			stack[sp++] = node.left;
+			stack[sp++] = node.right;
+		}
+	}
+	for (int i = 0; i < space->bvh_pending.size(); i++) {
+		process_body(space->bvh_pending[i]);
+	}
+
+	r_normal = best_normal;
+	return best_push;
 }
 
 bool KilosPhysicsServer3D::_intersect_ray_unlocked(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result) {

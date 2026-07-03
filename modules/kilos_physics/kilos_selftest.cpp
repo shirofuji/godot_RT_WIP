@@ -512,6 +512,57 @@ void test_shape_added_after_space() {
 	memdelete(server);
 }
 
+void test_capsule_recovery() {
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	RID space = server->space_create();
+
+	// Trimesh floor at y=5.
+	PackedVector3Array faces;
+	Vector3 a(-10, 5, -10), b(10, 5, -10), c(10, 5, 10), d(-10, 5, 10);
+	faces.push_back(a);
+	faces.push_back(b);
+	faces.push_back(c);
+	faces.push_back(a);
+	faces.push_back(c);
+	faces.push_back(d);
+	RID floor_shape = server->concave_polygon_shape_create();
+	Dictionary fd;
+	fd["faces"] = faces;
+	server->shape_set_data(floor_shape, fd);
+	RID floor_body = server->body_create();
+	server->body_set_mode(floor_body, PhysicsServer3D::BODY_MODE_STATIC);
+	server->body_add_shape(floor_body, floor_shape, Transform3D(), false);
+	server->body_set_space(floor_body, space);
+
+	// Capsule (r=0.5,h=2) sunk ~0.3 into the floor: bottom sphere centre at y=5.2
+	// (above the surface but overlapping), so depenetration should push it UP.
+	RID cap_shape = server->capsule_shape_create();
+	Dictionary cd;
+	cd["radius"] = 0.5;
+	cd["height"] = 2.0;
+	server->shape_set_data(cap_shape, cd);
+	RID cap = server->body_create();
+	server->body_add_shape(cap, cap_shape, Transform3D(), false);
+	server->body_set_space(cap, space);
+
+	PhysicsServer3D::MotionParameters mp;
+	mp.from = Transform3D(Basis(), Vector3(0, 5.7, 0));
+	mp.motion = Vector3(0, -0.001, 0);
+	PhysicsServer3D::MotionResult mr;
+	server->body_test_motion(cap, mp, &mr); // 1st call builds the broadphase
+	server->body_test_motion(cap, mp, &mr); // 2nd call: recovery active
+
+	check(mr.travel.y > 0.2, vformat("Recovery pushes a sunk capsule up out of the terrain (travel.y=%.3f)", mr.travel.y));
+	check(mr.collision_count > 0 && mr.collisions[0].normal.y > 0.7, "Recovery reports an up-facing floor contact");
+
+	server->free_rid(cap);
+	server->free_rid(cap_shape);
+	server->free_rid(floor_body);
+	server->free_rid(floor_shape);
+	server->free_rid(space);
+	memdelete(server);
+}
+
 } // namespace
 
 void run_kilos_selftest_if_requested() {
@@ -530,6 +581,7 @@ void run_kilos_selftest_if_requested() {
 	test_raycast_primitives();
 	test_shape_added_after_space();
 	test_capsule_motion();
+	test_capsule_recovery();
 	if (g_failures == 0) {
 		print_line("KILOS_SELFTEST: all checks passed");
 	} else {

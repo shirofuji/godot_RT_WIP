@@ -210,6 +210,9 @@ private:
 	void _build_space_bvh(KilosSpace *p_space);
 	void _mark_space_dirty(RID p_space);
 	bool _intersect_ray_unlocked(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result);
+	// Depenetrate a capsule (sphere centres p_a/p_b, radius) from static trimesh
+	// geometry; returns the deepest push-out (world) and its normal.
+	Vector3 _recover_capsule(RID p_space, RID p_exclude, const Vector3 &p_a, const Vector3 &p_b, real_t p_radius, uint32_t p_mask, Vector3 &r_normal) const;
 
 	// Guards the CPU collision state (shapes, body shape lists, space body sets and
 	// broadphase BVH) so main-thread queries don't race the physics thread creating
