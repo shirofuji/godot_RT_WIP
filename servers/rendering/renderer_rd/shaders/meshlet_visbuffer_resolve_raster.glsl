@@ -1,29 +1,33 @@
-#[compute]
+#[vertex]
 
 #version 450
 
 #VERSION_DEFINES
 
-// Material-resolve pass (P4). One thread per screen pixel: read the visibility buffer, unpack the
-// winning (source-list, slot, triangle), refetch that triangle's three vertices, recompute
-// perspective-correct barycentrics + analytic screen-space gradients (compute has no dFdx), interpolate
-// world position / normal / UV, and shade via the shared meshlet_shade() (the exact same lighting the
-// hardware color fragment uses). Writes the lit color to an output image; pixels with no fragment
-// (visbuffer == 0) are left untouched so the rest of the scene shows through.
-//
-// Two variants (selected by the caller from RD::SUPPORTS_BUFFER_ATOMIC_INT64), matching the raster:
-//   - default: one uint64 visbuffer.
-//   - MESHLET_VISBUFFER_FALLBACK: separate depth + payload buffers.
+// Fullscreen triangle (no vertex buffer): gl_VertexIndex 0,1,2 -> a triangle covering the viewport.
+void main() {
+	vec2 uv = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
+	gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+
+#[fragment]
+
+#version 450
+
+#VERSION_DEFINES
+
+// Fragment variant of the visibility-buffer resolve (P5): writes the shaded color to the framebuffer's
+// color attachment AND the fragment's reverse-Z depth to gl_FragDepth, so the meshlet geometry ends up
+// in the real depth buffer and sky/transparents composite correctly - which the compute+imageStore
+// resolve (meshlet_visbuffer_resolve.glsl) can't do. Same per-pixel math (shared resolve include).
 
 #ifndef MESHLET_VISBUFFER_FALLBACK
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #endif
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(location = 0) out vec4 frag_color;
 
-// Structs (MeshletMaterial/MeshletLight/SVOGINode) + M_PI, MESHLET_TEXTURE_NONE. Include before the
-// buffers that use these types.
 #include "meshlet_shade_types_inc.glsl"
 
 #ifndef MESHLET_VISBUFFER_FALLBACK
@@ -96,7 +100,7 @@ layout(set = 0, binding = 8, std430) restrict readonly buffer VertexPositions {
 vertex_positions;
 
 layout(set = 0, binding = 9, std430) restrict readonly buffer VertexAttributes {
-	vec4 data[]; // xy = octahedral normal, zw = uv.
+	vec4 data[];
 }
 vertex_attributes;
 
@@ -125,37 +129,29 @@ layout(set = 0, binding = 15) uniform sampler radiance_sampler;
 layout(set = 0, binding = 16) uniform texture2D material_textures[256];
 layout(set = 0, binding = 17) uniform sampler material_sampler;
 
-layout(set = 0, binding = 18, rgba32f) uniform restrict writeonly image2D out_color;
-
 layout(push_constant, std430) uniform Params {
-	mat4 view_projection; // Absolute (projection * inverse-camera) - matches the rasterizers.
+	mat4 view_projection;
 	vec3 camera_position;
 	uint light_count;
 	vec4 ambient_color;
 	vec4 svogi_bounds;
-	vec4 svogi_params;
+	vec4 svogi_params; // .w packs the viewport dims: (width << 16) | height, reinterpreted as float.
 }
 params;
 
-// oct_decode_normal + fetch_triangle_local_vertex (reads meshlet_triangles above).
 #include "meshlet_geometry_inc.glsl"
-// BRDF/light/SVOGI/ambient + meshlet_shade() (references meshlet_materials/lights/svogi_nodes/radiance*
-// /material* declared above).
 #include "meshlet_shade_inc.glsl"
-
-// Shared per-pixel resolve (edge/pc_bary/resolve_visbuffer_pixel).
 #include "meshlet_visbuffer_resolve_inc.glsl"
 
 void main() {
-	ivec2 dims = imageSize(out_color);
-	ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
-	if (pix.x >= dims.x || pix.y >= dims.y) {
-		return;
-	}
+	uint packed_dims = floatBitsToUint(params.svogi_params.w);
+	ivec2 dims = ivec2(int(packed_dims >> 16), int(packed_dims & 0xFFFFu));
+	ivec2 pix = ivec2(gl_FragCoord.xy);
 	vec3 color;
 	float depth;
-	if (resolve_visbuffer_pixel(pix, dims, color, depth)) {
-		imageStore(out_color, pix, vec4(color, 1.0));
+	if (!resolve_visbuffer_pixel(pix, dims, color, depth)) {
+		discard; // No fragment / alpha-scissor: keep whatever is already in the framebuffer here.
 	}
-	// Uncovered / discarded pixels are left untouched (background shows through).
+	frag_color = vec4(color, 1.0);
+	gl_FragDepth = depth; // Reverse-Z NDC depth of the winning surface.
 }

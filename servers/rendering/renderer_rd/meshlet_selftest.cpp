@@ -1335,6 +1335,49 @@ void test_meshlet_visbuffer_resolve() {
 	// The resolve writes exactly the pixels the visbuffer marks as covered.
 	check(lit == vb.non_zero, "Resolve: shaded pixel count equals the visbuffer coverage exactly");
 
+	// P5 fragment resolve: shade the same visbuffer into a real color+depth framebuffer (writes color +
+	// gl_FragDepth). Confirms the live-compositing path produces the same coverage as the compute resolve.
+	{
+		RD::TextureFormat cf;
+		cf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT; // Mandatory renderable color-attachment format.
+		cf.width = W;
+		cf.height = H;
+		cf.usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		RID color_tex = RD::get_singleton()->texture_create(cf, RD::TextureView());
+		RD::TextureFormat dfm;
+		dfm.format = RD::DATA_FORMAT_D32_SFLOAT;
+		dfm.width = W;
+		dfm.height = H;
+		dfm.usage_bits = RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+		RID depth_tex = RD::get_singleton()->texture_create(dfm, RD::TextureView());
+		Vector<RID> fb_texs;
+		fb_texs.push_back(color_tex);
+		fb_texs.push_back(depth_tex);
+		RID fb = RD::get_singleton()->framebuffer_create(fb_texs);
+
+		rasterizer->resolve_raster(fb, sw_list, RendererRD::MeshletCuller::CullResult(), transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, lights_buffer, 0, Color(0.4f, 0.4f, 0.4f), 0.0f, RID(), Vector3(), 0.0f, 0.0f, RID(), 1.0f, 0.0f, true);
+
+		Vector<uint8_t> raster_bytes = RD::get_singleton()->texture_get_data(color_tex, 0);
+		const uint16_t *rc = (const uint16_t *)raster_bytes.ptr(); // rgba16f: 4x half per pixel.
+		uint32_t rlit = 0;
+		for (int i = 0; i < W * H; i++) {
+			float rr = Math::half_to_float(rc[i * 4 + 0]);
+			float gg = Math::half_to_float(rc[i * 4 + 1]);
+			float bb = Math::half_to_float(rc[i * 4 + 2]);
+			if (rr > 0.01f || gg > 0.01f || bb > 0.01f) {
+				rlit++;
+			}
+		}
+		float corner_r = Math::half_to_float(rc[0]);
+		check(rlit > 50, "Resolve(raster): fragment resolve shaded a meaningful number of pixels");
+		check(corner_r <= 0.01f, "Resolve(raster): corner pixel is background");
+		check(rlit == vb.non_zero, "Resolve(raster): fragment resolve coverage equals the visbuffer coverage exactly");
+
+		RD::get_singleton()->free_rid(fb);
+		RD::get_singleton()->free_rid(color_tex);
+		RD::get_singleton()->free_rid(depth_tex);
+	}
+
 	storage->free_mesh_meshlets(upload);
 	RD::get_singleton()->free_rid(transforms_buffer);
 	RD::get_singleton()->free_rid(material_ids_buffer);

@@ -85,14 +85,30 @@ MeshletSoftwareRasterizer gained resolve() (mirrors MeshletRenderer::render's sh
 out_color (grow-reuse) + 2 samplers. **Verified** by test_meshlet_visbuffer_resolve: rasterize sw ->
 resolve -> shaded pixel count EQUALS visbuffer coverage exactly, colors in [0,1], corner unshaded.
 
-### P5 — live integration — NEXT
-Wire classify -> raster(sw compute + hw draw into one visbuffer) -> resolve into the late pass behind
-`rendering/meshlet/software_raster` (default off, A/B vs today's color render()). Route BOTH lists
-through occlude() before rastering (P1 split currently bypasses occlusion). Resolve writes the scene
-color + real depth (so sky/transparents composite). Camera-relative projection for precision at large
-world coords (P2b/P3/P4 use absolute - fine standalone, revisit here). Once validated, delete the
-color render() path + its CULL_BACK/depth-bias hacks. Consider the visbuffer moving into
-RenderSceneBuffers (per-view, resize-managed) instead of the rasterizer's single shared buffer.
+### P5 — live integration — IN PROGRESS
+- **P5a fragment resolve — DONE & VERIFIED (2026-07-04).** Extracted the per-pixel resolve into
+  meshlet_visbuffer_resolve_inc.glsl (resolve_visbuffer_pixel -> out color + reverse-Z depth);
+  compute resolve (P4) now uses it (re-verified). New meshlet_visbuffer_resolve_raster.glsl: fullscreen
+  triangle vertex + fragment that calls it and writes frag_color + gl_FragDepth (depth test
+  GREATER_OR_EQUAL, depth write on) - so meshlet geometry lands in the REAL depth buffer for compositing
+  (compute+imageStore can't write a depth attachment). Viewport dims packed into svogi_params.w to keep
+  the push constant at 128 bytes. MeshletSoftwareRasterizer::resolve_raster(target_fb, ...) draws it into
+  a caller framebuffer (pipeline cached per fb format; INVALID_FORMAT_ID vertex format = procedural, no
+  vertex array). Verified by test_meshlet_visbuffer_resolve (raster block): shades a real color+depth
+  framebuffer, coverage == visbuffer coverage exactly. GOTCHA: a procedural fullscreen draw needs the
+  pipeline's vertex format = INVALID_FORMAT_ID, NOT an empty vertex format (else "No vertex array bound").
+
+STILL TODO (not headless-verifiable - needs the live scene, user A/B):
+- **P5b occlusion routing**: occlude BOTH lists before raster (P1 split currently bypasses occlude()).
+  occlude() uses one shared occluded_buffer - needs a 2nd, or occlude both in one call.
+- **P5c late-pass wiring**: in _render_meshlet_late_pass, behind `rendering/meshlet/software_raster`
+  (default off): cull(split on) -> occlude both -> clear visbuffer -> sw compute raster + hw draw raster
+  into it -> resolve_raster into the color_only_framebuffer (composites color+depth), skipping the color
+  render(). A/B vs today.
+- **P5d**: camera-relative projection (P2b/P3/P4/P5a use absolute - fine standalone; revisit for
+  large-world precision, matching meshlet_render.glsl).
+- **P5e**: once validated, retire the color render() path + its CULL_BACK/depth-bias hacks; consider the
+  visbuffer moving into RenderSceneBuffers (per-view, resize-managed) vs the current single shared buffer.
 
 ## P0 result (files added)
 - `shaders/meshlet_geometry_inc.glsl` — oct_decode_normal + fetch_triangle_local_vertex.

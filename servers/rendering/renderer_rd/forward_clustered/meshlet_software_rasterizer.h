@@ -10,6 +10,7 @@
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_dispatch_args.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_hw_raster.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_resolve.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_resolve_raster.glsl.gen.h"
 #include "servers/rendering/renderer_rd/meshlet_culler.h"
 
 #include "core/math/color.h"
@@ -96,6 +97,14 @@ private:
 	RID resolve_radiance_sampler; // Linear, clamp, mipmapped - for the sky octmap ambient.
 	RID resolve_material_sampler; // Linear, repeat, anisotropic - for material textures.
 
+	// Fragment resolve (P5): writes shaded color + gl_FragDepth into a real framebuffer for live
+	// compositing. Pipelines are cached per framebuffer format (recreated on change).
+	MeshletVisbufferResolveRasterShaderRD resolve_raster_shader;
+	RID resolve_raster_shader_version;
+	RID resolve_raster_pipeline_int64;
+	RID resolve_raster_pipeline_fallback;
+	RD::FramebufferFormatID resolve_raster_pipeline_format = RD::INVALID_FORMAT_ID;
+
 	bool int64_supported = false;
 
 	// Visbuffer, grow-and-reuse, sized to the screen. Only the layout matching the last rasterize()
@@ -142,6 +151,14 @@ public:
 
 	RID get_out_color() const { return out_color; }
 	Size2i get_out_color_dims() const { return out_color_dims; }
+
+	void _ensure_resolve_raster_pipeline(RD::FramebufferFormatID p_fb_format);
+
+	// Fragment resolve into an existing color+depth framebuffer (live path): shades the visbuffer,
+	// writing color to attachment 0 and the winning reverse-Z depth to gl_FragDepth (depth test
+	// GREATER_OR_EQUAL, depth write on), so meshlet geometry lands in the real depth buffer. p_clear
+	// clears the framebuffer's color/depth first (test use); false composites onto existing contents.
+	void resolve_raster(RID p_target_framebuffer, const RendererRD::MeshletCuller::CullResult &p_sw_list, const RendererRD::MeshletCuller::CullResult &p_hw_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, const Color &p_ambient_color, float p_sky_mix, RID p_svogi_octree, const Vector3 &p_svogi_center, float p_svogi_half, float p_svogi_energy, RID p_radiance_texture, float p_radiance_exposure, float p_max_roughness_lod, bool p_clear);
 
 	// Visbuffer accessors for the material-resolve pass (P4) and self-tests.
 	bool visbuffer_is_int64_layout() const { return visbuffer_is_int64; }
