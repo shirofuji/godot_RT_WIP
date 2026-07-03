@@ -75,6 +75,7 @@ RID KilosPhysicsServer3D::custom_shape_create() {
 }
 
 void KilosPhysicsServer3D::shape_set_data(RID p_shape, const Variant &p_data) {
+	MutexLock lock(collision_mutex);
 	KilosShape *s = shape_owner.get_or_null(p_shape);
 	ERR_FAIL_NULL(s);
 	switch (s->type) {
@@ -82,14 +83,15 @@ void KilosPhysicsServer3D::shape_set_data(RID p_shape, const Variant &p_data) {
 			Dictionary d = p_data;
 			if (d.has("faces")) {
 				PackedVector3Array pf = d["faces"];
-				s->faces.resize(pf.size());
+				s->faces = pf; // COW share - no per-vertex copy
 				AABB bounds;
-				for (int i = 0; i < pf.size(); i++) {
-					s->faces.write[i] = pf[i];
+				const Vector3 *r = pf.ptr();
+				const int n = pf.size();
+				for (int i = 0; i < n; i++) {
 					if (i == 0) {
-						bounds.position = pf[0];
+						bounds.position = r[0];
 					} else {
-						bounds.expand_to(pf[i]);
+						bounds.expand_to(r[i]);
 					}
 				}
 				s->local_aabb = bounds;
@@ -144,6 +146,7 @@ real_t KilosPhysicsServer3D::shape_get_custom_solver_bias(RID p_shape) const {
 }
 
 RID KilosPhysicsServer3D::space_create() {
+	MutexLock lock(collision_mutex);
 	return space_owner.make_rid(KilosSpace());
 }
 
@@ -436,6 +439,7 @@ void KilosPhysicsServer3D::_mark_dirty(uint32_t p_slot) {
 }
 
 RID KilosPhysicsServer3D::body_create() {
+	MutexLock lock(collision_mutex);
 	KilosBody body;
 	body.slot = _alloc_slot();
 	body.has_slot = true;
@@ -443,6 +447,7 @@ RID KilosPhysicsServer3D::body_create() {
 }
 
 void KilosPhysicsServer3D::body_set_space(RID p_body, RID p_space) {
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	if (body->space == p_space) {
@@ -497,6 +502,7 @@ PhysicsServer3D::BodyMode KilosPhysicsServer3D::body_get_mode(RID p_body) const 
 }
 
 void KilosPhysicsServer3D::body_add_shape(RID p_body, RID p_shape, const Transform3D &p_transform, bool p_disabled) {
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	KilosBody::BodyShape bs;
@@ -507,6 +513,7 @@ void KilosPhysicsServer3D::body_add_shape(RID p_body, RID p_shape, const Transfo
 }
 
 void KilosPhysicsServer3D::body_set_shape(RID p_body, int p_shape_idx, RID p_shape) {
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
@@ -514,6 +521,7 @@ void KilosPhysicsServer3D::body_set_shape(RID p_body, int p_shape_idx, RID p_sha
 }
 
 void KilosPhysicsServer3D::body_set_shape_transform(RID p_body, int p_shape_idx, const Transform3D &p_transform) {
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
@@ -541,6 +549,7 @@ Transform3D KilosPhysicsServer3D::body_get_shape_transform(RID p_body, int p_sha
 }
 
 void KilosPhysicsServer3D::body_set_shape_disabled(RID p_body, int p_shape_idx, bool p_disabled) {
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
@@ -548,6 +557,7 @@ void KilosPhysicsServer3D::body_set_shape_disabled(RID p_body, int p_shape_idx, 
 }
 
 void KilosPhysicsServer3D::body_remove_shape(RID p_body, int p_shape_idx) {
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
@@ -555,6 +565,7 @@ void KilosPhysicsServer3D::body_remove_shape(RID p_body, int p_shape_idx) {
 }
 
 void KilosPhysicsServer3D::body_clear_shapes(RID p_body) {
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	body->shapes.clear();
@@ -648,6 +659,7 @@ void KilosPhysicsServer3D::body_reset_mass_properties(RID p_body) {
 }
 
 void KilosPhysicsServer3D::body_set_state(RID p_body, BodyState p_state, const Variant &p_variant) {
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	if (p_state == BODY_STATE_TRANSFORM) {
@@ -857,6 +869,7 @@ bool KilosPhysicsServer3D::body_test_motion(RID p_body, const MotionParameters &
 		return false;
 	};
 
+	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
 	if (!body) {
 		return no_collision();
@@ -906,7 +919,7 @@ bool KilosPhysicsServer3D::body_test_motion(RID p_body, const MotionParameters &
 		rp.collision_mask = body->collision_mask;
 		rp.hit_back_faces = true;
 		PhysicsDirectSpaceState3D::RayResult rr;
-		if (_intersect_ray(body->space, rp, rr)) {
+		if (_intersect_ray_unlocked(body->space, rp, rr)) {
 			const real_t hit_dist = c.distance_to(rr.position);
 			real_t allowed = hit_dist - radius - margin;
 			if (allowed < 0.0) {
@@ -1141,6 +1154,7 @@ bool KilosPhysicsServer3D::joint_is_disabled_collisions_between_bodies(RID p_joi
 }
 
 void KilosPhysicsServer3D::free_rid(RID p_rid) {
+	MutexLock lock(collision_mutex);
 	if (space_owner.owns(p_rid)) {
 		space_owner.free(p_rid);
 	} else if (body_owner.owns(p_rid)) {
@@ -2196,6 +2210,11 @@ void KilosPhysicsServer3D::_build_space_bvh(KilosSpace *space) {
 }
 
 bool KilosPhysicsServer3D::_intersect_ray(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result) {
+	MutexLock lock(collision_mutex);
+	return _intersect_ray_unlocked(p_space, p_parameters, r_result);
+}
+
+bool KilosPhysicsServer3D::_intersect_ray_unlocked(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result) {
 	KilosSpace *space = space_owner.get_or_null(p_space);
 	if (!space) {
 		return false;
