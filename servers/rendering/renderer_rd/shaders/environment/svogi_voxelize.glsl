@@ -289,9 +289,27 @@ void main() {
 		// one voxel resolve via atomicMax (keeps the brightest contributor - a reasonable cheap
 		// approximation).
 		uint material_id = instance_material_ids.data[item.instance_index];
-		vec3 mat_albedo = meshlet_materials.data[material_id].albedo.rgb;
-		vec3 mat_emission = meshlet_materials.data[material_id].emission;
+		MeshletMaterial mat = meshlet_materials.data[material_id];
+		vec3 mat_albedo = mat.albedo.rgb;
+		vec3 mat_emission = mat.emission;
 		vec3 radiance = mat_albedo * voxel_direct_light(tri_centroid, normal) + mat_emission;
+
+		// Foliage coverage attenuation. Alpha-scissor / cutout materials (flags bit 0, set CPU-side
+		// for flora/leaves - the same bit meshlet_render.glsl uses for its alpha-scissor discard)
+		// voxelize as FULLY OPAQUE blocks even though real foliage is mostly gaps (~60% see-through).
+		// Left unattenuated, a sunlit tree stores a saturated wall of green LIT RADIANCE and the
+		// cone-trace bounce washes nearby white-lit surfaces green (the reported artifact). The
+		// octree is binary-coverage (child_mask is present/absent, no partial opacity), so we can't
+		// store true fractional coverage - instead we damp the emitted radiance by an approximate
+		// leaf-coverage fraction, so the voxel bounces a realistic fraction of the light a solid
+		// surface would. This is the physically-motivated fix (foliage really does bounce far less
+		// than a solid green wall) rather than an art-side desaturation, and it costs nothing at
+		// render time: one bit test per triangle here at voxelize time, zero per-pixel cost.
+		const float FOLIAGE_COVERAGE = 0.4;
+		if ((mat.flags & 1u) != 0u) {
+			radiance *= FOLIAGE_COVERAGE;
+		}
+
 		uvec3 radiance_bytes = uvec3(clamp(radiance, vec3(0.0), vec3(1.0)) * 255.0 + 0.5);
 		uint packed_color = (radiance_bytes.r << 24u) | (radiance_bytes.g << 16u) | (radiance_bytes.b << 8u) | 255u;
 		atomicMax(nodes[node_idx].albedo, packed_color); // Use atomicMax to ensure it writes if 0
