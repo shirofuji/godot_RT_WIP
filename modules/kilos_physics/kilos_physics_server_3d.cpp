@@ -83,11 +83,21 @@ void KilosPhysicsServer3D::shape_set_data(RID p_shape, const Variant &p_data) {
 			if (d.has("faces")) {
 				PackedVector3Array pf = d["faces"];
 				s->faces.resize(pf.size());
+				AABB bounds;
 				for (int i = 0; i < pf.size(); i++) {
 					s->faces.write[i] = pf[i];
+					if (i == 0) {
+						bounds.position = pf[0];
+					} else {
+						bounds.expand_to(pf[i]);
+					}
 				}
+				s->local_aabb = bounds;
 				s->backface = d.has("backface_collision") ? (bool)d["backface_collision"] : false;
-				_build_shape_bvh(s);
+				// The per-triangle BVH is built lazily on the first raycast, so
+				// chunks that are never queried (underground/air) cost nothing.
+				s->bvh.clear();
+				s->tri_order.clear();
 			}
 		} break;
 		case SHAPE_SPHERE: {
@@ -442,6 +452,7 @@ void KilosPhysicsServer3D::body_set_space(RID p_body, RID p_space) {
 		KilosSpace *old = space_owner.get_or_null(body->space);
 		if (old) {
 			old->bodies.erase(p_body);
+			old->bvh_dirty = true;
 		}
 	}
 	body->space = p_space;
@@ -449,6 +460,13 @@ void KilosPhysicsServer3D::body_set_space(RID p_body, RID p_space) {
 		KilosSpace *sp = space_owner.get_or_null(p_space);
 		if (sp) {
 			sp->bodies.insert(p_body);
+			if (!sp->bvh_dirty) {
+				// BVH already built: defer via the pending list, fold in periodically.
+				sp->bvh_pending.push_back(p_body);
+				if (sp->bvh_pending.size() > 64) {
+					sp->bvh_dirty = true;
+				}
+			}
 		}
 	}
 	body->active = p_space.is_valid();
@@ -1132,6 +1150,7 @@ void KilosPhysicsServer3D::free_rid(RID p_rid) {
 				KilosSpace *sp = space_owner.get_or_null(body->space);
 				if (sp) {
 					sp->bodies.erase(p_rid);
+					sp->bvh_dirty = true;
 				}
 			}
 			if (body->tracked) {
@@ -1885,7 +1904,7 @@ bool ray_aabb(const Vector3 &from, const Vector3 &inv_dir, real_t seg_len, const
 
 } // namespace
 
-void KilosPhysicsServer3D::_build_shape_bvh(KilosShape *s) {
+void KilosPhysicsServer3D::_build_shape_bvh(KilosShape *s) const {
 	s->bvh.clear();
 	s->tri_order.clear();
 	const int tri_count = s->faces.size() / 3;
@@ -1988,8 +2007,14 @@ bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid
 			continue;
 		}
 		KilosShape *shape = shape_owner.get_or_null(bs.shape);
-		if (!shape || shape->type != SHAPE_CONCAVE_POLYGON || shape->bvh.is_empty()) {
+		if (!shape || shape->type != SHAPE_CONCAVE_POLYGON) {
 			continue; // P5a supports concave (trimesh) only
+		}
+		if (shape->bvh.is_empty()) {
+			if (shape->faces.is_empty()) {
+				continue;
+			}
+			_build_shape_bvh(shape); // lazy: first raycast against this chunk
 		}
 
 		const Transform3D world_xform = p_body->transform * bs.xform;
@@ -2057,14 +2082,183 @@ bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid
 	return hit_any;
 }
 
+AABB KilosPhysicsServer3D::_body_world_aabb(const KilosBody *p_body) const {
+	AABB result;
+	bool first = true;
+	for (int i = 0; i < p_body->shapes.size(); i++) {
+		const KilosBody::BodyShape &bs = p_body->shapes[i];
+		if (bs.disabled) {
+			continue;
+		}
+		KilosShape *sh = shape_owner.get_or_null(bs.shape);
+		if (!sh) {
+			continue;
+		}
+		AABB la = sh->local_aabb;
+		if (la.size == Vector3() && sh->type != SHAPE_CONCAVE_POLYGON) {
+			// Approximate a primitive's local bounds.
+			real_t r = MAX(sh->radius, (real_t)0.01);
+			real_t h = MAX(sh->height, 2.0 * r);
+			la = AABB(Vector3(-r, -h * 0.5, -r), Vector3(2.0 * r, h, 2.0 * r));
+		}
+		AABB wa = (p_body->transform * bs.xform).xform(la);
+		if (first) {
+			result = wa;
+			first = false;
+		} else {
+			result.merge_with(wa);
+		}
+	}
+	return result;
+}
+
+void KilosPhysicsServer3D::_build_space_bvh(KilosSpace *space) {
+	space->bvh.clear();
+	space->bvh_bodies.clear();
+	space->bvh_order.clear();
+	space->bvh_pending.clear();
+	space->bvh_dirty = false;
+
+	Vector<AABB> aabbs;
+	Vector<Vector3> centroids;
+	for (const RID &rid : space->bodies) {
+		KilosBody *b = body_owner.get_or_null(rid);
+		if (!b || b->shapes.is_empty()) {
+			continue;
+		}
+		AABB wa = _body_world_aabb(b);
+		space->bvh_bodies.push_back(rid);
+		aabbs.push_back(wa);
+		centroids.push_back(wa.position + wa.size * 0.5);
+	}
+	const int n = space->bvh_bodies.size();
+	if (n == 0) {
+		return;
+	}
+	space->bvh_order.resize(n);
+	for (int i = 0; i < n; i++) {
+		space->bvh_order.write[i] = i;
+	}
+
+	struct Work {
+		int start;
+		int end;
+		int node;
+	};
+	Vector<Work> stack;
+	space->bvh.push_back(BVHNode());
+	stack.push_back({ 0, n, 0 });
+	const int LEAF = 2;
+	while (!stack.is_empty()) {
+		Work wk = stack[stack.size() - 1];
+		stack.remove_at(stack.size() - 1);
+		AABB bounds = aabbs[space->bvh_order[wk.start]];
+		for (int i = wk.start + 1; i < wk.end; i++) {
+			bounds.merge_with(aabbs[space->bvh_order[i]]);
+		}
+		const int count = wk.end - wk.start;
+		BVHNode node;
+		node.bounds = bounds;
+		if (count <= LEAF) {
+			node.left = -1;
+			node.right = -1;
+			node.tri_start = wk.start;
+			node.tri_count = count;
+			space->bvh.write[wk.node] = node;
+			continue;
+		}
+		Vector3 ext = bounds.size;
+		int axis = 0;
+		if (ext.y > ext.x) {
+			axis = 1;
+		}
+		if (ext.z > ext[axis]) {
+			axis = 2;
+		}
+		CentroidSorter cs;
+		cs.centroids = centroids.ptr();
+		cs.axis = axis;
+		SortArray<int, CentroidSorter> sorter;
+		sorter.compare = cs;
+		sorter.sort(space->bvh_order.ptrw() + wk.start, count);
+		const int mid = (wk.start + wk.end) / 2;
+		int l = space->bvh.size();
+		space->bvh.push_back(BVHNode());
+		int r = space->bvh.size();
+		space->bvh.push_back(BVHNode());
+		node.left = l;
+		node.right = r;
+		node.tri_count = 0;
+		space->bvh.write[wk.node] = node;
+		stack.push_back({ wk.start, mid, l });
+		stack.push_back({ mid, wk.end, r });
+	}
+}
+
 bool KilosPhysicsServer3D::_intersect_ray(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result) {
 	KilosSpace *space = space_owner.get_or_null(p_space);
 	if (!space) {
 		return false;
 	}
+	if (space->bvh_dirty) {
+		_build_space_bvh(space);
+	}
+	if (space->bvh.is_empty()) {
+		return false;
+	}
+
+	const Vector3 from = p_parameters.from;
+	const Vector3 seg = p_parameters.to - from;
+	const real_t seg_len = seg.length();
+	if (seg_len < 1e-9) {
+		return false;
+	}
+	const Vector3 dir = seg / seg_len;
+	const Vector3 inv_dir(
+			Math::abs(dir.x) < 1e-9 ? 1e30 : 1.0 / dir.x,
+			Math::abs(dir.y) < 1e-9 ? 1e30 : 1.0 / dir.y,
+			Math::abs(dir.z) < 1e-9 ? 1e30 : 1.0 / dir.z);
+
 	real_t closest_t = 1.0;
 	bool hit = false;
-	for (const RID &body_rid : space->bodies) {
+
+	int node_stack[128];
+	int sp = 0;
+	node_stack[sp++] = 0;
+	while (sp > 0) {
+		const BVHNode &node = space->bvh[node_stack[--sp]];
+		real_t tmin;
+		if (!ray_aabb(from, inv_dir, closest_t * seg_len, node.bounds, tmin)) {
+			continue;
+		}
+		if (node.left < 0) {
+			for (int k = 0; k < node.tri_count; k++) {
+				RID body_rid = space->bvh_bodies[space->bvh_order[node.tri_start + k]];
+				if (p_parameters.exclude.has(body_rid)) {
+					continue;
+				}
+				KilosBody *body = body_owner.get_or_null(body_rid);
+				if (!body || body->shapes.is_empty()) {
+					continue;
+				}
+				if (!(body->collision_layer & p_parameters.collision_mask)) {
+					continue;
+				}
+				if (_body_raycast(body, body_rid, from, p_parameters.to, p_parameters.hit_back_faces, closest_t, r_result)) {
+					hit = true;
+				}
+			}
+		} else {
+			if (sp < 126) {
+				node_stack[sp++] = node.left;
+				node_stack[sp++] = node.right;
+			}
+		}
+	}
+
+	// Bodies added since the last BVH build (not yet folded in).
+	for (int i = 0; i < space->bvh_pending.size(); i++) {
+		RID body_rid = space->bvh_pending[i];
 		if (p_parameters.exclude.has(body_rid)) {
 			continue;
 		}
@@ -2075,7 +2269,7 @@ bool KilosPhysicsServer3D::_intersect_ray(RID p_space, const PhysicsDirectSpaceS
 		if (!(body->collision_layer & p_parameters.collision_mask)) {
 			continue;
 		}
-		if (_body_raycast(body, body_rid, p_parameters.from, p_parameters.to, p_parameters.hit_back_faces, closest_t, r_result)) {
+		if (_body_raycast(body, body_rid, from, p_parameters.to, p_parameters.hit_back_faces, closest_t, r_result)) {
 			hit = true;
 		}
 	}

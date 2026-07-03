@@ -135,19 +135,29 @@ private:
 	};
 	mutable RID_Owner<MeshletCollider> meshlet_collider_owner;
 
-	struct KilosSpace {
-		HashSet<RID> bodies; // bodies assigned to this space (for CPU queries)
-	};
-	mutable RID_Owner<KilosSpace> space_owner;
-
-	// A flattened binary BVH node over a concave shape's triangles.
+	// A flattened binary BVH node (used both per-shape over triangles and
+	// per-space over body AABBs). Leaves index a range in an order array.
 	struct BVHNode {
 		AABB bounds;
 		int left = -1; // child node index, or -1 for a leaf
 		int right = -1;
-		int tri_start = 0; // into tri_order (leaf only)
+		int tri_start = 0; // into the order array (leaf only)
 		int tri_count = 0;
 	};
+
+	struct KilosSpace {
+		HashSet<RID> bodies; // bodies assigned to this space (for CPU queries)
+		// Broadphase BVH over body world-AABBs (lazy; rebuilt when bodies change).
+		Vector<RID> bvh_bodies;
+		Vector<int> bvh_order;
+		Vector<BVHNode> bvh;
+		bool bvh_dirty = true;
+		// Bodies added since the last build, not yet in the BVH. Queries scan these
+		// linearly so incremental adds (e.g. GridMap tree colliders placed between
+		// raycasts) don't force a full rebuild each time.
+		Vector<RID> bvh_pending;
+	};
+	mutable RID_Owner<KilosSpace> space_owner;
 
 	struct KilosShape {
 		ShapeType type = SHAPE_CUSTOM;
@@ -164,7 +174,7 @@ private:
 	};
 	mutable RID_Owner<KilosShape> shape_owner;
 
-	void _build_shape_bvh(KilosShape *p_shape);
+	void _build_shape_bvh(KilosShape *p_shape) const;
 
 	struct KilosBody {
 		uint32_t slot = 0; // index into the GPU body pool
@@ -193,6 +203,8 @@ private:
 
 	// CPU ray cast against all shapes of one body; updates the closest hit.
 	bool _body_raycast(const KilosBody *p_body, RID p_body_rid, const Vector3 &p_from, const Vector3 &p_to, bool p_hit_back, real_t &r_closest_t, PhysicsDirectSpaceState3D::RayResult &r_result) const;
+	AABB _body_world_aabb(const KilosBody *p_body) const;
+	void _build_space_bvh(KilosSpace *p_space);
 
 	struct KilosArea {};
 	mutable RID_Owner<KilosArea> area_owner;
