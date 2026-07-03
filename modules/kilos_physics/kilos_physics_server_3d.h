@@ -161,8 +161,10 @@ private:
 
 	struct KilosShape {
 		ShapeType type = SHAPE_CUSTOM;
-		// Concave (trimesh) - triangle soup, 3 vertices per triangle.
-		Vector<Vector3> faces;
+		// Concave (trimesh): triangle soup quantized to 16-bit per axis relative to
+		// local_aabb (9 uint16 per triangle = half the size of float Vector3s).
+		// Dequantized on demand for BVH build and ray tests.
+		Vector<uint16_t> qfaces;
 		bool backface = false;
 		Vector<BVHNode> bvh;
 		Vector<int> tri_order; // triangle index per BVH leaf entry

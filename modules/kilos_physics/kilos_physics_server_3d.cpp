@@ -83,10 +83,9 @@ void KilosPhysicsServer3D::shape_set_data(RID p_shape, const Variant &p_data) {
 			Dictionary d = p_data;
 			if (d.has("faces")) {
 				PackedVector3Array pf = d["faces"];
-				s->faces = pf; // COW share - no per-vertex copy
-				AABB bounds;
-				const Vector3 *r = pf.ptr();
 				const int n = pf.size();
+				const Vector3 *r = pf.ptr();
+				AABB bounds;
 				for (int i = 0; i < n; i++) {
 					if (i == 0) {
 						bounds.position = r[0];
@@ -95,6 +94,19 @@ void KilosPhysicsServer3D::shape_set_data(RID p_shape, const Variant &p_data) {
 					}
 				}
 				s->local_aabb = bounds;
+				// Quantize the soup to 16-bit per axis (half the memory of floats).
+				const Vector3 inv_sz(
+						bounds.size.x > 0 ? 1.0 / bounds.size.x : 0.0,
+						bounds.size.y > 0 ? 1.0 / bounds.size.y : 0.0,
+						bounds.size.z > 0 ? 1.0 / bounds.size.z : 0.0);
+				s->qfaces.resize(n * 3);
+				uint16_t *q = s->qfaces.ptrw();
+				for (int i = 0; i < n; i++) {
+					const Vector3 rel = r[i] - bounds.position;
+					q[i * 3 + 0] = (uint16_t)CLAMP(Math::round(rel.x * inv_sz.x * 65535.0), 0.0, 65535.0);
+					q[i * 3 + 1] = (uint16_t)CLAMP(Math::round(rel.y * inv_sz.y * 65535.0), 0.0, 65535.0);
+					q[i * 3 + 2] = (uint16_t)CLAMP(Math::round(rel.z * inv_sz.z * 65535.0), 0.0, 65535.0);
+				}
 				s->backface = d.has("backface_collision") ? (bool)d["backface_collision"] : false;
 				// The per-triangle BVH is built lazily on the first raycast, so
 				// chunks that are never queried (underground/air) cost nothing.
@@ -1881,6 +1893,15 @@ struct CentroidSorter {
 	}
 };
 
+// Dequantize a 16-bit vertex (3 uint16) back to world/local space via the AABB.
+_FORCE_INLINE_ Vector3 dequant(const uint16_t *q, const AABB &box) {
+	const real_t k = 1.0 / 65535.0;
+	return box.position + Vector3(
+									box.size.x * (real_t)q[0] * k,
+									box.size.y * (real_t)q[1] * k,
+									box.size.z * (real_t)q[2] * k);
+}
+
 // Segment (from -> from + dir*seg_len, dir unit) vs triangle. r_t is world distance.
 bool segment_triangle(const Vector3 &from, const Vector3 &dir, real_t seg_len,
 		const Vector3 &v0, const Vector3 &v1, const Vector3 &v2,
@@ -2105,35 +2126,29 @@ bool ray_aabb(const Vector3 &from, const Vector3 &inv_dir, real_t seg_len, const
 void KilosPhysicsServer3D::_build_shape_bvh(KilosShape *s) const {
 	s->bvh.clear();
 	s->tri_order.clear();
-	const int tri_count = s->faces.size() / 3;
+	const int tri_count = s->qfaces.size() / 9; // 9 uint16 per triangle
 	if (tri_count == 0) {
-		s->local_aabb = AABB();
 		return;
 	}
 
+	const uint16_t *qf = s->qfaces.ptr();
+	const AABB &qbox = s->local_aabb; // set at shape_set_data; needed for dequant
 	Vector<AABB> tri_aabb;
 	tri_aabb.resize(tri_count);
 	Vector<Vector3> centroids;
 	centroids.resize(tri_count);
 	s->tri_order.resize(tri_count);
-	AABB total;
 	for (int i = 0; i < tri_count; i++) {
-		const Vector3 &a = s->faces[i * 3 + 0];
-		const Vector3 &b = s->faces[i * 3 + 1];
-		const Vector3 &c = s->faces[i * 3 + 2];
+		const Vector3 a = dequant(qf + i * 9 + 0, qbox);
+		const Vector3 b = dequant(qf + i * 9 + 3, qbox);
+		const Vector3 c = dequant(qf + i * 9 + 6, qbox);
 		AABB ta(a, Vector3());
 		ta.expand_to(b);
 		ta.expand_to(c);
 		tri_aabb.write[i] = ta;
 		centroids.write[i] = (a + b + c) / 3.0;
 		s->tri_order.write[i] = i;
-		if (i == 0) {
-			total = ta;
-		} else {
-			total.merge_with(ta);
-		}
 	}
-	s->local_aabb = total;
 
 	struct Work {
 		int start;
@@ -2246,7 +2261,7 @@ bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid
 		switch (shape->type) {
 			case SHAPE_CONCAVE_POLYGON: {
 				if (shape->bvh.is_empty()) {
-					if (shape->faces.is_empty()) {
+					if (shape->qfaces.is_empty()) {
 						break;
 					}
 					_build_shape_bvh(shape); // lazy: first raycast against this chunk
@@ -2256,7 +2271,8 @@ bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid
 						Math::abs(ldir.y) < 1e-9 ? 1e30 : 1.0 / ldir.y,
 						Math::abs(ldir.z) < 1e-9 ? 1e30 : 1.0 / ldir.z);
 				const bool hit_back = p_hit_back || shape->backface;
-				const Vector3 *faces = shape->faces.ptr();
+				const uint16_t *qf = shape->qfaces.ptr();
+				const AABB &qbox = shape->local_aabb;
 				const int *tri_order = shape->tri_order.ptr();
 				int node_stack[64];
 				int sp = 0;
@@ -2270,7 +2286,10 @@ bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid
 					if (node.left < 0) {
 						for (int k = 0; k < node.tri_count; k++) {
 							const int tri = tri_order[node.tri_start + k];
-							if (segment_triangle(lfrom, ldir, lseg_len, faces[tri * 3 + 0], faces[tri * 3 + 1], faces[tri * 3 + 2], hit_back, t_local, n_local)) {
+							const Vector3 a = dequant(qf + tri * 9 + 0, qbox);
+							const Vector3 b = dequant(qf + tri * 9 + 3, qbox);
+							const Vector3 c = dequant(qf + tri * 9 + 6, qbox);
+							if (segment_triangle(lfrom, ldir, lseg_len, a, b, c, hit_back, t_local, n_local)) {
 								record(t_local, n_local, tri);
 							}
 						}
