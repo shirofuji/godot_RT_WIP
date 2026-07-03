@@ -9,7 +9,10 @@
 #include "servers/rendering/renderer_rd/shaders/meshlet_software_rasterize.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_dispatch_args.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_hw_raster.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/meshlet_culler.h"
+
+#include "core/math/color.h"
 
 // Visibility-buffer software rasterizer (P2b). Scan-converts the small/subpixel clusters that P1's
 // classifier routed to the software worklist into a visibility buffer via atomicMax - the nearest
@@ -45,6 +48,17 @@ public:
 		uint32_t pad1;
 	};
 
+	// Must match meshlet_visbuffer_resolve.glsl's Params block (std430, 128 bytes): mat4 (64) +
+	// vec3+uint (16) + 3x vec4 (48).
+	struct ResolvePushConstant {
+		float view_projection_matrix[16];
+		float camera_position[3];
+		uint32_t light_count;
+		float ambient_color[4]; // .a = sky-radiance mix.
+		float svogi_bounds[4]; // xyz = octree center, w = half-size (0 = SVOGI off).
+		float svogi_params[4]; // x = energy, y = radiance exposure, z = max-roughness LOD layer.
+	};
+
 private:
 	// Rasterize shader variants: 0 = int64 visbuffer, 1 = MESHLET_VISBUFFER_FALLBACK (32-bit pair).
 	MeshletSoftwareRasterizeShaderRD rasterize_shader;
@@ -71,6 +85,16 @@ private:
 	RD::FramebufferFormatID hw_framebuffer_format = RD::INVALID_FORMAT_ID; // Attachment-less.
 	RID hw_framebuffer; // Attachment-less, screen-sized; grow-and-reuse.
 	Size2i hw_framebuffer_dims;
+
+	// Material-resolve pass (P4): reads the visbuffer, shades, writes out_color.
+	MeshletVisbufferResolveShaderRD resolve_shader;
+	RID resolve_shader_version;
+	RID resolve_pipeline_int64;
+	RID resolve_pipeline_fallback;
+	RID out_color; // rgba32f storage image, screen-sized; grow-and-reuse.
+	Size2i out_color_dims;
+	RID resolve_radiance_sampler; // Linear, clamp, mipmapped - for the sky octmap ambient.
+	RID resolve_material_sampler; // Linear, repeat, anisotropic - for material textures.
 
 	bool int64_supported = false;
 
@@ -107,6 +131,17 @@ public:
 	void rasterize_hardware(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_clear = true, bool p_force_fallback = false);
 
 	void _ensure_hw_framebuffer(const Size2i &p_screen_size);
+	void _ensure_out_color(const Size2i &p_screen_size);
+
+	// Material-resolve pass: reads the current visbuffer (whichever layout the last rasterize()/
+	// rasterize_hardware() wrote), shades each covered pixel via meshlet_shade(), writes the lit color
+	// to get_out_color(). p_sw_list / p_hw_list map a payload's slot back to (instance, meshlet) - pass
+	// whichever list(s) the visbuffer was rastered from (an invalid CullResult binds a harmless stand-in
+	// that is never indexed). The shading params mirror MeshletRenderer::render().
+	void resolve(const RendererRD::MeshletCuller::CullResult &p_sw_list, const RendererRD::MeshletCuller::CullResult &p_hw_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, const Color &p_ambient_color, float p_sky_mix, RID p_svogi_octree, const Vector3 &p_svogi_center, float p_svogi_half, float p_svogi_energy, RID p_radiance_texture, float p_radiance_exposure, float p_max_roughness_lod);
+
+	RID get_out_color() const { return out_color; }
+	Size2i get_out_color_dims() const { return out_color_dims; }
 
 	// Visbuffer accessors for the material-resolve pass (P4) and self-tests.
 	bool visbuffer_is_int64_layout() const { return visbuffer_is_int64; }

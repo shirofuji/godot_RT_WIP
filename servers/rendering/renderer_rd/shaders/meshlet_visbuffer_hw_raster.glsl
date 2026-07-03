@@ -136,7 +136,8 @@ void main() {
 	ivec2 p = ivec2(gl_FragCoord.xy);
 	int pixel_index = p.y * int(params.viewport_width) + p.x;
 	uint z_bits = floatBitsToUint(gl_FragCoord.z);
-	uint payload = ((slot_in & 0x1FFFFFFu) << 7) | (tri_in & 0x7Fu);
+	// Payload: bit 31 = source list (0 = hardware), bits 30..7 = 24-bit slot, bits 6..0 = triangle.
+	uint payload = ((slot_in & 0xFFFFFFu) << 7) | (tri_in & 0x7Fu);
 #ifndef MESHLET_VISBUFFER_FALLBACK
 	uint64_t packed = (uint64_t(z_bits) << 32) | uint64_t(payload);
 	atomicMax(visbuffer.data[pixel_index], packed);

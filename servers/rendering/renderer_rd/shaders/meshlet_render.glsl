@@ -266,6 +266,12 @@ void main() {
 	// fields / interpolated varyings are passed explicitly. r_discard reports the alpha-scissor
 	// cutout result (compute can't `discard`), which this fragment stage turns into a real discard.
 	bool do_discard = false;
+	// Fragment stage: screen-space gradients come from dFdx/dFdy (identical to what perturb_normal used
+	// to compute internally). The compute resolve pass passes analytic triangle gradients instead.
+	vec3 dpdx = dFdx(world_pos_interp);
+	vec3 dpdy = dFdy(world_pos_interp);
+	vec2 duvdx = dFdx(uv_interp);
+	vec2 duvdy = dFdy(uv_interp);
 	vec4 shaded = meshlet_shade(
 			material_id_interp,
 			world_normal_interp,
@@ -276,6 +282,10 @@ void main() {
 			params.svogi_bounds,
 			params.svogi_params,
 			params.light_count,
+			dpdx,
+			dpdy,
+			duvdx,
+			duvdy,
 			do_discard);
 	if (do_discard) {
 		discard;

@@ -190,7 +190,10 @@ void main() {
 	}
 	float inv_area = 1.0 / area;
 
-	uint payload = ((slot & 0x1FFFFFFu) << 7) | (tri & 0x7Fu); // 25-bit slot, 7-bit triangle.
+	// Payload: bit 31 = source list (1 = software), bits 30..7 = 24-bit slot, bits 6..0 = triangle.
+	// The resolve pass reads the software or hardware visible list per that bit to recover
+	// (instance, meshlet) - both raster paths share one visbuffer, so the bit disambiguates.
+	uint payload = (1u << 31) | ((slot & 0xFFFFFFu) << 7) | (tri & 0x7Fu);
 
 	for (int y = min_y; y <= max_y; y++) {
 		for (int x = min_x; x <= max_x; x++) {

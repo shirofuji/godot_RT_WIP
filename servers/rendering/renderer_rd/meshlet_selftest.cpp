@@ -1017,7 +1017,7 @@ VisbufferReadback read_visbuffer_int64(RID p_buffer, int p_w, int p_h, uint32_t 
 		}
 		out.non_zero++;
 		uint32_t payload = (uint32_t)(v[i] & 0xFFFFFFFFu);
-		uint32_t slot = (payload >> 7) & 0x1FFFFFFu;
+		uint32_t slot = (payload >> 7) & 0xFFFFFFu; // bit 31 = hw/sw source, bits 30..7 = 24-bit slot.
 		uint32_t tri = payload & 0x7Fu;
 		if (tri >= 124 || slot >= p_sw_count) {
 			out.payloads_valid = false;
@@ -1040,7 +1040,7 @@ VisbufferReadback read_visbuffer_fallback(RID p_depth, RID p_payload, int p_w, i
 			continue;
 		}
 		out.non_zero++;
-		uint32_t slot = (pl[i] >> 7) & 0x1FFFFFFu;
+		uint32_t slot = (pl[i] >> 7) & 0xFFFFFFu; // bit 31 = hw/sw source, bits 30..7 = 24-bit slot.
 		uint32_t tri = pl[i] & 0x7Fu;
 		if (tri >= 124 || slot >= p_sw_count) {
 			out.payloads_valid = false;
@@ -1233,6 +1233,114 @@ void test_meshlet_visbuffer_hardware_raster() {
 	RD::get_singleton()->free_rid(transforms_buffer);
 }
 
+// P4: rasterize a mesh into the visbuffer, then run the material-resolve pass and confirm it shades
+// exactly the covered pixels (lit where the visbuffer has a fragment, background elsewhere), with a
+// plausible lit color for a flat-white material under flat ambient.
+void test_meshlet_visbuffer_resolve() {
+	RendererRD::MeshletStorage *storage = RendererRD::MeshletStorage::get_singleton();
+	RendererRD::MeshletCuller *culler = RendererRD::MeshletCuller::get_singleton();
+	MeshletSoftwareRasterizer *rasterizer = MeshletSoftwareRasterizer::get_singleton();
+	if (!storage || !culler || !rasterizer) {
+		return;
+	}
+
+	PackedVector3Array vertices;
+	PackedInt32Array indices;
+	get_sphere_geometry(vertices, indices);
+	PackedInt32Array meshlet_vertices;
+	PackedByteArray meshlet_triangles;
+	Vector<SurfaceTool::MeshletBounds> bounds_st;
+	Vector<SurfaceTool::Meshlet> meshlets_st = SurfaceTool::build_meshlets(vertices, indices, 64, 124, 0.5f, meshlet_vertices, meshlet_triangles, bounds_st);
+	Vector<RenderingServerTypes::MeshletInfo> meshlets_info;
+	meshlets_info.resize(meshlets_st.size());
+	memcpy(meshlets_info.ptrw(), meshlets_st.ptr(), sizeof(SurfaceTool::Meshlet) * meshlets_st.size());
+	Vector<RenderingServerTypes::MeshletBoundsInfo> bounds_info;
+	bounds_info.resize(bounds_st.size());
+	memcpy(bounds_info.ptrw(), bounds_st.ptr(), sizeof(SurfaceTool::MeshletBounds) * bounds_st.size());
+	PackedVector3Array normals;
+	normals.resize(vertices.size());
+	for (int i = 0; i < vertices.size(); i++) {
+		normals.write[i] = vertices[i].normalized();
+	}
+	RendererRD::MeshletStorage::UploadResult upload = storage->upload_mesh_meshlets(vertices, normals, PackedVector2Array(), meshlets_info, meshlet_vertices, meshlet_triangles, bounds_info);
+
+	Transform3D instance_transform(Basis(), Vector3(0, 0, 0));
+	LocalVector<float> transforms_data;
+	transforms_data.resize(16);
+	transform_to_mat4_columns(instance_transform, &transforms_data[0]);
+	RID transforms_buffer = RD::get_singleton()->storage_buffer_create(transforms_data.size() * sizeof(float));
+	RD::get_singleton()->buffer_update(transforms_buffer, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
+
+	// A flat-white default material + a per-instance material-id buffer pointing at its slot.
+	uint32_t material_id = storage->upload_material(RID(), RendererRD::MeshletStorage::MeshletMaterialGPU());
+	RID material_ids_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t));
+	RD::get_singleton()->buffer_update(material_ids_buffer, 0, sizeof(uint32_t), &material_id);
+	// Valid (unused: light_count=0) lights buffer so the binding resolves.
+	RID lights_buffer = RD::get_singleton()->storage_buffer_create(64);
+
+	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> ranges;
+	RendererRD::MeshletCuller::InstanceMeshletRange r;
+	r.instance_index = 0;
+	r.meshlet_offset = upload.meshlet_range.offset;
+	r.meshlet_count = upload.meshlet_range.count;
+	ranges.push_back(r);
+
+	Transform3D camera_xform(Basis(), Vector3(0, 0, 5));
+	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 0.05f, 20.0f);
+	Projection depth_correction;
+	depth_correction.set_depth_correction();
+	Projection projection = depth_correction * raw_projection;
+	Vector<Plane> planes = projection.get_projection_planes(camera_xform);
+
+	const int W = 128;
+	const int H = 128;
+
+	// Rasterize all clusters to the software list, into the visbuffer.
+	RendererRD::MeshletCuller::CullResult sw_cull = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin, 1 << 16, 1 << 16, 500.0f, 100.0f, 1.0e9f);
+	uint32_t sw_count = culler->debug_read_visible_count(sw_cull.sw_visible_buffer);
+	RendererRD::MeshletCuller::CullResult sw_list;
+	sw_list.visible_buffer = sw_cull.sw_visible_buffer;
+	sw_list.max_visible = sw_cull.sw_max_visible;
+	rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, false);
+
+	// Resolve: flat ambient, no lights/SVOGI/sky/textures.
+	rasterizer->resolve(sw_list, RendererRD::MeshletCuller::CullResult(), transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, lights_buffer, 0, Color(0.4f, 0.4f, 0.4f), 0.0f, RID(), Vector3(), 0.0f, 0.0f, RID(), 1.0f, 0.0f);
+
+	// Visbuffer coverage (what the resolve should shade exactly).
+	VisbufferReadback vb = rasterizer->is_int64_supported()
+			? read_visbuffer_int64(rasterizer->get_visbuffer_u64(), W, H, sw_count)
+			: read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, sw_count);
+
+	// Read back the resolved color.
+	Vector<uint8_t> color_bytes = RD::get_singleton()->texture_get_data(rasterizer->get_out_color(), 0);
+	const float *c = (const float *)color_bytes.ptr();
+	uint32_t lit = 0;
+	bool plausible = true;
+	float corner = c[0]; // pixel (0,0) red channel.
+	for (int i = 0; i < W * H; i++) {
+		float rr = c[i * 4 + 0];
+		float gg = c[i * 4 + 1];
+		float bb = c[i * 4 + 2];
+		if (rr > 0.01f || gg > 0.01f || bb > 0.01f) {
+			lit++;
+			// Flat-white albedo * flat ambient 0.4 -> ~0.4 grey; allow a wide band (any positive, <=1).
+			if (rr > 1.01f || gg > 1.01f || bb > 1.01f) {
+				plausible = false;
+			}
+		}
+	}
+	check(lit > 50, "Resolve: shaded a meaningful number of pixels");
+	check(plausible, "Resolve: lit colors are in a plausible [0,1] range");
+	check(corner <= 0.01f, "Resolve: corner pixel (0,0) is background (unshaded)");
+	// The resolve writes exactly the pixels the visbuffer marks as covered.
+	check(lit == vb.non_zero, "Resolve: shaded pixel count equals the visbuffer coverage exactly");
+
+	storage->free_mesh_meshlets(upload);
+	RD::get_singleton()->free_rid(transforms_buffer);
+	RD::get_singleton()->free_rid(material_ids_buffer);
+	RD::get_singleton()->free_rid(lights_buffer);
+}
+
 } // namespace
 
 void run_meshlet_selftest_if_requested() {
@@ -1254,6 +1362,7 @@ void run_meshlet_selftest_if_requested() {
 	test_meshlet_material_lookup_vs_cpu_reference();
 	test_meshlet_visbuffer_rasterize();
 	test_meshlet_visbuffer_hardware_raster();
+	test_meshlet_visbuffer_resolve();
 	if (g_failures == 0) {
 		print_line("MESHLET_SELFTEST: all checks passed");
 	} else {

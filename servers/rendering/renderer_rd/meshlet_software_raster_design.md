@@ -69,11 +69,30 @@ shared visbuffer pixel's payload is ambiguous about which list. In P2b/P3 each i
 resolve must disambiguate - e.g. a 1-bit hw/sw flag in the payload (slot to 24 bits) + read the
 matching list, OR unify into one visible-meshlet buffer.
 
-### P4 — material-resolve compute pass — NEXT
-One thread/pixel: unpack (slot, tri) [+ hw/sw], refetch the triangle's 3 verts, recompute
-barycentrics + ANALYTIC gradients (no dFdx in compute - see P0 note), interpolate, shade via
-meshlet_shade() (P0), write color + depth to the real targets. Then P5 live integration (+ route
-sw/hw through occlude(), retire the color render() path and its CULL_BACK/depth-bias hacks).
+### P4 — material-resolve compute pass — DONE & VERIFIED (2026-07-04)
+New meshlet_visbuffer_resolve.glsl (8x8, int64 + fallback variants): per pixel reads the visbuffer,
+unpacks payload (bit31 hw/sw, 24-bit slot, 7-bit tri), reads the matching visible list ->
+(instance, meshlet), refetches the triangle's 3 verts, computes perspective-correct barycentrics +
+ANALYTIC screen-space gradients (perspective-correct interp at p, p+x, p+y - no dFdx), interpolates
+world pos/normal/uv, and shades via the shared meshlet_shade() -> imageStore into an rgba32f
+out_color (uncovered pixels left untouched for compositing). Full shading bindings (materials,
+lights, svogi, radiance, material textures) so it's P5-ready; push constant is 128 bytes.
+Prereqs done first (behavior-neutral, separately built/verified): payload gained a bit31 hw/sw source
+flag (slot 25->24 bit) in BOTH raster shaders; perturb_normal -> perturb_normal_grad (takes gradients
+as params, no dFdx) so meshlet_shade() is now stage-agnostic - the fragment passes dFdx/dFdy, the
+resolve passes analytic gradients (meshlet_render.glsl updated, still pixel-identical).
+MeshletSoftwareRasterizer gained resolve() (mirrors MeshletRenderer::render's shading params) +
+out_color (grow-reuse) + 2 samplers. **Verified** by test_meshlet_visbuffer_resolve: rasterize sw ->
+resolve -> shaded pixel count EQUALS visbuffer coverage exactly, colors in [0,1], corner unshaded.
+
+### P5 — live integration — NEXT
+Wire classify -> raster(sw compute + hw draw into one visbuffer) -> resolve into the late pass behind
+`rendering/meshlet/software_raster` (default off, A/B vs today's color render()). Route BOTH lists
+through occlude() before rastering (P1 split currently bypasses occlusion). Resolve writes the scene
+color + real depth (so sky/transparents composite). Camera-relative projection for precision at large
+world coords (P2b/P3/P4 use absolute - fine standalone, revisit here). Once validated, delete the
+color render() path + its CULL_BACK/depth-bias hacks. Consider the visbuffer moving into
+RenderSceneBuffers (per-view, resize-managed) instead of the rasterizer's single shared buffer.
 
 ## P0 result (files added)
 - `shaders/meshlet_geometry_inc.glsl` — oct_decode_normal + fetch_triangle_local_vertex.

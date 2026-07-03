@@ -239,15 +239,11 @@ vec3 svogi_hemisphere_gather(vec3 pos, vec3 normal, float surface_offset, float 
 	return acc;
 }
 
-// Cotangent-frame normal mapping without precomputed vertex tangents (Schueler 2011). Uses dFdx/dFdy
-// -> FRAGMENT STAGE ONLY. The compute resolve pass must instead build the TBN from analytic triangle
-// gradients (see design doc).
-vec3 perturb_normal(vec3 N, vec3 world_pos, vec2 uv, vec3 map_normal) {
-	vec3 dp1 = dFdx(world_pos);
-	vec3 dp2 = dFdy(world_pos);
-	vec2 duv1 = dFdx(uv);
-	vec2 duv2 = dFdy(uv);
-
+// Cotangent-frame normal mapping without precomputed vertex tangents (Schueler 2011). Takes the
+// screen-space world-position and UV gradients as parameters (dp1/dp2 = d(world_pos)/dx,dy; duv1/duv2
+// = d(uv)/dx,dy) rather than calling dFdx/dFdy, so it works in BOTH the fragment stage (which passes
+// dFdx/dFdy) and the compute resolve pass (which passes analytic triangle gradients).
+vec3 perturb_normal_grad(vec3 N, vec3 dp1, vec3 dp2, vec2 duv1, vec2 duv2, vec3 map_normal) {
 	vec3 dp2perp = cross(dp2, N);
 	vec3 dp1perp = cross(N, dp1);
 	vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
@@ -267,7 +263,10 @@ vec3 perturb_normal(vec3 N, vec3 world_pos, vec2 uv, vec3 map_normal) {
 // + push-constant fields; returns the final lit color (.rgb) and alpha (.a). Sets r_discard when
 // alpha-scissor rejects the fragment (the caller does the actual discard / visbuffer skip). Identical
 // math to meshlet_render.glsl's former inline fragment body.
-vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 uv, vec3 camera_position, vec4 ambient_color, vec4 svogi_bounds, vec4 svogi_params, uint light_count, out bool r_discard) {
+// dpdx/dpdy = screen-space gradients of world_pos; duvdx/duvdy = screen-space gradients of the raw
+// (pre-transform) UV. Fragment callers pass dFdx/dFdy of the interpolated varyings; the compute
+// resolve pass passes analytic triangle gradients. Only used for normal mapping (perturb_normal_grad).
+vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 uv, vec3 camera_position, vec4 ambient_color, vec4 svogi_bounds, vec4 svogi_params, uint light_count, vec3 dpdx, vec3 dpdy, vec2 duvdx, vec2 duvdy, out bool r_discard) {
 	r_discard = false;
 	MeshletMaterial mat = meshlet_materials.data[material_id];
 	vec3 N = normalize(world_normal_in);
@@ -295,7 +294,9 @@ vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 
 	if (mat.normal_texture_index != MESHLET_TEXTURE_NONE) {
 		vec3 nm = texture(sampler2D(material_textures[mat.normal_texture_index], material_sampler), muv).xyz * 2.0 - 1.0;
 		nm.xy *= mat.normal_scale;
-		N = perturb_normal(N, world_pos, muv, normalize(nm));
+		// TBN from the transformed-UV gradients: d(muv) = d(uv) * uv1_scale (uv1_scale is uniform per
+		// primitive), so scale the raw-UV gradients here to match muv.
+		N = perturb_normal_grad(N, dpdx, dpdy, duvdx * mat.uv1_scale, duvdy * mat.uv1_scale, normalize(nm));
 	}
 
 	// ORM map: r = occlusion, g = roughness, b = metallic (Godot's ORM packing).
