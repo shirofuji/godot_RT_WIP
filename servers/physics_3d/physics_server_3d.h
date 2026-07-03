@@ -635,6 +635,29 @@ public:
 	virtual void soft_body_pin_point(RID p_body, int p_point_index, bool p_pin) = 0;
 	virtual bool soft_body_is_point_pinned(RID p_body, int p_point_index) const = 0;
 
+	/* MESHLET COLLIDER API */
+	
+	virtual RID meshlet_collider_create() = 0;
+	virtual void meshlet_collider_set_data(RID p_collider, RID p_mesh, const Transform3D &p_transform = Transform3D()) = 0;
+	virtual void meshlet_collider_set_transform(RID p_collider, const Transform3D &p_transform) = 0;
+	virtual void meshlet_collider_clear(RID p_collider) = 0;
+
+	/* BULK BODY API (GPU-resident mass bodies; default no-op, implemented by GPU servers) */
+	// Creates p_count contiguous GPU-resident dynamic bodies, returns an integer
+	// handle (or -1 if unsupported). These bypass the per-RID/per-callback path so
+	// hundreds of thousands of bodies cost O(1) CPU. Consumed on the GPU (rendered
+	// straight from the physics buffer via bulk_body_set_multimesh).
+	virtual int bulk_body_create(int p_count) { return -1; }
+	virtual void bulk_body_scatter(int p_handle, const AABB &p_region) {}
+	virtual void bulk_body_set_multimesh(int p_handle, RID p_multimesh) {}
+	virtual void bulk_body_free(int p_handle) {}
+	// Enables GPU body-body + ground collision for bulk bodies (radius, ground height,
+	// PBD solve iterations). No-op on servers that don't support it.
+	virtual void bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) {}
+	// Binds a static-world signed distance field (an RD 3D texture, world units,
+	// positive outside solid) covering p_bounds, for bulk bodies to collide against.
+	virtual void bulk_set_sdf(RID p_sdf_texture, const AABB &p_bounds) {}
+
 	/* JOINT API */
 
 	enum JointType {

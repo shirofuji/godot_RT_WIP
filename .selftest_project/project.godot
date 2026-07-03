@@ -11,5 +11,9 @@ config_version=5
 [application]
 
 config/name="selftest"
-run/main_scene="res://meshlet_overlay_test.tscn"
+run/main_scene="res://stress_test.tscn"
 config/features=PackedStringArray("4.8")
+
+[physics]
+
+3d/physics_engine="KilosPhysics3D"

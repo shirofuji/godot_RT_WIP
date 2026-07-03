@@ -317,6 +317,13 @@ public:
 	virtual void soft_body_pin_point(RID p_body, int p_point_index, bool p_pin) override;
 	virtual bool soft_body_is_point_pinned(RID p_body, int p_point_index) const override;
 
+	/* MESHLET COLLIDER API */
+
+	virtual RID meshlet_collider_create() override { return RID(); }
+	virtual void meshlet_collider_set_data(RID p_collider, RID p_mesh, const Transform3D &p_transform = Transform3D()) override {}
+	virtual void meshlet_collider_set_transform(RID p_collider, const Transform3D &p_transform) override {}
+	virtual void meshlet_collider_clear(RID p_collider) override {}
+
 	/* JOINT API */
 
 	virtual RID joint_create() override;

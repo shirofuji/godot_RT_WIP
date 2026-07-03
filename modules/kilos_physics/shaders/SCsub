@@ -1,0 +1,10 @@
+Import("env")
+
+if "RD_GLSL" in env["BUILDERS"]:
+    glsl_files = [str(f) for f in Glob("*.glsl")]
+    
+    # make sure we recompile shaders if glsl_builders.py changes
+    env.Depends([f + ".gen.h" for f in glsl_files], ["#glsl_builders.py"])
+    
+    for f in glsl_files:
+        env.RD_GLSL(f)
