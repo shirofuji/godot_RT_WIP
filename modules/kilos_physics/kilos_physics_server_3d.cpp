@@ -1,7 +1,9 @@
 #include "kilos_physics_server_3d.h"
 
 #include "core/object/callable_mp.h"
+#include "core/object/object.h"
 #include "core/object/object_id.h"
+#include "core/templates/sort_array.h"
 
 #include "shaders/body_to_multimesh.glsl.gen.h"
 #include "shaders/grid_build.glsl.gen.h"
@@ -13,53 +15,107 @@
 #include "servers/rendering/rendering_device_binds.h"
 
 RID KilosPhysicsServer3D::world_boundary_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_WORLD_BOUNDARY;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::separation_ray_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_SEPARATION_RAY;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::sphere_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_SPHERE;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::box_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_BOX;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::capsule_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_CAPSULE;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::cylinder_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_CYLINDER;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::convex_polygon_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_CONVEX_POLYGON;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::concave_polygon_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_CONCAVE_POLYGON;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::heightmap_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_HEIGHTMAP;
+	return shape_owner.make_rid(s);
 }
 
 RID KilosPhysicsServer3D::custom_shape_create() {
-	return shape_owner.make_rid(KilosShape());
+	KilosShape s;
+	s.type = SHAPE_CUSTOM;
+	return shape_owner.make_rid(s);
 }
 
 void KilosPhysicsServer3D::shape_set_data(RID p_shape, const Variant &p_data) {
+	KilosShape *s = shape_owner.get_or_null(p_shape);
+	ERR_FAIL_NULL(s);
+	switch (s->type) {
+		case SHAPE_CONCAVE_POLYGON: {
+			Dictionary d = p_data;
+			if (d.has("faces")) {
+				PackedVector3Array pf = d["faces"];
+				s->faces.resize(pf.size());
+				for (int i = 0; i < pf.size(); i++) {
+					s->faces.write[i] = pf[i];
+				}
+				s->backface = d.has("backface_collision") ? (bool)d["backface_collision"] : false;
+				_build_shape_bvh(s);
+			}
+		} break;
+		case SHAPE_SPHERE: {
+			s->radius = p_data;
+			s->local_aabb = AABB(Vector3(-s->radius, -s->radius, -s->radius), Vector3(2, 2, 2) * s->radius);
+		} break;
+		case SHAPE_BOX: {
+			Vector3 he = p_data; // half-extents
+			s->box_half = he;
+			s->local_aabb = AABB(-he, he * 2.0);
+		} break;
+		case SHAPE_CAPSULE: {
+			Dictionary d = p_data;
+			s->radius = d.has("radius") ? (real_t)d["radius"] : 0.5;
+			s->height = d.has("height") ? (real_t)d["height"] : 1.0;
+		} break;
+		default:
+			break;
+	}
 }
 
 void KilosPhysicsServer3D::shape_set_custom_solver_bias(RID p_shape, real_t p_bias) {
 }
 
 PhysicsServer3D::ShapeType KilosPhysicsServer3D::shape_get_type(RID p_shape) const {
-	return SHAPE_CONCAVE_POLYGON;
+	KilosShape *s = shape_owner.get_or_null(p_shape);
+	ERR_FAIL_NULL_V(s, SHAPE_CUSTOM);
+	return s->type;
 }
 
 Variant KilosPhysicsServer3D::shape_get_data(RID p_shape) const {
@@ -99,6 +155,8 @@ PhysicsDirectSpaceState3D * KilosPhysicsServer3D::space_get_direct_state(RID p_s
 	if (!space_state) {
 		space_state = memnew(KilosDirectSpaceState3D);
 	}
+	space_state->server = this;
+	space_state->space = p_space;
 	return space_state;
 }
 
@@ -377,11 +435,29 @@ RID KilosPhysicsServer3D::body_create() {
 void KilosPhysicsServer3D::body_set_space(RID p_body, RID p_space) {
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
+	if (body->space == p_space) {
+		return;
+	}
+	if (body->space.is_valid()) {
+		KilosSpace *old = space_owner.get_or_null(body->space);
+		if (old) {
+			old->bodies.erase(p_body);
+		}
+	}
+	body->space = p_space;
+	if (p_space.is_valid()) {
+		KilosSpace *sp = space_owner.get_or_null(p_space);
+		if (sp) {
+			sp->bodies.insert(p_body);
+		}
+	}
 	body->active = p_space.is_valid();
 }
 
 RID KilosPhysicsServer3D::body_get_space(RID p_body) const {
-	return RID();
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, RID());
+	return body->space;
 }
 
 void KilosPhysicsServer3D::body_set_mode(RID p_body, BodyMode p_mode) {
@@ -403,33 +479,67 @@ PhysicsServer3D::BodyMode KilosPhysicsServer3D::body_get_mode(RID p_body) const 
 }
 
 void KilosPhysicsServer3D::body_add_shape(RID p_body, RID p_shape, const Transform3D &p_transform, bool p_disabled) {
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	KilosBody::BodyShape bs;
+	bs.shape = p_shape;
+	bs.xform = p_transform;
+	bs.disabled = p_disabled;
+	body->shapes.push_back(bs);
 }
 
 void KilosPhysicsServer3D::body_set_shape(RID p_body, int p_shape_idx, RID p_shape) {
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
+	body->shapes.write[p_shape_idx].shape = p_shape;
 }
 
 void KilosPhysicsServer3D::body_set_shape_transform(RID p_body, int p_shape_idx, const Transform3D &p_transform) {
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
+	body->shapes.write[p_shape_idx].xform = p_transform;
 }
 
 int KilosPhysicsServer3D::body_get_shape_count(RID p_body) const {
-	return 0;
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->shapes.size();
 }
 
 RID KilosPhysicsServer3D::body_get_shape(RID p_body, int p_shape_idx) const {
-	return RID();
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, RID());
+	ERR_FAIL_INDEX_V(p_shape_idx, body->shapes.size(), RID());
+	return body->shapes[p_shape_idx].shape;
 }
 
 Transform3D KilosPhysicsServer3D::body_get_shape_transform(RID p_body, int p_shape_idx) const {
-	return Transform3D();
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, Transform3D());
+	ERR_FAIL_INDEX_V(p_shape_idx, body->shapes.size(), Transform3D());
+	return body->shapes[p_shape_idx].xform;
 }
 
 void KilosPhysicsServer3D::body_set_shape_disabled(RID p_body, int p_shape_idx, bool p_disabled) {
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
+	body->shapes.write[p_shape_idx].disabled = p_disabled;
 }
 
 void KilosPhysicsServer3D::body_remove_shape(RID p_body, int p_shape_idx) {
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
+	body->shapes.remove_at(p_shape_idx);
 }
 
 void KilosPhysicsServer3D::body_clear_shapes(RID p_body) {
+	KilosBody *body = body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->shapes.clear();
 }
 
 void KilosPhysicsServer3D::body_attach_object_instance_id(RID p_body, ObjectID p_id) {
@@ -924,6 +1034,12 @@ void KilosPhysicsServer3D::free_rid(RID p_rid) {
 	} else if (body_owner.owns(p_rid)) {
 		KilosBody *body = body_owner.get_or_null(p_rid);
 		if (body) {
+			if (body->space.is_valid()) {
+				KilosSpace *sp = space_owner.get_or_null(body->space);
+				if (sp) {
+					sp->bodies.erase(p_rid);
+				}
+			}
 			if (body->tracked) {
 				tracked_slots.erase(body->slot);
 			}
@@ -1600,6 +1716,284 @@ void KilosPhysicsServer3D::pin_joint_set_param(RID p_joint, PhysicsServer3D::Pin
 real_t KilosPhysicsServer3D::pin_joint_get_param(RID p_joint, PhysicsServer3D::PinJointParam p_param) const { return 0.0f; }
 void KilosPhysicsServer3D::pin_joint_set_local_a(RID p_joint, const Vector3 &p_A) {}
 void KilosPhysicsServer3D::joint_make_hinge(RID p_joint, RID p_body_A, const Transform3D &p_frame_A, RID p_body_B, const Transform3D &p_frame_B) {}
+
+// ===== P5a: CPU ray queries against static trimesh bodies =====
+
+namespace {
+
+struct CentroidSorter {
+	const Vector3 *centroids = nullptr;
+	int axis = 0;
+	bool operator()(int a, int b) const {
+		return centroids[a][axis] < centroids[b][axis];
+	}
+};
+
+// Segment (from -> from + dir*seg_len, dir unit) vs triangle. r_t is world distance.
+bool segment_triangle(const Vector3 &from, const Vector3 &dir, real_t seg_len,
+		const Vector3 &v0, const Vector3 &v1, const Vector3 &v2,
+		bool hit_back, real_t &r_t, Vector3 &r_normal) {
+	const real_t EPS = 1e-9;
+	Vector3 e1 = v1 - v0;
+	Vector3 e2 = v2 - v0;
+	Vector3 pvec = dir.cross(e2);
+	real_t det = e1.dot(pvec);
+	if (det < 0.0 && !hit_back) {
+		return false;
+	}
+	if (Math::abs(det) < EPS) {
+		return false;
+	}
+	real_t inv_det = 1.0 / det;
+	Vector3 tvec = from - v0;
+	real_t u = tvec.dot(pvec) * inv_det;
+	if (u < 0.0 || u > 1.0) {
+		return false;
+	}
+	Vector3 qvec = tvec.cross(e1);
+	real_t v = dir.dot(qvec) * inv_det;
+	if (v < 0.0 || u + v > 1.0) {
+		return false;
+	}
+	real_t t = e2.dot(qvec) * inv_det;
+	if (t < 0.0 || t > seg_len) {
+		return false;
+	}
+	r_t = t;
+	Vector3 n = e1.cross(e2).normalized();
+	if (n.dot(dir) > 0.0) {
+		n = -n;
+	}
+	r_normal = n;
+	return true;
+}
+
+// Slab test for segment [0, seg_len] along unit dir (inv_dir = 1/dir per axis).
+bool ray_aabb(const Vector3 &from, const Vector3 &inv_dir, real_t seg_len, const AABB &box, real_t &r_tmin) {
+	Vector3 bmax = box.position + box.size;
+	real_t tmin = 0.0;
+	real_t tmax = seg_len;
+	for (int a = 0; a < 3; a++) {
+		real_t t1 = (box.position[a] - from[a]) * inv_dir[a];
+		real_t t2 = (bmax[a] - from[a]) * inv_dir[a];
+		if (t1 > t2) {
+			SWAP(t1, t2);
+		}
+		tmin = MAX(tmin, t1);
+		tmax = MIN(tmax, t2);
+		if (tmin > tmax) {
+			return false;
+		}
+	}
+	r_tmin = tmin;
+	return true;
+}
+
+} // namespace
+
+void KilosPhysicsServer3D::_build_shape_bvh(KilosShape *s) {
+	s->bvh.clear();
+	s->tri_order.clear();
+	const int tri_count = s->faces.size() / 3;
+	if (tri_count == 0) {
+		s->local_aabb = AABB();
+		return;
+	}
+
+	Vector<AABB> tri_aabb;
+	tri_aabb.resize(tri_count);
+	Vector<Vector3> centroids;
+	centroids.resize(tri_count);
+	s->tri_order.resize(tri_count);
+	AABB total;
+	for (int i = 0; i < tri_count; i++) {
+		const Vector3 &a = s->faces[i * 3 + 0];
+		const Vector3 &b = s->faces[i * 3 + 1];
+		const Vector3 &c = s->faces[i * 3 + 2];
+		AABB ta(a, Vector3());
+		ta.expand_to(b);
+		ta.expand_to(c);
+		tri_aabb.write[i] = ta;
+		centroids.write[i] = (a + b + c) / 3.0;
+		s->tri_order.write[i] = i;
+		if (i == 0) {
+			total = ta;
+		} else {
+			total.merge_with(ta);
+		}
+	}
+	s->local_aabb = total;
+
+	struct Work {
+		int start;
+		int end;
+		int node;
+	};
+	Vector<Work> stack;
+	s->bvh.push_back(BVHNode());
+	stack.push_back({ 0, tri_count, 0 });
+	const int LEAF = 4;
+
+	while (!stack.is_empty()) {
+		Work wk = stack[stack.size() - 1];
+		stack.remove_at(stack.size() - 1);
+
+		AABB bounds = tri_aabb[s->tri_order[wk.start]];
+		for (int i = wk.start + 1; i < wk.end; i++) {
+			bounds.merge_with(tri_aabb[s->tri_order[i]]);
+		}
+		const int count = wk.end - wk.start;
+		BVHNode node;
+		node.bounds = bounds;
+
+		if (count <= LEAF) {
+			node.left = -1;
+			node.right = -1;
+			node.tri_start = wk.start;
+			node.tri_count = count;
+			s->bvh.write[wk.node] = node;
+			continue;
+		}
+
+		Vector3 ext = bounds.size;
+		int axis = 0;
+		if (ext.y > ext.x) {
+			axis = 1;
+		}
+		if (ext.z > ext[axis]) {
+			axis = 2;
+		}
+		CentroidSorter cs;
+		cs.centroids = centroids.ptr();
+		cs.axis = axis;
+		SortArray<int, CentroidSorter> sorter;
+		sorter.compare = cs;
+		sorter.sort(s->tri_order.ptrw() + wk.start, count);
+
+		const int mid = (wk.start + wk.end) / 2;
+		int left_idx = s->bvh.size();
+		s->bvh.push_back(BVHNode());
+		int right_idx = s->bvh.size();
+		s->bvh.push_back(BVHNode());
+		node.left = left_idx;
+		node.right = right_idx;
+		node.tri_count = 0;
+		s->bvh.write[wk.node] = node;
+		stack.push_back({ wk.start, mid, left_idx });
+		stack.push_back({ mid, wk.end, right_idx });
+	}
+}
+
+bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid, const Vector3 &p_from, const Vector3 &p_to, bool p_hit_back, real_t &r_closest_t, PhysicsDirectSpaceState3D::RayResult &r_result) const {
+	bool hit_any = false;
+	const Vector3 world_seg = p_to - p_from;
+
+	for (int si = 0; si < p_body->shapes.size(); si++) {
+		const KilosBody::BodyShape &bs = p_body->shapes[si];
+		if (bs.disabled) {
+			continue;
+		}
+		KilosShape *shape = shape_owner.get_or_null(bs.shape);
+		if (!shape || shape->type != SHAPE_CONCAVE_POLYGON || shape->bvh.is_empty()) {
+			continue; // P5a supports concave (trimesh) only
+		}
+
+		const Transform3D world_xform = p_body->transform * bs.xform;
+		const Transform3D inv = world_xform.affine_inverse();
+		const Vector3 lfrom = inv.xform(p_from);
+		const Vector3 lto = inv.xform(p_to);
+		const Vector3 lseg = lto - lfrom;
+		const real_t lseg_len = lseg.length();
+		if (lseg_len < 1e-9) {
+			continue;
+		}
+		const Vector3 ldir = lseg / lseg_len;
+		Vector3 inv_dir(
+				Math::abs(ldir.x) < 1e-9 ? 1e30 : 1.0 / ldir.x,
+				Math::abs(ldir.y) < 1e-9 ? 1e30 : 1.0 / ldir.y,
+				Math::abs(ldir.z) < 1e-9 ? 1e30 : 1.0 / ldir.z);
+
+		const bool hit_back = p_hit_back || shape->backface;
+		const Vector3 *faces = shape->faces.ptr();
+		const int *tri_order = shape->tri_order.ptr();
+
+		// Iterative BVH traversal; prune by the current closest fraction.
+		int node_stack[64];
+		int sp = 0;
+		node_stack[sp++] = 0;
+		while (sp > 0) {
+			const BVHNode &node = shape->bvh[node_stack[--sp]];
+			real_t node_tmin;
+			real_t local_cutoff = r_closest_t * lseg_len;
+			if (!ray_aabb(lfrom, inv_dir, local_cutoff, node.bounds, node_tmin)) {
+				continue;
+			}
+			if (node.left < 0) {
+				for (int k = 0; k < node.tri_count; k++) {
+					const int tri = tri_order[node.tri_start + k];
+					real_t t_local;
+					Vector3 n_local;
+					if (segment_triangle(lfrom, ldir, lseg_len, faces[tri * 3 + 0], faces[tri * 3 + 1], faces[tri * 3 + 2], hit_back, t_local, n_local)) {
+						const real_t frac = t_local / lseg_len;
+						if (frac < r_closest_t) {
+							r_closest_t = frac;
+							hit_any = true;
+							r_result.position = p_from + world_seg * frac;
+							Vector3 wn = world_xform.basis.xform(n_local).normalized(); // rigid terrain xform => basis maps normals
+							if (wn.dot(world_seg) > 0.0) {
+								wn = -wn;
+							}
+							r_result.normal = wn;
+							r_result.rid = p_body_rid;
+							r_result.collider_id = p_body->instance_id;
+							r_result.collider = ObjectDB::get_instance(p_body->instance_id);
+							r_result.shape = si;
+							r_result.face_index = tri;
+						}
+					}
+				}
+			} else {
+				if (sp < 62) {
+					node_stack[sp++] = node.left;
+					node_stack[sp++] = node.right;
+				}
+			}
+		}
+	}
+	return hit_any;
+}
+
+bool KilosPhysicsServer3D::_intersect_ray(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result) {
+	KilosSpace *space = space_owner.get_or_null(p_space);
+	if (!space) {
+		return false;
+	}
+	real_t closest_t = 1.0;
+	bool hit = false;
+	for (const RID &body_rid : space->bodies) {
+		if (p_parameters.exclude.has(body_rid)) {
+			continue;
+		}
+		KilosBody *body = body_owner.get_or_null(body_rid);
+		if (!body || body->shapes.is_empty()) {
+			continue;
+		}
+		if (!(body->collision_layer & p_parameters.collision_mask)) {
+			continue;
+		}
+		if (_body_raycast(body, body_rid, p_parameters.from, p_parameters.to, p_parameters.hit_back_faces, closest_t, r_result)) {
+			hit = true;
+		}
+	}
+	return hit;
+}
+
+bool KilosDirectSpaceState3D::intersect_ray(const RayParameters &p_parameters, RayResult &r_result) {
+	if (!server) {
+		return false;
+	}
+	return server->_intersect_ray(space, p_parameters, r_result);
+}
 
 // --- KilosDirectBodyState3D implementation ---
 

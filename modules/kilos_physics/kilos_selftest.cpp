@@ -314,6 +314,57 @@ void test_sdf_dome() {
 	memdelete(server);
 }
 
+void test_raycast_trimesh() {
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	RID space = server->space_create();
+
+	// A flat quad at y=5 spanning x,z in [-10,10] (two triangles).
+	PackedVector3Array faces;
+	Vector3 a(-10, 5, -10), b(10, 5, -10), c(10, 5, 10), d(-10, 5, 10);
+	faces.push_back(a);
+	faces.push_back(b);
+	faces.push_back(c);
+	faces.push_back(a);
+	faces.push_back(c);
+	faces.push_back(d);
+
+	RID shape = server->concave_polygon_shape_create();
+	Dictionary sd;
+	sd["faces"] = faces;
+	sd["backface_collision"] = false;
+	server->shape_set_data(shape, sd);
+
+	RID body = server->body_create();
+	server->body_set_mode(body, PhysicsServer3D::BODY_MODE_STATIC);
+	server->body_add_shape(body, shape, Transform3D(), false);
+	server->body_set_space(body, space);
+
+	PhysicsDirectSpaceState3D *ss = server->space_get_direct_state(space);
+
+	PhysicsDirectSpaceState3D::RayParameters rp;
+	rp.from = Vector3(1, 20, 2);
+	rp.to = Vector3(1, -20, 2);
+	PhysicsDirectSpaceState3D::RayResult rr;
+	bool hit = ss->intersect_ray(rp, rr);
+	check(hit, "intersect_ray hits the trimesh terrain quad");
+	if (hit) {
+		check(Math::abs(rr.position.y - 5.0) < 0.01, vformat("Ray hit at y=%.4f (expected 5.0)", rr.position.y));
+		check(rr.normal.y > 0.99, vformat("Hit normal points up (n.y=%.3f)", rr.normal.y));
+		check(rr.rid == body, "Hit reports the correct body RID");
+	}
+
+	// A ray outside the quad must miss.
+	rp.from = Vector3(50, 20, 50);
+	rp.to = Vector3(50, -20, 50);
+	PhysicsDirectSpaceState3D::RayResult rr2;
+	check(!ss->intersect_ray(rp, rr2), "Ray outside the mesh misses");
+
+	server->free_rid(body);
+	server->free_rid(shape);
+	server->free_rid(space);
+	memdelete(server);
+}
+
 } // namespace
 
 void run_kilos_selftest_if_requested() {
@@ -328,6 +379,7 @@ void run_kilos_selftest_if_requested() {
 	test_ground_rest();
 	test_pile_no_interpenetration();
 	test_sdf_dome();
+	test_raycast_trimesh();
 	if (g_failures == 0) {
 		print_line("KILOS_SELFTEST: all checks passed");
 	} else {

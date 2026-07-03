@@ -4,6 +4,7 @@
 
 #include "core/os/mutex.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/list.h"
 #include "core/templates/local_vector.h"
 #include "servers/physics_3d/physics_server_3d.h"
@@ -12,11 +13,16 @@
 #include "shaders/body_to_multimesh.glsl.gen.h"
 #include "shaders/integration.glsl.gen.h"
 
+class KilosPhysicsServer3D;
+
 class KilosDirectSpaceState3D : public PhysicsDirectSpaceState3D {
 	GDCLASS(KilosDirectSpaceState3D, PhysicsDirectSpaceState3D);
 
 public:
-	virtual bool intersect_ray(const RayParameters &p_parameters, RayResult &r_result) override { return false; }
+	KilosPhysicsServer3D *server = nullptr;
+	RID space;
+
+	virtual bool intersect_ray(const RayParameters &p_parameters, RayResult &r_result) override;
 	virtual int intersect_point(const PointParameters &p_parameters, ShapeResult *r_results, int p_result_max) override { return 0; }
 	virtual int intersect_shape(const ShapeParameters &p_parameters, ShapeResult *r_results, int p_result_max) override { return 0; }
 	virtual bool cast_motion(const ShapeParameters &p_parameters, real_t &p_closest_safe, real_t &p_closest_unsafe, ShapeRestInfo *r_info = nullptr) override { return false; }
@@ -129,11 +135,36 @@ private:
 	};
 	mutable RID_Owner<MeshletCollider> meshlet_collider_owner;
 
-	struct KilosSpace {};
+	struct KilosSpace {
+		HashSet<RID> bodies; // bodies assigned to this space (for CPU queries)
+	};
 	mutable RID_Owner<KilosSpace> space_owner;
 
-	struct KilosShape {};
+	// A flattened binary BVH node over a concave shape's triangles.
+	struct BVHNode {
+		AABB bounds;
+		int left = -1; // child node index, or -1 for a leaf
+		int right = -1;
+		int tri_start = 0; // into tri_order (leaf only)
+		int tri_count = 0;
+	};
+
+	struct KilosShape {
+		ShapeType type = SHAPE_CUSTOM;
+		// Concave (trimesh) - triangle soup, 3 vertices per triangle.
+		Vector<Vector3> faces;
+		bool backface = false;
+		Vector<BVHNode> bvh;
+		Vector<int> tri_order; // triangle index per BVH leaf entry
+		// Primitives.
+		Vector3 box_half;
+		real_t radius = 0.5;
+		real_t height = 1.0;
+		AABB local_aabb;
+	};
 	mutable RID_Owner<KilosShape> shape_owner;
+
+	void _build_shape_bvh(KilosShape *p_shape);
 
 	struct KilosBody {
 		uint32_t slot = 0; // index into the GPU body pool
@@ -150,8 +181,18 @@ private:
 		uint32_t collision_mask = 1;
 		bool active = false;
 		bool tracked = false; // read GPU state back to CPU each frame
+		RID space;
+		struct BodyShape {
+			RID shape;
+			Transform3D xform;
+			bool disabled = false;
+		};
+		Vector<BodyShape> shapes;
 	};
 	mutable RID_Owner<KilosBody> body_owner;
+
+	// CPU ray cast against all shapes of one body; updates the closest hit.
+	bool _body_raycast(const KilosBody *p_body, RID p_body_rid, const Vector3 &p_from, const Vector3 &p_to, bool p_hit_back, real_t &r_closest_t, PhysicsDirectSpaceState3D::RayResult &r_result) const;
 
 	struct KilosArea {};
 	mutable RID_Owner<KilosArea> area_owner;
@@ -510,6 +551,9 @@ public:
 	// into the CPU shadow so body_get_state() reflects the GPU result. This
 	// stalls (submit+sync) and must not be used on the hot path.
 	void _debug_sync_readback();
+
+	// Query entry point used by KilosDirectSpaceState3D.
+	bool _intersect_ray(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result);
 
 	// Selftest-only: read a slot's position from the CPU shadow (call after
 	// _debug_sync_readback()).
