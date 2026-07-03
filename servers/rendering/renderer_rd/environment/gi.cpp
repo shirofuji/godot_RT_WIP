@@ -2279,6 +2279,13 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 		
 		RD::get_singleton()->compute_list_end();
 
+		// uniform_set_1 is transient per-region (its meshlet/visibility buffers change each call) and
+		// is only referenced by the voxelize dispatch above - free it now that the compute list has
+		// ended. Previously this was leaked on every voxelized region: its dependency buffers persist,
+		// so RD never auto-collected it, and SVOGI updates accumulated one dangling uniform set per
+		// region for the lifetime of the process.
+		RD::get_singleton()->free_rid(uniform_set_1);
+
 		RD::get_singleton()->draw_command_end_label();
 
 		// Mipmap (aggregation) pass: walk the octree from the deepest leaf level up to the root,

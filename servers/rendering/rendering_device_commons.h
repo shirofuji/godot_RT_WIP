@@ -1030,6 +1030,10 @@ public:
 		SUPPORTS_FRAGMENT_SHADER_WITH_ONLY_SIDE_EFFECTS,
 		SUPPORTS_BUFFER_DEVICE_ADDRESS,
 		SUPPORTS_IMAGE_ATOMIC_32_BIT,
+		// 64-bit atomic min/max/etc. on storage buffers (VK_KHR_shader_atomic_int64's
+		// shaderBufferInt64Atomics). Used by the meshlet visibility-buffer software rasterizer to pack
+		// depth+payload into one uint64 and resolve nearest-surface via a single atomicMax.
+		SUPPORTS_BUFFER_ATOMIC_INT64,
 		SUPPORTS_VULKAN_MEMORY_MODEL,
 		SUPPORTS_FRAMEBUFFER_DEPTH_RESOLVE,
 		SUPPORTS_POINT_SIZE,

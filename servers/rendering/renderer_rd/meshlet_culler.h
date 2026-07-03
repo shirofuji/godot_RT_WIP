@@ -69,7 +69,15 @@ public:
 		RID visible_buffer; // SSBO: { uint count; VisibleMeshlet data[]; }, sized max_visible.
 		uint32_t max_visible = 0;
 
+		// Software-raster worklist (small/subpixel clusters routed to the compute rasterizer), same
+		// SSBO layout, sized sw_max_visible. Populated only when cull()'s p_sw_cluster_px > 0 (the
+		// visibility-buffer path - default off, in which case every survivor lands in visible_buffer
+		// exactly as before and this stays a 1-element placeholder).
+		RID sw_visible_buffer;
+		uint32_t sw_max_visible = 0;
+
 		bool is_valid() const { return visible_buffer.is_valid(); }
+		bool has_software() const { return sw_visible_buffer.is_valid() && sw_max_visible > 0; }
 	};
 
 	// Mirrors VkDrawIndexedIndirectCommand's layout exactly (20 bytes).
@@ -117,10 +125,14 @@ private:
 	// Transient scratch buffers: recreated (not grown-with-copy) whenever too small, since their
 	// contents don't need to persist across calls - unlike MeshletStorage's persistent allocator.
 	RID ranges_buffer;
+	uint32_t ranges_capacity = 0; // In InstanceMeshletRange entries. Grow-and-reuse so ranges_buffer's
+			// RID stays stable across frames, letting the expand pass's uniform-set cache hit.
 	RID work_items_buffer;
 	uint32_t work_items_capacity = 0;
 	RID visible_buffer;
 	uint32_t visible_capacity = 0;
+	RID sw_visible_buffer; // cull()'s software-raster output list (binding 5); grow-and-reuse.
+	uint32_t sw_visible_capacity = 0;
 	RID occluded_buffer; // occlude()'s own output buffer - distinct from visible_buffer, since
 			// occlude() reads a CullResult (often visible_buffer itself) as input.
 	uint32_t occluded_capacity = 0;
@@ -130,6 +142,7 @@ private:
 
 	void _ensure_work_items_capacity(uint32_t p_capacity);
 	void _ensure_visible_capacity(uint32_t p_capacity);
+	void _ensure_sw_visible_capacity(uint32_t p_capacity);
 	void _ensure_occluded_capacity(uint32_t p_capacity);
 	void _ensure_command_capacity(uint32_t p_capacity);
 
@@ -142,7 +155,13 @@ public:
 	// distance); p_lod_threshold = max acceptable cluster screen-error in pixels. Together they drive
 	// the Nanite-style per-cluster LOD cut in meshlet_cull.glsl. p_projection_scale <= 0 disables the
 	// cut and renders the finest LOD only (for callers without projection info).
-	CullResult cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items = 1 << 16, uint32_t p_max_visible = 1 << 16, float p_projection_scale = 0.0f, float p_lod_threshold = 0.0f);
+	// p_sw_cluster_px: hardware/software raster split threshold, in projected screen pixels of cluster
+	// radius. A survivor whose bounding sphere projects smaller than this is routed to the result's
+	// sw_visible_buffer (for the compute rasterizer) instead of visible_buffer. <= 0 disables the split
+	// entirely (every survivor -> visible_buffer, i.e. today's hardware-only behavior), in which case a
+	// 1-element placeholder sw buffer is still bound so the shader has a valid target. When enabled, the
+	// software list is sized to p_max_visible (it shares the hardware list's capacity bound).
+	CullResult cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items = 1 << 16, uint32_t p_max_visible = 1 << 16, float p_projection_scale = 0.0f, float p_lod_threshold = 0.0f, float p_sw_cluster_px = 0.0f);
 
 	// Tests p_frustum_result's survivors (e.g. from cull() above) against a Hi-Z depth pyramid
 	// (see HiZBuilder) and returns a new, final CullResult. p_camera_transform/p_projection
@@ -164,6 +183,8 @@ public:
 	// Read-back helper (stalls the GPU - test/debug use only, never call this per-frame).
 	Vector<VisibleMeshlet> debug_read_visible(const CullResult &p_result);
 	Vector<IndirectCommand> debug_read_commands(const IndirectDrawResult &p_result);
+	// Reads just the leading atomic count word of a visible-list SSBO (hw or sw). Stalls; debug only.
+	uint32_t debug_read_visible_count(RID p_visible_buffer);
 
 	MeshletCuller();
 	~MeshletCuller();

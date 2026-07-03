@@ -36,6 +36,7 @@
 #include "core/os/os.h"
 #include "scene/resources/3d/primitive_meshes.h"
 #include "scene/resources/surface_tool.h"
+#include "servers/rendering/renderer_rd/forward_clustered/meshlet_software_rasterizer.h"
 #include "servers/rendering/renderer_rd/hiz_builder.h"
 #include "servers/rendering/renderer_rd/meshlet_culler.h"
 #include "servers/rendering/renderer_rd/meshlet_renderer.h"
@@ -247,6 +248,49 @@ void test_meshlet_culler_vs_cpu_reference() {
 	check(!false_positive, "GPU produced no false-positive visible meshlets");
 	check(!duplicate, "GPU produced no duplicate visible meshlets");
 	check(seen.size() == expected.size(), "GPU produced every CPU-expected visible meshlet (no false negatives)");
+
+	// P1 HW/SW raster split conservation. Two culls with IDENTICAL LOD params (so the LOD cut removes
+	// the same meshlets in both), differing only in the software-raster threshold: a baseline that
+	// keeps every survivor on the hardware list, and a split that routes ALL survivors to the software
+	// list (a huge threshold - every cluster projects smaller than it). The hardware list must then be
+	// empty and the software list must equal the baseline set exactly - proving the classifier
+	// partitions survivors without losing or duplicating any, and that the software output path writes.
+	{
+		const float PROJ = 500.0f; // Any positive projection_scale enables the split (and the LOD cut).
+		const float LODT = 100.0f; // Generous LOD threshold so the cut keeps a non-empty set.
+		RendererRD::MeshletCuller::CullResult base = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin, 1 << 16, 1 << 16, PROJ, LODT, 0.0f);
+		Vector<RendererRD::MeshletCuller::VisibleMeshlet> base_vis = culler->debug_read_visible(base);
+		HashSet<uint64_t> base_set;
+		for (int i = 0; i < base_vis.size(); i++) {
+			base_set.insert((uint64_t(base_vis[i].instance_index) << 32) | base_vis[i].meshlet_index);
+		}
+		check(!base_set.is_empty(), "HW/SW split: baseline (LOD-cut, split off) keeps a non-empty visible set");
+
+		RendererRD::MeshletCuller::CullResult split = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin, 1 << 16, 1 << 16, PROJ, LODT, 1.0e9f);
+		uint32_t hw_count = culler->debug_read_visible_count(split.visible_buffer);
+		check(hw_count == 0, "HW/SW split: a huge threshold routes every survivor to software (hardware list empty)");
+
+		RendererRD::MeshletCuller::CullResult sw_view;
+		sw_view.visible_buffer = split.sw_visible_buffer;
+		sw_view.max_visible = split.sw_max_visible;
+		Vector<RendererRD::MeshletCuller::VisibleMeshlet> sw_vis = culler->debug_read_visible(sw_view);
+		HashSet<uint64_t> sw_set;
+		bool sw_dup = false;
+		bool sw_fp = false;
+		for (int i = 0; i < sw_vis.size(); i++) {
+			uint64_t key = (uint64_t(sw_vis[i].instance_index) << 32) | sw_vis[i].meshlet_index;
+			if (sw_set.has(key)) {
+				sw_dup = true;
+			}
+			if (!base_set.has(key)) {
+				sw_fp = true;
+			}
+			sw_set.insert(key);
+		}
+		check(!sw_dup, "HW/SW split: software list has no duplicate meshlets");
+		check(!sw_fp, "HW/SW split: software list introduces no meshlet absent from the baseline set");
+		check(sw_set.size() == base_set.size(), "HW/SW split: software list equals the baseline visible set (conservation)");
+	}
 
 	storage->free_mesh_meshlets(upload);
 	RD::get_singleton()->free_rid(transforms_buffer);
@@ -953,6 +997,242 @@ void test_meshlet_material_lookup_vs_cpu_reference() {
 	}
 }
 
+// P2b: rasterize a known mesh (all clusters forced to the software worklist) into the visibility
+// buffer and read it back. Verifies the compute rasterizer covers pixels, writes valid (slot,
+// triangle) payloads, and - crucially - that the 32-bit fallback path produces the same coverage as
+// the int64 path (so the fallback is trustworthy even though this GPU uses int64).
+struct VisbufferReadback {
+	uint32_t non_zero = 0;
+	bool payloads_valid = true;
+	bool corner_empty = true;
+};
+
+VisbufferReadback read_visbuffer_int64(RID p_buffer, int p_w, int p_h, uint32_t p_sw_count) {
+	VisbufferReadback out;
+	Vector<uint8_t> bytes = RD::get_singleton()->buffer_get_data(p_buffer, 0, (uint32_t)p_w * p_h * sizeof(uint64_t));
+	const uint64_t *v = (const uint64_t *)bytes.ptr();
+	for (int i = 0; i < p_w * p_h; i++) {
+		if (v[i] == 0) {
+			continue;
+		}
+		out.non_zero++;
+		uint32_t payload = (uint32_t)(v[i] & 0xFFFFFFFFu);
+		uint32_t slot = (payload >> 7) & 0x1FFFFFFu;
+		uint32_t tri = payload & 0x7Fu;
+		if (tri >= 124 || slot >= p_sw_count) {
+			out.payloads_valid = false;
+		}
+	}
+	if (v[0] != 0) {
+		out.corner_empty = false; // Pixel (0,0) should be background for a centered sphere.
+	}
+	return out;
+}
+
+VisbufferReadback read_visbuffer_fallback(RID p_depth, RID p_payload, int p_w, int p_h, uint32_t p_sw_count) {
+	VisbufferReadback out;
+	Vector<uint8_t> depth_bytes = RD::get_singleton()->buffer_get_data(p_depth, 0, (uint32_t)p_w * p_h * sizeof(uint32_t));
+	Vector<uint8_t> payload_bytes = RD::get_singleton()->buffer_get_data(p_payload, 0, (uint32_t)p_w * p_h * sizeof(uint32_t));
+	const uint32_t *d = (const uint32_t *)depth_bytes.ptr();
+	const uint32_t *pl = (const uint32_t *)payload_bytes.ptr();
+	for (int i = 0; i < p_w * p_h; i++) {
+		if (d[i] == 0) {
+			continue;
+		}
+		out.non_zero++;
+		uint32_t slot = (pl[i] >> 7) & 0x1FFFFFFu;
+		uint32_t tri = pl[i] & 0x7Fu;
+		if (tri >= 124 || slot >= p_sw_count) {
+			out.payloads_valid = false;
+		}
+	}
+	if (d[0] != 0) {
+		out.corner_empty = false;
+	}
+	return out;
+}
+
+void test_meshlet_visbuffer_rasterize() {
+	RendererRD::MeshletStorage *storage = RendererRD::MeshletStorage::get_singleton();
+	RendererRD::MeshletCuller *culler = RendererRD::MeshletCuller::get_singleton();
+	MeshletSoftwareRasterizer *rasterizer = MeshletSoftwareRasterizer::get_singleton();
+	check(rasterizer != nullptr, "MeshletSoftwareRasterizer singleton exists");
+	if (!storage || !culler || !rasterizer) {
+		return;
+	}
+
+	PackedVector3Array vertices;
+	PackedInt32Array indices;
+	get_sphere_geometry(vertices, indices);
+	PackedInt32Array meshlet_vertices;
+	PackedByteArray meshlet_triangles;
+	Vector<SurfaceTool::MeshletBounds> bounds_st;
+	Vector<SurfaceTool::Meshlet> meshlets_st = SurfaceTool::build_meshlets(vertices, indices, 64, 124, 0.5f, meshlet_vertices, meshlet_triangles, bounds_st);
+	Vector<RenderingServerTypes::MeshletInfo> meshlets_info;
+	meshlets_info.resize(meshlets_st.size());
+	memcpy(meshlets_info.ptrw(), meshlets_st.ptr(), sizeof(SurfaceTool::Meshlet) * meshlets_st.size());
+	Vector<RenderingServerTypes::MeshletBoundsInfo> bounds_info;
+	bounds_info.resize(bounds_st.size());
+	memcpy(bounds_info.ptrw(), bounds_st.ptr(), sizeof(SurfaceTool::MeshletBounds) * bounds_st.size());
+	PackedVector3Array normals;
+	normals.resize(vertices.size());
+	for (int i = 0; i < vertices.size(); i++) {
+		normals.write[i] = vertices[i].normalized();
+	}
+	RendererRD::MeshletStorage::UploadResult upload = storage->upload_mesh_meshlets(vertices, normals, PackedVector2Array(), meshlets_info, meshlet_vertices, meshlet_triangles, bounds_info);
+
+	Transform3D instance_transform(Basis(), Vector3(0, 0, 0));
+	LocalVector<float> transforms_data;
+	transforms_data.resize(16);
+	transform_to_mat4_columns(instance_transform, &transforms_data[0]);
+	RID transforms_buffer = RD::get_singleton()->storage_buffer_create(transforms_data.size() * sizeof(float));
+	RD::get_singleton()->buffer_update(transforms_buffer, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
+
+	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> ranges;
+	RendererRD::MeshletCuller::InstanceMeshletRange r;
+	r.instance_index = 0;
+	r.meshlet_offset = upload.meshlet_range.offset;
+	r.meshlet_count = upload.meshlet_range.count;
+	ranges.push_back(r);
+
+	Transform3D camera_xform(Basis(), Vector3(0, 0, 5));
+	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 0.05f, 20.0f);
+	Projection depth_correction;
+	depth_correction.set_depth_correction();
+	Projection projection = depth_correction * raw_projection;
+	Vector<Plane> planes = projection.get_projection_planes(camera_xform);
+
+	// Force every visible cluster to the software worklist (huge threshold; identical LOD params to the
+	// conservation test), so the rasterizer has a full mesh to draw.
+	RendererRD::MeshletCuller::CullResult cull_result = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin, 1 << 16, 1 << 16, 500.0f, 100.0f, 1.0e9f);
+	check(cull_result.has_software(), "Visbuffer: cull produced a software worklist");
+	uint32_t sw_count = culler->debug_read_visible_count(cull_result.sw_visible_buffer);
+	check(sw_count > 0, "Visbuffer: software worklist is non-empty");
+
+	// The rasterizer reads a list from a CullResult's visible_buffer/max_visible - point it at the
+	// software list.
+	RendererRD::MeshletCuller::CullResult sw_list;
+	sw_list.visible_buffer = cull_result.sw_visible_buffer;
+	sw_list.max_visible = cull_result.sw_max_visible;
+
+	const int W = 128;
+	const int H = 128;
+
+	// Int64 path (primary on this GPU).
+	if (rasterizer->is_int64_supported()) {
+		rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, false);
+		check(rasterizer->visbuffer_is_int64_layout(), "Visbuffer(int64): allocated the int64 layout");
+		VisbufferReadback rb = read_visbuffer_int64(rasterizer->get_visbuffer_u64(), W, H, sw_count);
+		check(rb.non_zero > 50, "Visbuffer(int64): rasterizer covered a meaningful number of pixels");
+		check(rb.payloads_valid, "Visbuffer(int64): every covered pixel has a valid (slot, triangle) payload");
+		check(rb.corner_empty, "Visbuffer(int64): corner pixel (0,0) is empty (centered sphere)");
+
+		// Fallback path forced on int64 hardware - must produce the SAME coverage (which pixels get a
+		// fragment is identical; only how the winner is stored differs).
+		rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, true);
+		check(!rasterizer->visbuffer_is_int64_layout(), "Visbuffer(fallback): allocated the 32-bit layout");
+		VisbufferReadback fb = read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, sw_count);
+		check(fb.non_zero > 50, "Visbuffer(fallback): rasterizer covered a meaningful number of pixels");
+		check(fb.payloads_valid, "Visbuffer(fallback): every covered pixel has a valid (slot, triangle) payload");
+		check(fb.non_zero == rb.non_zero, "Visbuffer: fallback path covers exactly the same pixels as the int64 path");
+	} else {
+		rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, false);
+		VisbufferReadback fb = read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, sw_count);
+		check(fb.non_zero > 50, "Visbuffer(fallback-only): rasterizer covered a meaningful number of pixels");
+		check(fb.payloads_valid, "Visbuffer(fallback-only): every covered pixel has a valid (slot, triangle) payload");
+	}
+
+	storage->free_mesh_meshlets(upload);
+	RD::get_singleton()->free_rid(transforms_buffer);
+}
+
+// P3: rasterize the hardware worklist into the SAME visbuffer via the side-effect fragment path, and
+// cross-check that its coverage matches the compute software rasterizer for the same mesh (they use
+// the same projection, so screen-space coverage agrees to within rasterization fill-rule differences).
+void test_meshlet_visbuffer_hardware_raster() {
+	RendererRD::MeshletStorage *storage = RendererRD::MeshletStorage::get_singleton();
+	RendererRD::MeshletCuller *culler = RendererRD::MeshletCuller::get_singleton();
+	MeshletSoftwareRasterizer *rasterizer = MeshletSoftwareRasterizer::get_singleton();
+	if (!storage || !culler || !rasterizer) {
+		return;
+	}
+
+	PackedVector3Array vertices;
+	PackedInt32Array indices;
+	get_sphere_geometry(vertices, indices);
+	PackedInt32Array meshlet_vertices;
+	PackedByteArray meshlet_triangles;
+	Vector<SurfaceTool::MeshletBounds> bounds_st;
+	Vector<SurfaceTool::Meshlet> meshlets_st = SurfaceTool::build_meshlets(vertices, indices, 64, 124, 0.5f, meshlet_vertices, meshlet_triangles, bounds_st);
+	Vector<RenderingServerTypes::MeshletInfo> meshlets_info;
+	meshlets_info.resize(meshlets_st.size());
+	memcpy(meshlets_info.ptrw(), meshlets_st.ptr(), sizeof(SurfaceTool::Meshlet) * meshlets_st.size());
+	Vector<RenderingServerTypes::MeshletBoundsInfo> bounds_info;
+	bounds_info.resize(bounds_st.size());
+	memcpy(bounds_info.ptrw(), bounds_st.ptr(), sizeof(SurfaceTool::MeshletBounds) * bounds_st.size());
+	PackedVector3Array normals;
+	normals.resize(vertices.size());
+	for (int i = 0; i < vertices.size(); i++) {
+		normals.write[i] = vertices[i].normalized();
+	}
+	RendererRD::MeshletStorage::UploadResult upload = storage->upload_mesh_meshlets(vertices, normals, PackedVector2Array(), meshlets_info, meshlet_vertices, meshlet_triangles, bounds_info);
+
+	Transform3D instance_transform(Basis(), Vector3(0, 0, 0));
+	LocalVector<float> transforms_data;
+	transforms_data.resize(16);
+	transform_to_mat4_columns(instance_transform, &transforms_data[0]);
+	RID transforms_buffer = RD::get_singleton()->storage_buffer_create(transforms_data.size() * sizeof(float));
+	RD::get_singleton()->buffer_update(transforms_buffer, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
+
+	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> ranges;
+	RendererRD::MeshletCuller::InstanceMeshletRange r;
+	r.instance_index = 0;
+	r.meshlet_offset = upload.meshlet_range.offset;
+	r.meshlet_count = upload.meshlet_range.count;
+	ranges.push_back(r);
+
+	Transform3D camera_xform(Basis(), Vector3(0, 0, 5));
+	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 0.05f, 20.0f);
+	Projection depth_correction;
+	depth_correction.set_depth_correction();
+	Projection projection = depth_correction * raw_projection;
+	Vector<Plane> planes = projection.get_projection_planes(camera_xform);
+
+	const int W = 128;
+	const int H = 128;
+	bool i64 = rasterizer->is_int64_supported();
+
+	// Hardware path: split OFF (sw_cluster_px = 0) -> every visible cluster stays on the hardware list.
+	RendererRD::MeshletCuller::CullResult hw_cull = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin, 1 << 16, 1 << 16, 500.0f, 100.0f, 0.0f);
+	uint32_t hw_count = culler->debug_read_visible_count(hw_cull.visible_buffer);
+	check(hw_count > 0, "HW visbuffer: hardware worklist is non-empty");
+	rasterizer->rasterize_hardware(hw_cull, transforms_buffer, Size2i(W, H), projection, camera_xform, true, false);
+	VisbufferReadback hw_rb = i64
+			? read_visbuffer_int64(rasterizer->get_visbuffer_u64(), W, H, hw_count)
+			: read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, hw_count);
+	check(hw_rb.non_zero > 50, "HW visbuffer: side-effect fragment covered a meaningful number of pixels");
+	check(hw_rb.payloads_valid, "HW visbuffer: every covered pixel has a valid (slot, triangle) payload");
+	check(hw_rb.corner_empty, "HW visbuffer: corner pixel (0,0) is empty (centered sphere)");
+
+	// Software raster of the same mesh (all clusters forced to software) for a coverage cross-check.
+	RendererRD::MeshletCuller::CullResult sw_cull = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin, 1 << 16, 1 << 16, 500.0f, 100.0f, 1.0e9f);
+	uint32_t sw_count = culler->debug_read_visible_count(sw_cull.sw_visible_buffer);
+	RendererRD::MeshletCuller::CullResult sw_list;
+	sw_list.visible_buffer = sw_cull.sw_visible_buffer;
+	sw_list.max_visible = sw_cull.sw_max_visible;
+	rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, false);
+	VisbufferReadback sw_rb = i64
+			? read_visbuffer_int64(rasterizer->get_visbuffer_u64(), W, H, sw_count)
+			: read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, sw_count);
+
+	// Coverage should agree closely; hardware and software fill rules differ only along triangle edges.
+	float ratio = (float)hw_rb.non_zero / (float)MAX(1u, sw_rb.non_zero);
+	check(ratio > 0.85f && ratio < 1.18f, "HW visbuffer coverage matches the software rasterizer within fill-rule tolerance");
+
+	storage->free_mesh_meshlets(upload);
+	RD::get_singleton()->free_rid(transforms_buffer);
+}
+
 } // namespace
 
 void run_meshlet_selftest_if_requested() {
@@ -961,6 +1241,10 @@ void run_meshlet_selftest_if_requested() {
 	}
 
 	print_line("MESHLET_SELFTEST: starting");
+	// Report the 64-bit buffer-atomic capability (P2 visibility buffer picks its primary int64 path vs
+	// the 32-bit fallback from this). Informational, not a check() - hardware without it is valid.
+	bool int64_atomics = RD::get_singleton()->has_feature(RD::SUPPORTS_BUFFER_ATOMIC_INT64);
+	print_line(vformat("MESHLET_SELFTEST: SUPPORTS_BUFFER_ATOMIC_INT64 = %s", int64_atomics ? "true" : "false"));
 	g_failures = 0;
 	test_meshlet_storage_round_trip();
 	test_meshlet_culler_vs_cpu_reference();
@@ -968,6 +1252,8 @@ void run_meshlet_selftest_if_requested() {
 	test_temporal_hiz_two_pass_disocclusion_recovery();
 	test_meshlet_render_visual_proof();
 	test_meshlet_material_lookup_vs_cpu_reference();
+	test_meshlet_visbuffer_rasterize();
+	test_meshlet_visbuffer_hardware_raster();
 	if (g_failures == 0) {
 		print_line("MESHLET_SELFTEST: all checks passed");
 	} else {

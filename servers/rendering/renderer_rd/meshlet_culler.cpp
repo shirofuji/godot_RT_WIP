@@ -31,6 +31,7 @@
 #include "meshlet_culler.h"
 
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
+#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 
 using namespace RendererRD;
 
@@ -90,6 +91,9 @@ MeshletCuller::~MeshletCuller() {
 	if (visible_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(visible_buffer);
 	}
+	if (sw_visible_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(sw_visible_buffer);
+	}
 	if (occluded_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(occluded_buffer);
 	}
@@ -132,6 +136,18 @@ void MeshletCuller::_ensure_visible_capacity(uint32_t p_capacity) {
 	visible_capacity = p_capacity;
 }
 
+void MeshletCuller::_ensure_sw_visible_capacity(uint32_t p_capacity) {
+	if (sw_visible_capacity >= p_capacity) {
+		return;
+	}
+	if (sw_visible_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(sw_visible_buffer);
+	}
+	uint32_t size_bytes = sizeof(uint32_t) + p_capacity * sizeof(uint32_t) * 2;
+	sw_visible_buffer = RD::get_singleton()->storage_buffer_create(size_bytes);
+	sw_visible_capacity = p_capacity;
+}
+
 void MeshletCuller::_ensure_occluded_capacity(uint32_t p_capacity) {
 	if (occluded_capacity >= p_capacity) {
 		return;
@@ -156,37 +172,55 @@ void MeshletCuller::_ensure_command_capacity(uint32_t p_capacity) {
 	command_capacity = p_capacity;
 }
 
-MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items, uint32_t p_max_visible, float p_projection_scale, float p_lod_threshold) {
+MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items, uint32_t p_max_visible, float p_projection_scale, float p_lod_threshold, float p_sw_cluster_px) {
 	CullResult result;
 
 	ERR_FAIL_COND_V(p_frustum_planes.size() != 6, result);
 	ERR_FAIL_NULL_V(MeshletStorage::get_singleton(), result);
 
+	// The software list is only actually written when the split is on (p_sw_cluster_px > 0); when off
+	// its capacity collapses to 1 so binding 5 still resolves to a valid buffer without reserving the
+	// full hardware capacity's worth of VRAM. When on it shares the hardware list's capacity bound
+	// (the shader bounds sw writes by max_visible - see meshlet_cull.glsl).
+	bool sw_split = p_sw_cluster_px > 0.0f;
+	uint32_t sw_capacity = sw_split ? p_max_visible : 1u;
+
 	_ensure_work_items_capacity(p_max_work_items);
 	_ensure_visible_capacity(p_max_visible);
+	_ensure_sw_visible_capacity(sw_capacity);
 
 	// Zero the atomic counters before this call's dispatches.
 	uint32_t zero = 0;
 	RD::get_singleton()->buffer_update(work_items_buffer, 0, sizeof(uint32_t), &zero);
 	RD::get_singleton()->buffer_update(visible_buffer, 0, sizeof(uint32_t), &zero);
+	RD::get_singleton()->buffer_update(sw_visible_buffer, 0, sizeof(uint32_t), &zero);
 
 	result.visible_buffer = visible_buffer;
 	result.max_visible = p_max_visible;
+	result.sw_visible_buffer = sw_visible_buffer;
+	result.sw_max_visible = sw_split ? sw_capacity : 0; // 0 signals "no software list this call".
 
 	if (p_ranges.is_empty()) {
 		return result;
 	}
 
-	if (ranges_buffer.is_valid()) {
-		RD::get_singleton()->free_rid(ranges_buffer);
+	// Grow-and-reuse (not free+recreate every frame): keeps ranges_buffer's RID stable across frames
+	// so the expand-pass uniform-set cache hits, and avoids per-frame GPU buffer churn. Only the
+	// live prefix is uploaded; stale tail bytes beyond p_ranges.size() are never read (the expand
+	// shader is bounded by range_count in the push constant).
+	uint32_t needed_ranges = (uint32_t)p_ranges.size();
+	if (needed_ranges > ranges_capacity) {
+		if (ranges_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(ranges_buffer);
+		}
+		ranges_buffer = RD::get_singleton()->storage_buffer_create(needed_ranges * sizeof(InstanceMeshletRange));
+		ranges_capacity = needed_ranges;
 	}
-	uint32_t ranges_size_bytes = p_ranges.size() * sizeof(InstanceMeshletRange);
-	ranges_buffer = RD::get_singleton()->storage_buffer_create(ranges_size_bytes);
-	RD::get_singleton()->buffer_update(ranges_buffer, 0, ranges_size_bytes, p_ranges.ptr());
+	RD::get_singleton()->buffer_update(ranges_buffer, 0, needed_ranges * sizeof(InstanceMeshletRange), p_ranges.ptr());
 
 	// --- Pass A: expand instance-surface ranges into a flat per-meshlet worklist. ---
 	{
-		Vector<RD::Uniform> uniforms;
+		LocalVector<RD::Uniform> uniforms;
 		{
 			RD::Uniform u;
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
@@ -201,7 +235,7 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 			u.append_id(work_items_buffer);
 			uniforms.push_back(u);
 		}
-		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, expand_shader_rid, 0);
+		RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(expand_shader_rid, 0, uniforms);
 
 		struct ExpandPushConstant {
 			uint32_t range_count;
@@ -221,8 +255,6 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
 		RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_ranges.size(), 1, 1);
 		RD::get_singleton()->compute_list_end();
-
-		RD::get_singleton()->free_rid(uniform_set);
 	}
 
 	// --- Pass B: cull each worklist entry, append survivors. ---
@@ -233,7 +265,7 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 	// render loop at scale (see project memory: this was a known correctness-first tradeoff from
 	// Phase 3, finally fixed here once a real stress scene exposed the cost).
 	{
-		Vector<RD::Uniform> uniforms;
+		LocalVector<RD::Uniform> uniforms;
 		{
 			RD::Uniform u;
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
@@ -271,7 +303,16 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 			u.append_id(MeshletStorage::get_singleton()->get_meshlet_lod_buffer_rid());
 			uniforms.push_back(u);
 		}
-		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, cull_shader_rid, 0);
+		{
+			// Binding 5: software-raster output list (small clusters). Always bound (valid even when
+			// the split is off - see sw_capacity above); the shader only writes it when sw_cluster_px > 0.
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 5;
+			u.append_id(sw_visible_buffer);
+			uniforms.push_back(u);
+		}
+		RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(cull_shader_rid, 0, uniforms);
 
 		struct CullPushConstant {
 			uint32_t work_item_count;
@@ -280,7 +321,7 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 			float lod_threshold;
 			float planes[6][4];
 			float camera_position[3];
-			float pad2;
+			float sw_cluster_px; // was pad2; keeps the block at the 128-byte Vulkan push-constant floor.
 		};
 		CullPushConstant push_constant;
 		push_constant.work_item_count = p_max_work_items; // Capacity, not the real count - see shader.
@@ -296,7 +337,7 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 		push_constant.camera_position[0] = p_camera_position.x;
 		push_constant.camera_position[1] = p_camera_position.y;
 		push_constant.camera_position[2] = p_camera_position.z;
-		push_constant.pad2 = 0;
+		push_constant.sw_cluster_px = sw_split ? p_sw_cluster_px : 0.0f;
 
 		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, cull_pipeline);
@@ -304,8 +345,6 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
 		RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_max_work_items, 1, 1);
 		RD::get_singleton()->compute_list_end();
-
-		RD::get_singleton()->free_rid(uniform_set);
 	}
 
 	return result;
@@ -346,7 +385,7 @@ MeshletCuller::CullResult MeshletCuller::occlude(RID p_transforms_buffer, const 
 
 	// No CPU readback of Pass B's survivor count - dispatch p_frustum_result's full fixed buffer
 	// capacity instead (see the shader's own clamped bounds check against work_items.count).
-	Vector<RD::Uniform> uniforms;
+	LocalVector<RD::Uniform> uniforms;
 	{
 		RD::Uniform u;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
@@ -379,7 +418,7 @@ MeshletCuller::CullResult MeshletCuller::occlude(RID p_transforms_buffer, const 
 		u.append_id(occluded_buffer);
 		uniforms.push_back(u);
 	}
-	RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, occlusion_shader_rid, 0);
+	RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(occlusion_shader_rid, 0, uniforms);
 
 	struct OcclusionPushConstant {
 		uint32_t work_item_count;
@@ -416,8 +455,6 @@ MeshletCuller::CullResult MeshletCuller::occlude(RID p_transforms_buffer, const 
 	RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_frustum_result.max_visible, 1, 1);
 	RD::get_singleton()->compute_list_end();
 
-	RD::get_singleton()->free_rid(uniform_set);
-
 	return result;
 }
 
@@ -439,7 +476,7 @@ MeshletCuller::IndirectDrawResult MeshletCuller::emit_indirect_draws(const CullR
 	}
 	result.count_buffer = draw_count_buffer;
 
-	Vector<RD::Uniform> uniforms;
+	LocalVector<RD::Uniform> uniforms;
 	{
 		RD::Uniform u;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
@@ -468,7 +505,7 @@ MeshletCuller::IndirectDrawResult MeshletCuller::emit_indirect_draws(const CullR
 		u.append_id(draw_count_buffer);
 		uniforms.push_back(u);
 	}
-	RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, emit_draws_shader_rid, 0);
+	RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(emit_draws_shader_rid, 0, uniforms);
 
 	struct EmitDrawsPushConstant {
 		uint32_t max_draws;
@@ -489,8 +526,6 @@ MeshletCuller::IndirectDrawResult MeshletCuller::emit_indirect_draws(const CullR
 	RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_max_draws, 1, 1);
 	RD::get_singleton()->compute_list_end();
 
-	RD::get_singleton()->free_rid(uniform_set);
-
 	return result;
 }
 
@@ -505,6 +540,18 @@ Vector<MeshletCuller::IndirectCommand> MeshletCuller::debug_read_commands(const 
 		memcpy(out.ptrw(), data.ptr(), p_result.max_draw_count * sizeof(IndirectCommand));
 	}
 	return out;
+}
+
+uint32_t MeshletCuller::debug_read_visible_count(RID p_visible_buffer) {
+	if (!p_visible_buffer.is_valid()) {
+		return 0;
+	}
+	Vector<uint8_t> count_data = RD::get_singleton()->buffer_get_data(p_visible_buffer, 0, sizeof(uint32_t));
+	uint32_t count = 0;
+	if ((uint32_t)count_data.size() >= sizeof(uint32_t)) {
+		memcpy(&count, count_data.ptr(), sizeof(uint32_t));
+	}
+	return count;
 }
 
 Vector<MeshletCuller::VisibleMeshlet> MeshletCuller::debug_read_visible(const CullResult &p_result) {

@@ -2191,6 +2191,31 @@ static _FORCE_INLINE_ float _meshlet_lod_threshold_px() {
 	return (float)GLOBAL_GET_CACHED(double, "rendering/meshlet/lod_error_threshold_px");
 }
 
+// P1 (visibility-buffer software-raster path): the projected cluster-radius threshold, in screen
+// pixels, below which a cluster is routed to the software-raster worklist instead of the hardware
+// one (see MeshletCuller::cull()). Returns 0 (split OFF - all clusters hardware, today's behavior)
+// unless --meshlet-swraster-diag is passed, in which case the split is exercised at a fixed default
+// (overridable via --meshlet-swraster-px=N) so the classifier can be validated by the hw/sw count
+// readback below. NOTE: with the split ON, small clusters are removed from the hardware draw but the
+// software rasterizer that would draw them doesn't exist yet (P2/P3) - so they visibly vanish. This
+// is a diagnostic-only switch until P5 wires the real, rendered path behind a project setting.
+static float _meshlet_sw_cluster_px() {
+	static float threshold = []() {
+		const List<String> &args = OS::get_singleton()->get_cmdline_args();
+		if (args.find("--meshlet-swraster-diag") == nullptr) {
+			return 0.0f;
+		}
+		float px = 8.0f;
+		for (const String &a : args) {
+			if (a.begins_with("--meshlet-swraster-px=")) {
+				px = a.get_slicec('=', 1).to_float();
+			}
+		}
+		return px;
+	}();
+	return threshold;
+}
+
 RID RenderForwardClustered::meshlet_scan_transforms_buffer() {
 	const Vector<Transform3D> &instance_transforms = meshlet_scan_instance_transforms;
 
@@ -2355,7 +2380,9 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 
 	// Continuous-LOD cut projection scale (see the early pass for the derivation).
 	float lod_projection_scale = Math::abs((float)projection.columns[1].y) * (float)p_render_buffers->get_internal_size().y * 0.5f;
-	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY, lod_projection_scale, _meshlet_lod_threshold_px());
+	// P1: HW/SW raster split threshold (0 = off = today's hardware-only path; see _meshlet_sw_cluster_px()).
+	float sw_cluster_px = _meshlet_sw_cluster_px();
+	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY, lod_projection_scale, _meshlet_lod_threshold_px(), sw_cluster_px);
 
 	// Occlude against a Hi-Z rebuilt from *this* frame's current real depth (whatever's in the
 	// depth buffer right now: real depth pre-pass output for non-meshlet instances, plus the early
@@ -2381,6 +2408,16 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	if (meshlet_lod_diag) {
 		uint32_t visible_meshlets = (uint32_t)meshlet_culler->debug_read_visible(occlusion_result).size();
 		print_line(vformat("MESHLET_LOD_DIAG: instances=%d visible_meshlets=%d", (int)meshlet_scan_ranges.size(), (int)visible_meshlets));
+	}
+
+	// --meshlet-swraster-diag: P1 classifier readback (GPU-stall, debug only). Reads the two atomic
+	// counters straight off the frustum-cull output: hw= clusters kept on the hardware raster, sw=
+	// clusters routed to the (not-yet-built) software list. As the camera pulls back, projected
+	// cluster radii shrink and entries migrate hw->sw - that migration is what P1 exists to prove.
+	if (sw_cluster_px > 0.0f && frustum_result.has_software()) {
+		uint32_t hw_count = meshlet_culler->debug_read_visible_count(frustum_result.visible_buffer);
+		uint32_t sw_count = meshlet_culler->debug_read_visible_count(frustum_result.sw_visible_buffer);
+		print_line(vformat("MESHLET_SWRASTER_DIAG: threshold_px=%.1f hw=%d sw=%d (total=%d)", sw_cluster_px, (int)hw_count, (int)sw_count, (int)(hw_count + sw_count)));
 	}
 
 	RendererRD::MeshletCuller::IndirectDrawResult draws = meshlet_culler->emit_indirect_draws(occlusion_result, MESHLET_LIVE_CAPACITY);

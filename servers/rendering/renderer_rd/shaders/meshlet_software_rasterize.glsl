@@ -4,178 +4,208 @@
 
 #VERSION_DEFINES
 
-#extension GL_EXT_shader_atomic_int64 : enable
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+// Visibility-buffer software rasterizer (P2b). One workgroup per software-visible meshlet
+// (gl_WorkGroupID.x = its slot in the software worklist), one thread per triangle
+// (gl_LocalInvocationID.x). Each thread scan-converts its triangle and, per covered pixel, packs
+// reverse-Z depth + a (slot, triangle) payload and atomicMax-es it into the visbuffer so the nearest
+// surface wins deterministically (no Z-fighting - unlike hardware equal-depth ties). The material
+// resolve pass (P4) reads the visbuffer, unpacks (slot, tri), and shades.
+//
+// Two variants, selected by the caller from RD::SUPPORTS_BUFFER_ATOMIC_INT64:
+//   - default: one uint64 visbuffer, single atomicMax of (depth<<32 | payload).
+//   - MESHLET_VISBUFFER_FALLBACK: two uint32 buffers (depth + payload); atomicMax the depth, then
+//     write payload iff we still hold the winning depth (benign race on exact ties).
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#ifndef MESHLET_VISBUFFER_FALLBACK
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
 
-
-
-layout(set = 2, binding = 0, std430) restrict buffer DepthBuffer {
-	uint data[];
-} depth_buffer;
-
-struct MeshletDescriptor {
-	float offset_x;
-	float offset_y;
-	float offset_z;
-	float radius;
-	float cone_apex_x;
-	float cone_apex_y;
-	float cone_apex_z;
-	float cone_axis_x;
-	float cone_axis_y;
-	float cone_axis_z;
-	float cone_cutoff;
-	uint vertex_count;
-	uint triangle_count;
-	uint vertex_offset;
-	uint triangle_offset;
-};
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 struct VisibleMeshlet {
 	uint instance_index;
 	uint meshlet_index;
 };
 
-layout(set = 1, binding = 1, std430) restrict readonly buffer VisibleMeshlets {
+layout(set = 0, binding = 0, std430) restrict readonly buffer VisibleMeshlets {
 	uint count;
 	VisibleMeshlet data[];
-} visible_meshlets;
+}
+visible_meshlets;
 
-layout(set = 1, binding = 2, std430) restrict readonly buffer Transforms {
+layout(set = 0, binding = 1, std430) restrict readonly buffer Transforms {
 	mat4 data[];
-} transforms;
+}
+transforms;
 
-layout(set = 1, binding = 3, std430) restrict readonly buffer MeshletDescriptors {
+struct MeshletDescriptor {
+	vec3 bounds_center;
+	float bounds_radius;
+	vec3 cone_axis;
+	float cone_cutoff;
+	uint vertex_remap_offset;
+	uint triangle_offset;
+	uint vertex_count;
+	uint triangle_count;
+};
+
+layout(set = 0, binding = 2, std430) restrict readonly buffer MeshletDescriptors {
 	MeshletDescriptor data[];
-} meshlet_descriptors;
+}
+meshlet_descriptors;
 
-layout(set = 1, binding = 4, std430) restrict readonly buffer MeshletVertexRemap {
+layout(set = 0, binding = 3, std430) restrict readonly buffer MeshletVertexRemap {
 	uint data[];
-} meshlet_vertex_remap;
+}
+meshlet_vertex_remap;
 
-layout(set = 1, binding = 5, std430) restrict readonly buffer MeshletTriangles {
+// Packed 4x uint8 triangle-local-vertex-indices per uint32 word. fetch_triangle_local_vertex()
+// (meshlet_geometry_inc.glsl) reads this buffer by name, so declare it before the include.
+layout(set = 0, binding = 4, std430) restrict readonly buffer MeshletTriangles {
 	uint data[];
-} meshlet_triangles;
+}
+meshlet_triangles;
 
-layout(set = 1, binding = 6, std430) restrict readonly buffer MeshletVertexPositions {
+layout(set = 0, binding = 5, std430) restrict readonly buffer VertexPositions {
 	vec4 data[];
-} meshlet_vertex_positions;
+}
+vertex_positions;
 
-layout(push_constant, std430) uniform PushConstant {
-	mat4 view_projection_matrix;
-	vec2 viewport_size;
-} push_constant;
+#ifndef MESHLET_VISBUFFER_FALLBACK
+layout(set = 0, binding = 6, std430) restrict buffer VisBuffer {
+	uint64_t data[];
+}
+visbuffer;
+#else
+layout(set = 0, binding = 6, std430) restrict buffer VisDepth {
+	uint data[];
+}
+vis_depth;
+layout(set = 0, binding = 7, std430) restrict buffer VisPayload {
+	uint data[];
+}
+vis_payload;
+#endif
+
+layout(push_constant, std430) uniform Params {
+	mat4 view_projection;
+	uint viewport_width;
+	uint viewport_height;
+	uint max_visible; // Cap for visible_meshlets.count (buffer capacity - the count is an atomic that can overrun it).
+	uint pad;
+}
+params;
+
+// oct_decode_normal (unused here) + fetch_triangle_local_vertex (reads meshlet_triangles above).
+#include "meshlet_geometry_inc.glsl"
+
+// Safety net against a large triangle slipping past the per-cluster classifier: skip scan-converting
+// any triangle whose screen bounding box exceeds this many pixels (software raster is only a win for
+// small triangles; a huge one here would be one thread looping over the whole box). The classifier is
+// meant to keep clusters below this; a dropped large triangle is a rare, localized miss, not a stall.
+const int MESHLET_VISBUFFER_MAX_BBOX_AREA = 4096; // e.g. 64x64.
+
+void write_visbuffer(int pixel_index, float ndc_z, uint payload) {
+	uint z_bits = floatBitsToUint(ndc_z); // Reverse-Z: near = 1.0 (large), far = 0.0. Monotonic in [0,1].
+#ifndef MESHLET_VISBUFFER_FALLBACK
+	uint64_t packed = (uint64_t(z_bits) << 32) | uint64_t(payload);
+	atomicMax(visbuffer.data[pixel_index], packed);
+#else
+	uint prev = atomicMax(vis_depth.data[pixel_index], z_bits);
+	// If our depth is now the winner (>= everything seen so far), claim the payload. A concurrent
+	// thread at the exact same depth can still overwrite this - a benign per-pixel flicker on true
+	// depth ties, acceptable for the fallback path.
+	if (z_bits >= prev && vis_depth.data[pixel_index] == z_bits) {
+		vis_payload.data[pixel_index] = payload;
+	}
+#endif
+}
 
 void main() {
-	uint visible_meshlet_id = gl_WorkGroupID.x;
-	uint triangle_id = gl_LocalInvocationID.x;
-	
-	if (visible_meshlet_id >= visible_meshlets.count) {
+	uint slot = gl_WorkGroupID.x;
+	if (slot >= min(visible_meshlets.count, params.max_visible)) {
+		return;
+	}
+	uint tri = gl_LocalInvocationID.x;
+
+	uint instance_id = visible_meshlets.data[slot].instance_index;
+	uint meshlet_id = visible_meshlets.data[slot].meshlet_index;
+	MeshletDescriptor d = meshlet_descriptors.data[meshlet_id];
+	if (tri >= d.triangle_count) {
 		return;
 	}
 
-	uint instance_id = visible_meshlets.data[visible_meshlet_id].instance_index;
-	uint meshlet_id = visible_meshlets.data[visible_meshlet_id].meshlet_index;
+	mat4 model = transforms.data[instance_id];
+	mat4 mvp = params.view_projection * model;
 
-	mat4 instance_transform = transforms.data[instance_id];
+	// Fetch this triangle's three vertices (triangle-local index -> meshlet vertex remap -> global).
+	uint base = d.triangle_offset + tri * 3u;
+	vec4 clip[3];
+	for (uint c = 0u; c < 3u; c++) {
+		uint local_v = fetch_triangle_local_vertex(base + c);
+		uint global_v = meshlet_vertex_remap.data[d.vertex_remap_offset + local_v];
+		clip[c] = mvp * vec4(vertex_positions.data[global_v].xyz, 1.0);
+	}
 
-	MeshletDescriptor desc = meshlet_descriptors.data[meshlet_id];
-	
-	if (triangle_id >= desc.triangle_count) {
+	// Reject if any vertex is behind the camera (w <= 0); a proper near-clip is future work - subpixel
+	// clusters straddling the near plane are a rare edge for this path.
+	if (clip[0].w <= 0.0 || clip[1].w <= 0.0 || clip[2].w <= 0.0) {
 		return;
 	}
-	
-	// Fetch Triangle Vertices
-	uint tri_idx = desc.triangle_offset + triangle_id;
-	uint tri_data = meshlet_triangles.data[tri_idx];
-	uint v0_idx = desc.vertex_offset + (tri_data & 0xFF);
-	uint v1_idx = desc.vertex_offset + ((tri_data >> 8) & 0xFF);
-	uint v2_idx = desc.vertex_offset + ((tri_data >> 16) & 0xFF);
-	
-	uint v0_global = meshlet_vertex_remap.data[v0_idx];
-	uint v1_global = meshlet_vertex_remap.data[v1_idx];
-	uint v2_global = meshlet_vertex_remap.data[v2_idx];
-	
-	vec3 p0 = meshlet_vertex_positions.data[v0_global].xyz;
-	vec3 p1 = meshlet_vertex_positions.data[v1_global].xyz;
-	vec3 p2 = meshlet_vertex_positions.data[v2_global].xyz;
-	
-	// Transform & Project to screen space
-	vec4 p0_clip = push_constant.view_projection_matrix * instance_transform * vec4(p0, 1.0);
-	vec4 p1_clip = push_constant.view_projection_matrix * instance_transform * vec4(p1, 1.0);
-	vec4 p2_clip = push_constant.view_projection_matrix * instance_transform * vec4(p2, 1.0);
-	
-	if (p0_clip.w <= 0.0 || p1_clip.w <= 0.0 || p2_clip.w <= 0.0) {
-		return;
+
+	// Perspective divide -> NDC, then to screen (pixel) coordinates. Vulkan NDC xy in [-1,1].
+	vec2 screen[3];
+	float ndc_z[3];
+	for (uint c = 0u; c < 3u; c++) {
+		vec3 ndc = clip[c].xyz / clip[c].w;
+		screen[c] = (ndc.xy * 0.5 + 0.5) * vec2(float(params.viewport_width), float(params.viewport_height));
+		ndc_z[c] = ndc.z;
 	}
-	
-	// Perspective divide
-	p0_clip.xyz /= p0_clip.w;
-	p1_clip.xyz /= p1_clip.w;
-	p2_clip.xyz /= p2_clip.w;
-	
-	// Viewport transform
-	vec2 screen0 = (p0_clip.xy * 0.5 + 0.5) * push_constant.viewport_size;
-	vec2 screen1 = (p1_clip.xy * 0.5 + 0.5) * push_constant.viewport_size;
-	vec2 screen2 = (p2_clip.xy * 0.5 + 0.5) * push_constant.viewport_size;
-	
-	// Backface culling
-	vec2 e0 = screen1 - screen0;
-	vec2 e1 = screen2 - screen0;
-	if (e0.x * e1.y - e0.y * e1.x <= 0.0) {
-		return; // Culled
+
+	// No backface cull: atomicMax keeps the nearest surface deterministically, so rendering both
+	// windings is Z-fight-free and correct for closed meshes (the front face is nearer and wins).
+	// Matching the hardware path's CULL_BACK exactly is a P5 consistency concern, not needed here.
+	vec2 lo = min(min(screen[0], screen[1]), screen[2]);
+	vec2 hi = max(max(screen[0], screen[1]), screen[2]);
+	int min_x = max(0, int(floor(lo.x)));
+	int min_y = max(0, int(floor(lo.y)));
+	int max_x = min(int(params.viewport_width) - 1, int(ceil(hi.x)));
+	int max_y = min(int(params.viewport_height) - 1, int(ceil(hi.y)));
+	if (min_x > max_x || min_y > max_y) {
+		return; // Off-screen or degenerate.
 	}
-	
-	// Bounding Box Test (Screen Space)
-	vec2 min_bound = min(min(screen0, screen1), screen2);
-	vec2 max_bound = max(max(screen0, screen1), screen2);
+	if ((max_x - min_x + 1) * (max_y - min_y + 1) > MESHLET_VISBUFFER_MAX_BBOX_AREA) {
+		return; // Safety net - see the cap's comment.
+	}
 
-	vec2 viewport_size = push_constant.viewport_size;
+	// Edge-function setup (screen space). area = signed area * 2; sign is winding-dependent, handled
+	// by normalizing the barycentrics by `area` so both windings produce inside==true.
+	vec2 e0 = screen[1] - screen[0];
+	vec2 e1 = screen[2] - screen[1];
+	vec2 e2 = screen[0] - screen[2];
+	float area = e0.x * (screen[2].y - screen[0].y) - e0.y * (screen[2].x - screen[0].x);
+	if (abs(area) < 1e-6) {
+		return; // Degenerate/zero-area.
+	}
+	float inv_area = 1.0 / area;
 
-	// Clamp to screen bounds
-	int min_x = max(0, int(floor(min_bound.x)));
-	int min_y = max(0, int(floor(min_bound.y)));
-	int max_x = min(int(viewport_size.x) - 1, int(ceil(max_bound.x)));
-	int max_y = min(int(viewport_size.y) - 1, int(ceil(max_bound.y)));
+	uint payload = ((slot & 0x1FFFFFFu) << 7) | (tri & 0x7Fu); // 25-bit slot, 7-bit triangle.
 
-	// Rasterize
 	for (int y = min_y; y <= max_y; y++) {
 		for (int x = min_x; x <= max_x; x++) {
-			vec2 p = vec2(x, y) + 0.5;
-
-			// Edge functions
-			vec2 v0 = screen1 - screen0;
-			vec2 w0 = p - screen0;
-			float cross0 = v0.x * w0.y - v0.y * w0.x;
-			
-			vec2 v1 = screen2 - screen1;
-			vec2 w1 = p - screen1;
-			float cross1 = v1.x * w1.y - v1.y * w1.x;
-			
-			vec2 v2 = screen0 - screen2;
-			vec2 w2 = p - screen2;
-			float cross2 = v2.x * w2.y - v2.y * w2.x;
-			
-			if (cross0 >= 0.0 && cross1 >= 0.0 && cross2 >= 0.0) {
-				// Barycentric coordinates
-				float area = cross0 + cross1 + cross2;
-				float b0 = cross1 / area;
-				float b1 = cross2 / area;
-				float b2 = cross0 / area;
-				
-				// Interpolate depth
-				float z = b0 * p0_clip.z + b1 * p1_clip.z + b2 * p2_clip.z;
-				
-				// Depth is [0.0, 1.0]. Float [0.0, 1.0] has same ordering as its IEEE 754 uint representation.
-				uint z_uint = floatBitsToUint(z);
-				
-				// Write to DepthBuffer using atomicMax (Reverse-Z means near=1.0, far=0.0)
-				// atomicMax effectively does greater-or-equal depth testing for Reverse-Z!
-				int pixel_index = y * int(viewport_size.x) + x;
-				atomicMax(depth_buffer.data[pixel_index], z_uint);
+			vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
+			// Barycentric weights via edge functions, normalized by the signed area so the inside test
+			// (all weights >= 0) works for either winding.
+			float w0 = (e1.x * (p.y - screen[1].y) - e1.y * (p.x - screen[1].x)) * inv_area;
+			float w1 = (e2.x * (p.y - screen[2].y) - e2.y * (p.x - screen[2].x)) * inv_area;
+			float w2 = (e0.x * (p.y - screen[0].y) - e0.y * (p.x - screen[0].x)) * inv_area;
+			if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) {
+				continue;
 			}
+			float z = w0 * ndc_z[0] + w1 * ndc_z[1] + w2 * ndc_z[2];
+			int pixel_index = y * int(params.viewport_width) + x;
+			write_visbuffer(pixel_index, z, payload);
 		}
 	}
 }
