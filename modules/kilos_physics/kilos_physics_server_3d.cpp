@@ -824,12 +824,106 @@ void KilosPhysicsServer3D::body_set_ray_pickable(RID p_body, bool p_enable) {
 }
 
 bool KilosPhysicsServer3D::body_test_motion(RID p_body, const MotionParameters &p_parameters, MotionResult *r_result) {
-	if (r_result) {
-		r_result->travel = p_parameters.motion;
-		r_result->collision_safe_fraction = 1.0;
-		r_result->collision_unsafe_fraction = 1.0;
+	// Approximate swept motion of a capsule/sphere body: cast a ray from each of
+	// the capsule's two sphere centres along the motion and stop at the earliest
+	// contact, accounting for the radius. Approximate but enough for a character
+	// to stand and walk on static trimesh terrain.
+	auto no_collision = [&]() -> bool {
+		if (r_result) {
+			r_result->travel = p_parameters.motion;
+			r_result->remainder = Vector3();
+			r_result->collision_safe_fraction = 1.0;
+			r_result->collision_unsafe_fraction = 1.0;
+			r_result->collision_count = 0;
+		}
+		return false;
+	};
+
+	KilosBody *body = body_owner.get_or_null(p_body);
+	if (!body) {
+		return no_collision();
 	}
-	return false;
+	KilosSpace *space = space_owner.get_or_null(body->space);
+	const Vector3 motion = p_parameters.motion;
+	const real_t motion_len = motion.length();
+	const real_t margin = p_parameters.margin;
+	if (!space || motion_len < 1e-6) {
+		return no_collision();
+	}
+
+	// First capsule/sphere shape on the body.
+	real_t radius = 0.0;
+	real_t cap_h = 0.0;
+	Transform3D shape_xform;
+	bool found = false;
+	for (int i = 0; i < body->shapes.size(); i++) {
+		KilosShape *sh = shape_owner.get_or_null(body->shapes[i].shape);
+		if (sh && (sh->type == SHAPE_CAPSULE || sh->type == SHAPE_SPHERE)) {
+			radius = sh->radius;
+			cap_h = (sh->type == SHAPE_CAPSULE) ? sh->height : (2.0 * sh->radius);
+			shape_xform = body->shapes[i].xform;
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		return no_collision();
+	}
+
+	const Transform3D world = p_parameters.from * shape_xform;
+	const real_t half = MAX((real_t)0.0, cap_h * 0.5 - radius);
+	const Vector3 centers_local[2] = { Vector3(0, half, 0), Vector3(0, -half, 0) };
+	const Vector3 dir = motion / motion_len;
+
+	real_t best_safe = 1.0;
+	bool any_hit = false;
+	PhysicsServer3D::MotionCollision best_col;
+
+	for (int i = 0; i < 2; i++) {
+		const Vector3 c = world.xform(centers_local[i]);
+		PhysicsDirectSpaceState3D::RayParameters rp;
+		rp.from = c;
+		rp.to = c + dir * (motion_len + radius + margin);
+		rp.exclude.insert(p_body);
+		rp.collision_mask = body->collision_mask;
+		rp.hit_back_faces = true;
+		PhysicsDirectSpaceState3D::RayResult rr;
+		if (_intersect_ray(body->space, rp, rr)) {
+			const real_t hit_dist = c.distance_to(rr.position);
+			real_t allowed = hit_dist - radius - margin;
+			if (allowed < 0.0) {
+				allowed = 0.0;
+			}
+			const real_t safe = allowed / motion_len;
+			if (safe < best_safe) {
+				best_safe = safe;
+				any_hit = true;
+				best_col.normal = rr.normal;
+				best_col.position = rr.position;
+				best_col.collider = rr.rid;
+				best_col.collider_id = rr.collider_id;
+				best_col.collider_shape = rr.shape;
+				best_col.local_shape = 0;
+				best_col.depth = margin;
+			}
+		}
+	}
+
+	best_safe = CLAMP(best_safe, (real_t)0.0, (real_t)1.0);
+	if (r_result) {
+		r_result->travel = motion * best_safe;
+		r_result->remainder = motion - r_result->travel;
+		r_result->collision_safe_fraction = best_safe;
+		r_result->collision_unsafe_fraction = best_safe;
+		r_result->collision_depth = margin;
+		if (any_hit) {
+			r_result->collisions[0] = best_col;
+			r_result->collision_count = 1;
+		} else {
+			r_result->collision_count = 0;
+		}
+	}
+	return any_hit;
 }
 
 PhysicsDirectBodyState3D * KilosPhysicsServer3D::body_get_direct_state(RID p_body) {

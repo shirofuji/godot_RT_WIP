@@ -365,6 +365,64 @@ void test_raycast_trimesh() {
 	memdelete(server);
 }
 
+void test_capsule_motion() {
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	RID space = server->space_create();
+
+	// Trimesh floor at y=5.
+	PackedVector3Array faces;
+	Vector3 a(-10, 5, -10), b(10, 5, -10), c(10, 5, 10), d(-10, 5, 10);
+	faces.push_back(a);
+	faces.push_back(b);
+	faces.push_back(c);
+	faces.push_back(a);
+	faces.push_back(c);
+	faces.push_back(d);
+	RID floor_shape = server->concave_polygon_shape_create();
+	Dictionary fd;
+	fd["faces"] = faces;
+	server->shape_set_data(floor_shape, fd);
+	RID floor_body = server->body_create();
+	server->body_set_mode(floor_body, PhysicsServer3D::BODY_MODE_STATIC);
+	server->body_add_shape(floor_body, floor_shape, Transform3D(), false);
+	server->body_set_space(floor_body, space);
+
+	// A capsule character (radius 0.5, height 2) at y=10, moving down 10.
+	RID cap_shape = server->capsule_shape_create();
+	Dictionary cd;
+	cd["radius"] = 0.5;
+	cd["height"] = 2.0;
+	server->shape_set_data(cap_shape, cd);
+	RID cap = server->body_create();
+	server->body_add_shape(cap, cap_shape, Transform3D(), false);
+	server->body_set_space(cap, space);
+
+	PhysicsServer3D::MotionParameters mp;
+	mp.from = Transform3D(Basis(), Vector3(0, 10, 0));
+	mp.motion = Vector3(0, -10, 0);
+	PhysicsServer3D::MotionResult mr;
+	bool collided = server->body_test_motion(cap, mp, &mr);
+
+	// Bottom sphere centre starts at y=9.5; floor at y=5 => it can descend 4.5,
+	// minus the radius/margin => travel ~= -4.0 (capsule foot rests at y=5).
+	check(collided, "body_test_motion reports a collision moving into the floor");
+	check(Math::abs(mr.travel.y + 4.0) < 0.05, vformat("Capsule stops resting on the floor (travel.y=%.4f, expected ~-4.0)", mr.travel.y));
+	check(mr.collision_count > 0 && mr.collisions[0].normal.y > 0.9, "Floor collision normal points up (walkable)");
+
+	// Moving up (away from floor) must be unobstructed.
+	mp.motion = Vector3(0, 5, 0);
+	PhysicsServer3D::MotionResult mr2;
+	bool up_collided = server->body_test_motion(cap, mp, &mr2);
+	check(!up_collided && Math::abs(mr2.travel.y - 5.0) < 0.01, "Moving away from the floor is unobstructed");
+
+	server->free_rid(cap);
+	server->free_rid(cap_shape);
+	server->free_rid(floor_body);
+	server->free_rid(floor_shape);
+	server->free_rid(space);
+	memdelete(server);
+}
+
 } // namespace
 
 void run_kilos_selftest_if_requested() {
@@ -380,6 +438,7 @@ void run_kilos_selftest_if_requested() {
 	test_pile_no_interpenetration();
 	test_sdf_dome();
 	test_raycast_trimesh();
+	test_capsule_motion();
 	if (g_failures == 0) {
 		print_line("KILOS_SELFTEST: all checks passed");
 	} else {
