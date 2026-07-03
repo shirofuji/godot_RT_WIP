@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/hiz_builder.h"
 #include "servers/rendering/renderer_rd/meshlet_culler.h"
+#include "servers/rendering/renderer_rd/forward_clustered/meshlet_software_rasterizer.h"
 #include "servers/rendering/renderer_rd/meshlet_renderer.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
@@ -2199,10 +2200,23 @@ static _FORCE_INLINE_ float _meshlet_lod_threshold_px() {
 // readback below. NOTE: with the split ON, small clusters are removed from the hardware draw but the
 // software rasterizer that would draw them doesn't exist yet (P2/P3) - so they visibly vanish. This
 // is a diagnostic-only switch until P5 wires the real, rendered path behind a project setting.
+// P5 live software-raster path (debug gate, default OFF): --meshlet-software-raster routes qualifying
+// meshlet geometry through the visibility-buffer pipeline (classify -> sw compute + hw draw into one
+// visbuffer -> fragment resolve compositing color+depth) INSTEAD of the meshlet color render(). Default
+// off so the game renders exactly as before; flip it on to A/B the software rasterizer. Occlusion is
+// intentionally skipped in this path for now (hidden meshlets just lose the visbuffer atomicMax - the
+// image stays correct, only less perf-optimal; occlusion routing is a later step).
+static bool _meshlet_software_raster_enabled() {
+	static bool enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-software-raster") != nullptr;
+	return enabled;
+}
+
 static float _meshlet_sw_cluster_px() {
 	static float threshold = []() {
 		const List<String> &args = OS::get_singleton()->get_cmdline_args();
-		if (args.find("--meshlet-swraster-diag") == nullptr) {
+		// The cull must split into hw/sw lists whenever either the diagnostic OR the live software-raster
+		// path is active.
+		if (args.find("--meshlet-swraster-diag") == nullptr && args.find("--meshlet-software-raster") == nullptr) {
 			return 0.0f;
 		}
 		float px = 8.0f;
@@ -2497,10 +2511,35 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 		}
 	}
 
-	// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
-	// color (and, if the early pass ran, its partial depth contribution too) - never true here,
-	// matching this pass's existing pre-restructuring behavior.
-	meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_sky_ambient_mix, meshlet_radiance_exposure, meshlet_max_roughness_lod);
+	if (_meshlet_software_raster_enabled()) {
+		// P5 debug path: visibility-buffer software rasterizer instead of the color render(). Rasterize
+		// the small (software) and large (hardware) clusters from *this frame's* frustum result into one
+		// shared visbuffer, then a fragment resolve shades + composites color+depth into the scene
+		// framebuffer. Occlusion (occlusion_result) is intentionally not used here yet - see the gate's
+		// comment. Uses the same projection/camera/shading params the render() path uses just below.
+		MeshletSoftwareRasterizer *sw_rast = MeshletSoftwareRasterizer::get_singleton();
+		if (sw_rast && frustum_result.has_software()) {
+			RendererRD::MeshletCuller::CullResult sw_list;
+			sw_list.visible_buffer = frustum_result.sw_visible_buffer;
+			sw_list.max_visible = frustum_result.sw_max_visible;
+			RendererRD::MeshletCuller::CullResult hw_list;
+			hw_list.visible_buffer = frustum_result.visible_buffer;
+			hw_list.max_visible = frustum_result.max_visible;
+
+			// Software (small/subpixel) clusters via compute - this call clears the shared visbuffer.
+			sw_rast->rasterize(sw_list, transforms_buffer, screen_size, projection, camera_transform, false);
+			// Hardware (large) clusters via a draw - accumulate into the SAME visbuffer (p_clear = false).
+			sw_rast->rasterize_hardware(hw_list, transforms_buffer, screen_size, projection, camera_transform, false, false);
+			// Resolve: shade every covered pixel and composite color + gl_FragDepth into the scene's
+			// color-only framebuffer (p_clear = false - the opaque pass already filled it).
+			sw_rast->resolve_raster(p_color_only_framebuffer, sw_list, hw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, lights_buffer, (uint32_t)lights.size(), meshlet_ambient_color, meshlet_sky_ambient_mix, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_radiance_exposure, meshlet_max_roughness_lod, false);
+		}
+	} else {
+		// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
+		// color (and, if the early pass ran, its partial depth contribution too) - never true here,
+		// matching this pass's existing pre-restructuring behavior.
+		meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_sky_ambient_mix, meshlet_radiance_exposure, meshlet_max_roughness_lod);
+	}
 
 	// Rebuild Hi-Z once more, now from the fully-resolved depth (everything drawn this frame,
 	// including what this late pass itself just drew) - this becomes *next* frame's "last frame's

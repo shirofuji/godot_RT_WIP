@@ -98,13 +98,22 @@ resolve -> shaded pixel count EQUALS visbuffer coverage exactly, colors in [0,1]
   framebuffer, coverage == visbuffer coverage exactly. GOTCHA: a procedural fullscreen draw needs the
   pipeline's vertex format = INVALID_FORMAT_ID, NOT an empty vertex format (else "No vertex array bound").
 
-STILL TODO (not headless-verifiable - needs the live scene, user A/B):
-- **P5b occlusion routing**: occlude BOTH lists before raster (P1 split currently bypasses occlude()).
-  occlude() uses one shared occluded_buffer - needs a 2nd, or occlude both in one call.
-- **P5c late-pass wiring**: in _render_meshlet_late_pass, behind `rendering/meshlet/software_raster`
-  (default off): cull(split on) -> occlude both -> clear visbuffer -> sw compute raster + hw draw raster
-  into it -> resolve_raster into the color_only_framebuffer (composites color+depth), skipping the color
-  render(). A/B vs today.
+- **P5c late-pass wiring — DONE (gated, smoke-tested live; visual A/B pending user) 2026-07-04.**
+  Gate: `--meshlet-software-raster` (default OFF). When on, _render_meshlet_late_pass branches at the
+  render() call: rasterize frustum_result's sw list (compute, clears visbuffer) + hw list (draw,
+  accumulate) -> resolve_raster composites color+depth into p_color_only_framebuffer, skipping the
+  color render(). Reuses the render() path's exact shading params. `--meshlet-swraster-px=N` tunes the
+  split (1e9 = all software). Occlusion SKIPPED for now (still correct - atomicMax; occlusion = P5b
+  perf). Smoke-tested on neesan/meshlet_pbr_test.tscn: both paths run 30-40 frames, no crashes, no
+  Vulkan validation errors (8px -> hw=37/sw=0; 1e5px -> hw=0/sw=37). Not yet visually A/B'd (needs the
+  user to look). Default-off path unregressed (--meshlet-selftest still only the known center fail).
+  NB: resolve_raster assumes p_color_only_framebuffer has exactly 1 color attachment + depth (same as
+  render()'s pipeline) - holds for the common Forward+ opaque target.
+
+STILL TODO (needs the live scene, user A/B):
+- **P5b occlusion routing**: occlude BOTH lists before raster (currently skipped in the gated path -
+  correct but not perf-optimal). occlude() uses one shared occluded_buffer - needs a 2nd, or occlude
+  both in one call.
 - **P5d**: camera-relative projection (P2b/P3/P4/P5a use absolute - fine standalone; revisit for
   large-world precision, matching meshlet_render.glsl).
 - **P5e**: once validated, retire the color render() path + its CULL_BACK/depth-bias hacks; consider the
