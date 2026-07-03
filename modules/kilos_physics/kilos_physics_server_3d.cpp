@@ -941,18 +941,46 @@ bool KilosPhysicsServer3D::body_test_motion(RID p_body, const MotionParameters &
 		return no_collision();
 	}
 
-	// First capsule/sphere shape on the body.
+	// Represent the body's first shape as a swept capsule (radius + total height).
+	// Non-capsule shapes (box/cylinder/convex, e.g. a CharacterBody3D animal with a
+	// BoxShape3D) inscribe a vertical capsule so they collide instead of falling through.
 	real_t radius = 0.0;
 	real_t cap_h = 0.0;
 	Transform3D shape_xform;
 	bool found = false;
 	for (int i = 0; i < body->shapes.size(); i++) {
 		KilosShape *sh = shape_owner.get_or_null(body->shapes[i].shape);
-		if (sh && (sh->type == SHAPE_CAPSULE || sh->type == SHAPE_SPHERE)) {
-			radius = sh->radius;
-			cap_h = (sh->type == SHAPE_CAPSULE) ? sh->height : (2.0 * sh->radius);
-			shape_xform = body->shapes[i].xform;
-			found = true;
+		if (!sh) {
+			continue;
+		}
+		shape_xform = body->shapes[i].xform;
+		switch (sh->type) {
+			case SHAPE_SPHERE:
+				radius = sh->radius;
+				cap_h = 2.0 * sh->radius;
+				found = true;
+				break;
+			case SHAPE_CAPSULE:
+			case SHAPE_CYLINDER:
+				radius = sh->radius;
+				cap_h = sh->height;
+				found = true;
+				break;
+			case SHAPE_BOX:
+				radius = MAX((real_t)0.01, MIN(sh->box_half.x, sh->box_half.z));
+				cap_h = 2.0 * sh->box_half.y;
+				found = true;
+				break;
+			case SHAPE_CONVEX_POLYGON:
+				radius = MAX((real_t)0.01, MIN(sh->box_half.x, sh->box_half.z));
+				cap_h = 2.0 * sh->box_half.y;
+				shape_xform = shape_xform.translated_local(sh->center);
+				found = true;
+				break;
+			default:
+				break;
+		}
+		if (found) {
 			break;
 		}
 	}

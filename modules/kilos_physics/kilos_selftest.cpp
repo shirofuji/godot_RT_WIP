@@ -512,6 +512,53 @@ void test_shape_added_after_space() {
 	memdelete(server);
 }
 
+void test_box_character_motion() {
+	// An animal is a CharacterBody3D with a BoxShape3D. body_test_motion must treat
+	// the box as a swept capsule or the animal falls through the ground.
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	RID space = server->space_create();
+
+	PackedVector3Array faces;
+	Vector3 a(-10, 5, -10), b(10, 5, -10), c(10, 5, 10), d(-10, 5, 10);
+	faces.push_back(a);
+	faces.push_back(b);
+	faces.push_back(c);
+	faces.push_back(a);
+	faces.push_back(c);
+	faces.push_back(d);
+	RID floor_shape = server->concave_polygon_shape_create();
+	Dictionary fd;
+	fd["faces"] = faces;
+	server->shape_set_data(floor_shape, fd);
+	RID floor_body = server->body_create();
+	server->body_set_mode(floor_body, PhysicsServer3D::BODY_MODE_STATIC);
+	server->body_add_shape(floor_body, floor_shape, Transform3D(), false);
+	server->body_set_space(floor_body, space);
+
+	RID box_shape = server->box_shape_create();
+	server->shape_set_data(box_shape, Vector3(0.5, 0.5, 0.5)); // half-extents
+	RID animal = server->body_create();
+	server->body_add_shape(animal, box_shape, Transform3D(), false);
+	server->body_set_space(animal, space);
+
+	PhysicsServer3D::MotionParameters mp;
+	mp.from = Transform3D(Basis(), Vector3(0, 10, 0));
+	mp.motion = Vector3(0, -10, 0);
+	PhysicsServer3D::MotionResult mr;
+	bool collided = server->body_test_motion(animal, mp, &mr);
+
+	// Inscribed radius 0.5 -> stops with the box centre at y=5.5 (travel ~ -4.5).
+	check(collided && Math::abs(mr.travel.y + 4.5) < 0.05,
+			vformat("Box-shaped character stops on the floor instead of falling through (travel.y=%.4f)", mr.travel.y));
+
+	server->free_rid(animal);
+	server->free_rid(box_shape);
+	server->free_rid(floor_body);
+	server->free_rid(floor_shape);
+	server->free_rid(space);
+	memdelete(server);
+}
+
 void test_capsule_recovery() {
 	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
 	RID space = server->space_create();
@@ -581,6 +628,7 @@ void run_kilos_selftest_if_requested() {
 	test_raycast_primitives();
 	test_shape_added_after_space();
 	test_capsule_motion();
+	test_box_character_motion();
 	test_capsule_recovery();
 	if (g_failures == 0) {
 		print_line("KILOS_SELFTEST: all checks passed");
