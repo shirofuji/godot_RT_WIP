@@ -479,6 +479,39 @@ void test_raycast_primitives() {
 	memdelete(server);
 }
 
+void test_shape_added_after_space() {
+	// Reproduces the GridMap ordering: body_set_space is called BEFORE the shape is
+	// added (and shapes get re-baked later). The broadphase must refresh or the body
+	// (empty when added) stays invisible - which is why trees didn't block.
+	KilosPhysicsServer3D *server = memnew(KilosPhysicsServer3D(false));
+	RID space = server->space_create();
+	PhysicsDirectSpaceState3D *ss = server->space_get_direct_state(space);
+
+	RID box_shape = server->box_shape_create();
+	server->shape_set_data(box_shape, Vector3(1, 1, 1));
+	RID body = server->body_create();
+	server->body_set_mode(body, PhysicsServer3D::BODY_MODE_STATIC);
+	server->body_set_space(body, space); // space set BEFORE the shape exists
+
+	PhysicsDirectSpaceState3D::RayParameters rp;
+	rp.from = Vector3(5, 0, 0);
+	rp.to = Vector3(-5, 0, 0);
+	PhysicsDirectSpaceState3D::RayResult warm;
+	ss->intersect_ray(rp, warm); // builds the broadphase while the body is empty
+
+	server->body_add_shape(body, box_shape, Transform3D(), false); // shape added later
+
+	PhysicsDirectSpaceState3D::RayResult rr;
+	bool hit = ss->intersect_ray(rp, rr);
+	check(hit && Math::abs(rr.position.x - 1.0) < 0.01,
+			"Shape added after body_set_space is picked up by the broadphase (GridMap tree order)");
+
+	server->free_rid(body);
+	server->free_rid(box_shape);
+	server->free_rid(space);
+	memdelete(server);
+}
+
 } // namespace
 
 void run_kilos_selftest_if_requested() {
@@ -495,6 +528,7 @@ void run_kilos_selftest_if_requested() {
 	test_sdf_dome();
 	test_raycast_trimesh();
 	test_raycast_primitives();
+	test_shape_added_after_space();
 	test_capsule_motion();
 	if (g_failures == 0) {
 		print_line("KILOS_SELFTEST: all checks passed");

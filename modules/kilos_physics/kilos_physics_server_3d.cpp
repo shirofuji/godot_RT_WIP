@@ -538,6 +538,15 @@ PhysicsServer3D::BodyMode KilosPhysicsServer3D::body_get_mode(RID p_body) const 
 	return body->mode;
 }
 
+void KilosPhysicsServer3D::_mark_space_dirty(RID p_space) {
+	if (p_space.is_valid()) {
+		KilosSpace *sp = space_owner.get_or_null(p_space);
+		if (sp) {
+			sp->bvh_dirty = true;
+		}
+	}
+}
+
 void KilosPhysicsServer3D::body_add_shape(RID p_body, RID p_shape, const Transform3D &p_transform, bool p_disabled) {
 	MutexLock lock(collision_mutex);
 	KilosBody *body = body_owner.get_or_null(p_body);
@@ -547,6 +556,9 @@ void KilosPhysicsServer3D::body_add_shape(RID p_body, RID p_shape, const Transfo
 	bs.xform = p_transform;
 	bs.disabled = p_disabled;
 	body->shapes.push_back(bs);
+	// Shapes often added AFTER body_set_space (e.g. GridMap), so the broadphase
+	// must be rebuilt or the body (empty when added) stays absent from it.
+	_mark_space_dirty(body->space);
 }
 
 void KilosPhysicsServer3D::body_set_shape(RID p_body, int p_shape_idx, RID p_shape) {
@@ -555,6 +567,7 @@ void KilosPhysicsServer3D::body_set_shape(RID p_body, int p_shape_idx, RID p_sha
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.write[p_shape_idx].shape = p_shape;
+	_mark_space_dirty(body->space);
 }
 
 void KilosPhysicsServer3D::body_set_shape_transform(RID p_body, int p_shape_idx, const Transform3D &p_transform) {
@@ -563,6 +576,7 @@ void KilosPhysicsServer3D::body_set_shape_transform(RID p_body, int p_shape_idx,
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.write[p_shape_idx].xform = p_transform;
+	_mark_space_dirty(body->space);
 }
 
 int KilosPhysicsServer3D::body_get_shape_count(RID p_body) const {
@@ -599,6 +613,7 @@ void KilosPhysicsServer3D::body_remove_shape(RID p_body, int p_shape_idx) {
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.remove_at(p_shape_idx);
+	_mark_space_dirty(body->space);
 }
 
 void KilosPhysicsServer3D::body_clear_shapes(RID p_body) {
@@ -606,6 +621,7 @@ void KilosPhysicsServer3D::body_clear_shapes(RID p_body) {
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	body->shapes.clear();
+	_mark_space_dirty(body->space);
 }
 
 void KilosPhysicsServer3D::body_attach_object_instance_id(RID p_body, ObjectID p_id) {
@@ -714,6 +730,12 @@ void KilosPhysicsServer3D::body_set_state(RID p_body, BodyState p_state, const V
 			d.rotation[2] = q.z;
 			d.rotation[3] = q.w;
 			_mark_dirty(body->slot);
+		}
+		// Static colliders (e.g. GridMap octants) can be repositioned once; refresh
+		// their broadphase entry. Skip kinematic/dynamic bodies (the player) so
+		// per-frame moves don't thrash the BVH.
+		if (body->mode == BODY_MODE_STATIC) {
+			_mark_space_dirty(body->space);
 		}
 	} else if (p_state == BODY_STATE_LINEAR_VELOCITY) {
 		Vector3 v = p_variant;
@@ -958,7 +980,11 @@ bool KilosPhysicsServer3D::body_test_motion(RID p_body, const MotionParameters &
 		PhysicsDirectSpaceState3D::RayResult rr;
 		if (_intersect_ray_unlocked(body->space, rp, rr)) {
 			const real_t hit_dist = c.distance_to(rr.position);
-			real_t allowed = hit_dist - radius - margin;
+			// A sphere of radius r moving along dir touches a surface with normal n
+			// when its centre is r/|dir.n| from the hit point (not r). On flat ground
+			// |dir.n|=1; on slopes it's < 1, so using plain r let the capsule sink.
+			const real_t ndot = MAX((real_t)0.25, Math::abs(dir.dot(rr.normal)));
+			real_t allowed = hit_dist - radius / ndot - margin;
 			if (allowed < 0.0) {
 				allowed = 0.0;
 			}

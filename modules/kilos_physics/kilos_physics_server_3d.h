@@ -208,6 +208,7 @@ private:
 	bool _body_raycast(const KilosBody *p_body, RID p_body_rid, const Vector3 &p_from, const Vector3 &p_to, bool p_hit_back, real_t &r_closest_t, PhysicsDirectSpaceState3D::RayResult &r_result) const;
 	AABB _body_world_aabb(const KilosBody *p_body) const;
 	void _build_space_bvh(KilosSpace *p_space);
+	void _mark_space_dirty(RID p_space);
 	bool _intersect_ray_unlocked(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result);
 
 	// Guards the CPU collision state (shapes, body shape lists, space body sets and
