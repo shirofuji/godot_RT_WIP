@@ -1238,8 +1238,25 @@ void GI::SVOGI::update(RID p_env, const Vector3 &p_world_position) {
 
 	int32_t drag_margin = (cascade_size / SVOGI::PROBE_DIVISOR) / 2;
 
+	uint32_t cascade_index = 0;
 	for (SVOGI::Cascade &cascade : cascades) {
 		cascade.dirty_regions = Vector3i();
+
+		// Only cascade 0 is ever sampled by the cone trace - svogi_cone_trace() (scene_forward_gi_inc.glsl
+		// and meshlet_render.glsl) hardcodes cascades[0] / a single svogi_bounds, and the trace comments
+		// note "this prototype only populates cascade 0". Higher cascades share the SAME octree buffer
+		// (there is one octree_nodes_buffer, not one per cascade); when a higher cascade drags it does a
+		// full octree CLEAR + repopulate (SVOGI::render_region) with its own larger, coarser, bounds-
+		// mismatched geometry, and because it renders AFTER cascade 0 in the same frame it clobbers
+		// cascade 0's data - leaving the trace sampling the wrong content for that one frame. That is the
+		// observed green flash: the SVOGI voxelize input jumps from cascade 0's ~114 meshlets to a higher
+		// cascade's ~1604 for a single frame, then back. Since nothing reads higher cascades, skip
+		// dirtying/voxelizing them entirely: the octree then always holds cascade 0 (stable, no flash),
+		// and we save the wasted higher-cascade voxelize cost. (A real multi-cascade SVOGI would need a
+		// separate octree per cascade, or a combined structure the trace can select into - future work.)
+		if (cascade_index++ != 0) {
+			continue;
+		}
 
 		Vector3 probe_half_size = Vector3(1, 1, 1) * cascade.cell_size * float(cascade_size / SVOGI::PROBE_DIVISOR) * 0.5;
 		probe_half_size = Vector3(0, 0, 0);
@@ -1271,17 +1288,25 @@ void GI::SVOGI::update(RID p_env, const Vector3 &p_world_position) {
 		}
 
 		if (cascade.dirty_regions != Vector3i() && cascade.dirty_regions != SVOGI::Cascade::DIRTY_ALL) {
-			//see how much the total dirty volume represents from the total volume
-			uint32_t total_volume = cascade_size * cascade_size * cascade_size;
-			uint32_t safe_volume = 1;
-			for (int j = 0; j < 3; j++) {
-				safe_volume *= cascade_size - Math::abs(cascade.dirty_regions[j]);
-			}
-			uint32_t dirty_volume = total_volume - safe_volume;
-			if (dirty_volume > (safe_volume / 2)) {
-				//more than half the volume is dirty, make all dirty so its only rendered once
-				cascade.dirty_regions = SVOGI::Cascade::DIRTY_ALL;
-			}
+			// Partial ("dirty strip") updates are NOT consistent for this sparse octree and must be
+			// promoted to a full clear+rebuild. Unlike SDFGI's toroidal 3D texture - where non-dirty
+			// texels keep their values across a scroll and only the newly-exposed slice needs
+			// re-rendering - this octree's root AABB is anchored to the CURRENT cascade position, so
+			// when the cascade drags every previously-voxelized node is at a stale relative coordinate.
+			// SVOGI::render_region() therefore wipes the ENTIRE octree (MODE_CLEAR resets the node
+			// allocator + root) whenever it rebuilds. The incremental get_pending_region_data() path
+			// then only re-voxelizes the thin dirty slice, leaving the rest of the octree EMPTY for
+			// that frame - which shows up as GI popping/flickering as you move (e.g. a tree's green
+			// foliage bounce flashing on and off, or the whole indirect bounce dropping for a frame).
+			// The old heuristic only promoted to DIRTY_ALL when >half the volume was dirty, so every
+			// small drag fell into the broken partial path. Promote ANY movement to a full rebuild
+			// instead: the only self-consistent states for this octree are "stationary" (nothing dirty,
+			// octree persists untouched) and "full rebuild". The cost is bounded - the cascade only
+			// drags in whole drag-margin steps (cascade_size/PROBE_DIVISOR cells), so a full rebuild
+			// fires only when you cross a chunk boundary, not every frame; between crossings the octree
+			// is untouched. A true toroidally-addressed sparse octree (SDFGI-style) that could survive
+			// a scroll and keep genuine incremental updates is the larger future win.
+			cascade.dirty_regions = SVOGI::Cascade::DIRTY_ALL;
 		}
 	}
 }
@@ -2253,6 +2278,13 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 		RD::get_singleton()->compute_list_dispatch_threads(compute_list, dispatch_x, 1, 1);
 		
 		RD::get_singleton()->compute_list_end();
+
+		// uniform_set_1 is transient per-region (its meshlet/visibility buffers change each call) and
+		// is only referenced by the voxelize dispatch above - free it now that the compute list has
+		// ended. Previously this was leaked on every voxelized region: its dependency buffers persist,
+		// so RD never auto-collected it, and SVOGI updates accumulated one dangling uniform set per
+		// region for the lifetime of the process.
+		RD::get_singleton()->free_rid(uniform_set_1);
 
 		RD::get_singleton()->draw_command_end_label();
 

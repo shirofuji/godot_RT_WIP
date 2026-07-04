@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/shaders/meshlet_cull_expand.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_emit_draws.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_occlusion_test.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_dispatch_args.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
 namespace RendererRD {
@@ -69,7 +70,15 @@ public:
 		RID visible_buffer; // SSBO: { uint count; VisibleMeshlet data[]; }, sized max_visible.
 		uint32_t max_visible = 0;
 
+		// Software-raster worklist (small/subpixel clusters routed to the compute rasterizer), same
+		// SSBO layout, sized sw_max_visible. Populated only when cull()'s p_sw_cluster_px > 0 (the
+		// visibility-buffer path - default off, in which case every survivor lands in visible_buffer
+		// exactly as before and this stays a 1-element placeholder).
+		RID sw_visible_buffer;
+		uint32_t sw_max_visible = 0;
+
 		bool is_valid() const { return visible_buffer.is_valid(); }
+		bool has_software() const { return sw_visible_buffer.is_valid() && sw_max_visible > 0; }
 	};
 
 	// Mirrors VkDrawIndexedIndirectCommand's layout exactly (20 bytes).
@@ -112,26 +121,47 @@ private:
 	RID emit_draws_shader_rid;
 	RID emit_draws_pipeline;
 
+	// Builds indirect dispatch args from a GPU-side count, so cull/occlude/emit dispatch the real
+	// survivor count instead of the fixed multi-million capacity (no per-frame readback stall).
+	MeshletVisbufferDispatchArgsShaderRD dispatch_args_shader;
+	RID dispatch_args_shader_version;
+	RID dispatch_args_shader_rid;
+	RID dispatch_args_pipeline;
+	RID dispatch_args_buffer; // VkDispatchIndirectCommand {x,y,z}, DISPATCH_INDIRECT usage.
+
 	RID hiz_sampler;
 
 	// Transient scratch buffers: recreated (not grown-with-copy) whenever too small, since their
 	// contents don't need to persist across calls - unlike MeshletStorage's persistent allocator.
 	RID ranges_buffer;
+	uint32_t ranges_capacity = 0; // In InstanceMeshletRange entries. Grow-and-reuse so ranges_buffer's
+			// RID stays stable across frames, letting the expand pass's uniform-set cache hit.
 	RID work_items_buffer;
 	uint32_t work_items_capacity = 0;
 	RID visible_buffer;
 	uint32_t visible_capacity = 0;
+	RID sw_visible_buffer; // cull()'s software-raster output list (binding 5); grow-and-reuse.
+	uint32_t sw_visible_capacity = 0;
 	RID occluded_buffer; // occlude()'s own output buffer - distinct from visible_buffer, since
 			// occlude() reads a CullResult (often visible_buffer itself) as input.
 	uint32_t occluded_capacity = 0;
+	RID occluded_buffer_2; // occlude()'s SECONDARY output (p_secondary=true) - lets the caller occlude
+			// two lists (hardware + software) in one frame without the second overwriting the first.
+	uint32_t occluded_capacity_2 = 0;
 	RID command_buffer;
 	uint32_t command_capacity = 0;
 	RID draw_count_buffer; // 4-byte SSBO for vkCmdDrawIndexedIndirectCount.
 
 	void _ensure_work_items_capacity(uint32_t p_capacity);
 	void _ensure_visible_capacity(uint32_t p_capacity);
-	void _ensure_occluded_capacity(uint32_t p_capacity);
+	void _ensure_sw_visible_capacity(uint32_t p_capacity);
+	void _ensure_buffer_capacity(RID &r_buffer, uint32_t &r_capacity, uint32_t p_capacity); // grow-and-reuse for occluded buffers.
 	void _ensure_command_capacity(uint32_t p_capacity);
+	// Dispatches the 1-thread args builder: reads p_count_source_buffer's leading count (clamped to
+	// p_capacity), writes dispatch_args_buffer = {ceil(count/p_divisor), 1, 1} for a following
+	// compute_list_dispatch_indirect. Its own compute list, so RD barriers it against the count write
+	// and the indirect read.
+	void _build_dispatch_args(RID p_count_source_buffer, uint32_t p_capacity, uint32_t p_divisor);
 
 public:
 	static MeshletCuller *get_singleton();
@@ -142,12 +172,20 @@ public:
 	// distance); p_lod_threshold = max acceptable cluster screen-error in pixels. Together they drive
 	// the Nanite-style per-cluster LOD cut in meshlet_cull.glsl. p_projection_scale <= 0 disables the
 	// cut and renders the finest LOD only (for callers without projection info).
-	CullResult cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items = 1 << 16, uint32_t p_max_visible = 1 << 16, float p_projection_scale = 0.0f, float p_lod_threshold = 0.0f);
+	// p_sw_cluster_px: hardware/software raster split threshold, in projected screen pixels of cluster
+	// radius. A survivor whose bounding sphere projects smaller than this is routed to the result's
+	// sw_visible_buffer (for the compute rasterizer) instead of visible_buffer. <= 0 disables the split
+	// entirely (every survivor -> visible_buffer, i.e. today's hardware-only behavior), in which case a
+	// 1-element placeholder sw buffer is still bound so the shader has a valid target. When enabled, the
+	// software list is sized to p_max_visible (it shares the hardware list's capacity bound).
+	CullResult cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items = 1 << 16, uint32_t p_max_visible = 1 << 16, float p_projection_scale = 0.0f, float p_lod_threshold = 0.0f, float p_sw_cluster_px = 0.0f);
 
 	// Tests p_frustum_result's survivors (e.g. from cull() above) against a Hi-Z depth pyramid
 	// (see HiZBuilder) and returns a new, final CullResult. p_camera_transform/p_projection
 	// describe the same camera the Hi-Z texture's source depth was rendered with.
-	CullResult occlude(RID p_transforms_buffer, const CullResult &p_frustum_result, RID p_hiz_texture, uint32_t p_hiz_mip_count, const Transform3D &p_camera_transform, const Projection &p_projection, const Size2i &p_screen_size, uint32_t p_max_visible = 1 << 16);
+	// p_secondary selects a distinct output buffer, so a caller can occlude a hardware list and a
+	// software list against the same Hi-Z in one frame without the second clobbering the first.
+	CullResult occlude(RID p_transforms_buffer, const CullResult &p_frustum_result, RID p_hiz_texture, uint32_t p_hiz_mip_count, const Transform3D &p_camera_transform, const Projection &p_projection, const Size2i &p_screen_size, uint32_t p_max_visible = 1 << 16, bool p_secondary = false);
 
 	// Converts p_result's survivors into an indirect draw command buffer, one command per
 	// surviving meshlet, with each command's index_count set to that specific meshlet's actual
@@ -164,6 +202,8 @@ public:
 	// Read-back helper (stalls the GPU - test/debug use only, never call this per-frame).
 	Vector<VisibleMeshlet> debug_read_visible(const CullResult &p_result);
 	Vector<IndirectCommand> debug_read_commands(const IndirectDrawResult &p_result);
+	// Reads just the leading atomic count word of a visible-list SSBO (hw or sw). Stalls; debug only.
+	uint32_t debug_read_visible_count(RID p_visible_buffer);
 
 	MeshletCuller();
 	~MeshletCuller();
