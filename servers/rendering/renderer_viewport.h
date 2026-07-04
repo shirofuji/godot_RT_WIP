@@ -97,6 +97,10 @@ public:
 
 		uint64_t time_gpu_begin;
 		uint64_t time_gpu_end;
+		// Last physically-plausible GPU render time (ms). GPU query results can be
+		// stale/unavailable for a frame (extra reordered passes leave a slot unwritten),
+		// which would otherwise surface as a huge garbage span; we hold this instead.
+		double time_gpu_measured = 0.0;
 
 		RID shadow_atlas;
 		int shadow_atlas_size = 2048;
