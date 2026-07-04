@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/shaders/meshlet_cull_expand.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_emit_draws.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_occlusion_test.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_dispatch_args.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
 namespace RendererRD {
@@ -120,6 +121,14 @@ private:
 	RID emit_draws_shader_rid;
 	RID emit_draws_pipeline;
 
+	// Builds indirect dispatch args from a GPU-side count, so cull/occlude/emit dispatch the real
+	// survivor count instead of the fixed multi-million capacity (no per-frame readback stall).
+	MeshletVisbufferDispatchArgsShaderRD dispatch_args_shader;
+	RID dispatch_args_shader_version;
+	RID dispatch_args_shader_rid;
+	RID dispatch_args_pipeline;
+	RID dispatch_args_buffer; // VkDispatchIndirectCommand {x,y,z}, DISPATCH_INDIRECT usage.
+
 	RID hiz_sampler;
 
 	// Transient scratch buffers: recreated (not grown-with-copy) whenever too small, since their
@@ -148,6 +157,11 @@ private:
 	void _ensure_sw_visible_capacity(uint32_t p_capacity);
 	void _ensure_buffer_capacity(RID &r_buffer, uint32_t &r_capacity, uint32_t p_capacity); // grow-and-reuse for occluded buffers.
 	void _ensure_command_capacity(uint32_t p_capacity);
+	// Dispatches the 1-thread args builder: reads p_count_source_buffer's leading count (clamped to
+	// p_capacity), writes dispatch_args_buffer = {ceil(count/p_divisor), 1, 1} for a following
+	// compute_list_dispatch_indirect. Its own compute list, so RD barriers it against the count write
+	// and the indirect read.
+	void _build_dispatch_args(RID p_count_source_buffer, uint32_t p_capacity, uint32_t p_divisor);
 
 public:
 	static MeshletCuller *get_singleton();

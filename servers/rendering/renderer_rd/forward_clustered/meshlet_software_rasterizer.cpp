@@ -314,10 +314,10 @@ void MeshletSoftwareRasterizer::rasterize(const RendererRD::MeshletCuller::CullR
 		RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(dispatch_args_shader_rid, 0, uniforms);
 
 		DispatchArgsPushConstant pc;
-		pc.max_visible = p_list.max_visible;
+		pc.max_count = p_list.max_visible;
+		pc.divisor = 1; // One workgroup per meshlet (the rasterizer uses gl_WorkGroupID.x = slot).
 		pc.pad0 = 0;
 		pc.pad1 = 0;
-		pc.pad2 = 0;
 
 		RD::ComputeListID cl = RD::get_singleton()->compute_list_begin();
 		RD::get_singleton()->compute_list_bind_compute_pipeline(cl, dispatch_args_pipeline);

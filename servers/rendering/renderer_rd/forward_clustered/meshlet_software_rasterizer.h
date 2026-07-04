@@ -36,10 +36,10 @@ public:
 
 	// Must match meshlet_visbuffer_dispatch_args.glsl's Params block (std430): 4 uints (16 bytes).
 	struct DispatchArgsPushConstant {
-		uint32_t max_visible;
+		uint32_t max_count;
+		uint32_t divisor; // Consuming shader's local_size_x (1 = one workgroup per item).
 		uint32_t pad0;
 		uint32_t pad1;
-		uint32_t pad2;
 	};
 
 	// Must match meshlet_visbuffer_hw_raster.glsl's Params block (std430, 92 bytes): mat4 (64) +

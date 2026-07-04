@@ -162,6 +162,23 @@ resolve -> shaded pixel count EQUALS visbuffer coverage exactly, colors in [0,1]
   cutout material writes ~nothing to the visbuffer, opaque covers fully. (The resolve's own alpha-scissor
   in meshlet_shade is now redundant-but-harmless - scissored fragments never reach it.)
 
+## 4M over-dispatch → indirect (2026-07-04) — DONE & VERIFIED
+The cull (Pass B), occlude, and emit passes dispatched the fixed MESHLET_LIVE_CAPACITY (~4M) threads
+every frame regardless of the real survivor count (×3 passes × early+late = big waste). Now each
+dispatches the actual GPU-side count via indirect dispatch, with NO CPU readback:
+- Generalized meshlet_visbuffer_dispatch_args.glsl: reads any `{uint count; ...}` list's leading count
+  (clamped to capacity), writes {ceil(min(count,cap)/divisor),1,1}; `divisor` = the consumer's
+  local_size_x (1 for the sw raster's one-workgroup-per-item; 64 for cull/occlude/emit's dispatch_threads
+  semantics). The sw rasterizer's DispatchArgsPushConstant gained the divisor field (=1).
+- MeshletCuller got its own dispatch_args shader/pipeline + a DISPATCH_INDIRECT dispatch_args_buffer, and
+  `_build_dispatch_args(count_source, capacity, divisor)` (1-thread compute list, RD-barriered against
+  the count write and the indirect read). cull Pass B / occlude / emit now `compute_list_dispatch_indirect`.
+- Zero-count correctness: emit pre-zeroes draw_count_buffer (with 0 workgroups its thread 0 never runs,
+  so the count would be stale); cull/occlude already zero their output counts at entry.
+Verified: all cull/occlude/emit/Hi-Z/conservation/alpha-scissor selftests pass unchanged (behavior-
+identical, just fewer threads); neesan live smoke stable on both the software-raster and render() paths,
+coverage unchanged, no validation errors. Benefits BOTH the render() and visbuffer paths (shared culler).
+
 ## Perf findings (2026-07-04, user A/B in real scene) — parked, revisit later
 Correctness DONE: renders correctly incl. MultiMesh flora, no holes. Perf: NO FPS change (1-2 fps).
 Why: (1) the test scene is CPU-bound - `process` (animal AI) ~163ms/frame dominates; the GPU/render

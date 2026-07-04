@@ -78,6 +78,16 @@ MeshletCuller::MeshletCuller() {
 		emit_draws_pipeline = RD::get_singleton()->compute_pipeline_create(emit_draws_shader_rid);
 	}
 
+	{
+		Vector<String> versions;
+		versions.push_back("");
+		dispatch_args_shader.initialize(versions);
+		dispatch_args_shader_version = dispatch_args_shader.version_create();
+		dispatch_args_shader_rid = dispatch_args_shader.version_get_shader(dispatch_args_shader_version, 0);
+		dispatch_args_pipeline = RD::get_singleton()->compute_pipeline_create(dispatch_args_shader_rid);
+		dispatch_args_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t) * 3, Span<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+	}
+
 	hiz_sampler = RD::get_singleton()->sampler_create(RD::SamplerState());
 }
 
@@ -106,11 +116,15 @@ MeshletCuller::~MeshletCuller() {
 	if (draw_count_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(draw_count_buffer);
 	}
+	if (dispatch_args_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(dispatch_args_buffer);
+	}
 	RD::get_singleton()->free_rid(hiz_sampler);
 	expand_shader.version_free(expand_shader_version);
 	cull_shader.version_free(cull_shader_version);
 	occlusion_shader.version_free(occlusion_shader_version);
 	emit_draws_shader.version_free(emit_draws_shader_version);
+	dispatch_args_shader.version_free(dispatch_args_shader_version);
 	singleton = nullptr;
 }
 
@@ -173,6 +187,44 @@ void MeshletCuller::_ensure_command_capacity(uint32_t p_capacity) {
 	uint32_t size_bytes = p_capacity * sizeof(IndirectCommand);
 	command_buffer = RD::get_singleton()->storage_buffer_create(size_bytes, Span<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
 	command_capacity = p_capacity;
+}
+
+void MeshletCuller::_build_dispatch_args(RID p_count_source_buffer, uint32_t p_capacity, uint32_t p_divisor) {
+	LocalVector<RD::Uniform> uniforms;
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = 0;
+		u.append_id(p_count_source_buffer);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = 1;
+		u.append_id(dispatch_args_buffer);
+		uniforms.push_back(u);
+	}
+	RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(dispatch_args_shader_rid, 0, uniforms);
+
+	struct ArgsPushConstant {
+		uint32_t max_count;
+		uint32_t divisor;
+		uint32_t pad0;
+		uint32_t pad1;
+	};
+	ArgsPushConstant pc;
+	pc.max_count = p_capacity;
+	pc.divisor = p_divisor;
+	pc.pad0 = 0;
+	pc.pad1 = 0;
+
+	RD::ComputeListID cl = RD::get_singleton()->compute_list_begin();
+	RD::get_singleton()->compute_list_bind_compute_pipeline(cl, dispatch_args_pipeline);
+	RD::get_singleton()->compute_list_bind_uniform_set(cl, set, 0);
+	RD::get_singleton()->compute_list_set_push_constant(cl, &pc, sizeof(ArgsPushConstant));
+	RD::get_singleton()->compute_list_dispatch(cl, 1, 1, 1);
+	RD::get_singleton()->compute_list_end();
 }
 
 MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vector<InstanceMeshletRange> &p_ranges, const Vector<Plane> &p_frustum_planes, const Vector3 &p_camera_position, uint32_t p_max_work_items, uint32_t p_max_visible, float p_projection_scale, float p_lod_threshold, float p_sw_cluster_px) {
@@ -342,11 +394,16 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 		push_constant.camera_position[2] = p_camera_position.z;
 		push_constant.sw_cluster_px = sw_split ? p_sw_cluster_px : 0.0f;
 
+		// Indirect: dispatch ceil(work_items.count / 64) workgroups (the real expanded count from Pass A),
+		// not the fixed p_max_work_items capacity. work_item_count in the push constant is still the
+		// capacity (the shader clamps its per-thread bounds check against it).
+		_build_dispatch_args(work_items_buffer, p_max_work_items, 64);
+
 		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, cull_pipeline);
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
-		RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_max_work_items, 1, 1);
+		RD::get_singleton()->compute_list_dispatch_indirect(compute_list, dispatch_args_buffer, 0);
 		RD::get_singleton()->compute_list_end();
 	}
 
@@ -454,11 +511,14 @@ MeshletCuller::CullResult MeshletCuller::occlude(RID p_transforms_buffer, const 
 	push_constant.pad1[0] = 0;
 	push_constant.pad1[1] = 0;
 
+	// Indirect: dispatch ceil(frustum survivors / 64), not the fixed capacity.
+	_build_dispatch_args(p_frustum_result.visible_buffer, p_frustum_result.max_visible, 64);
+
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, occlusion_pipeline);
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
 	RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
-	RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_frustum_result.max_visible, 1, 1);
+	RD::get_singleton()->compute_list_dispatch_indirect(compute_list, dispatch_args_buffer, 0);
 	RD::get_singleton()->compute_list_end();
 
 	return result;
@@ -481,6 +541,11 @@ MeshletCuller::IndirectDrawResult MeshletCuller::emit_indirect_draws(const CullR
 		draw_count_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t), Span<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
 	}
 	result.count_buffer = draw_count_buffer;
+
+	// Pre-zero the draw count: with indirect dispatch, a zero visible count means zero workgroups, so
+	// the shader's thread 0 (which writes the count) never runs - without this it would read stale.
+	uint32_t zero = 0;
+	RD::get_singleton()->buffer_update(draw_count_buffer, 0, sizeof(uint32_t), &zero);
 
 	LocalVector<RD::Uniform> uniforms;
 	{
@@ -525,11 +590,14 @@ MeshletCuller::IndirectDrawResult MeshletCuller::emit_indirect_draws(const CullR
 	push_constant.pad0 = 0;
 	push_constant.pad1 = 0;
 
+	// Indirect: dispatch ceil(visible meshlets / 64), not the fixed p_max_draws capacity.
+	_build_dispatch_args(p_result.visible_buffer, p_result.max_visible, 64);
+
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, emit_draws_pipeline);
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
 	RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
-	RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_max_draws, 1, 1);
+	RD::get_singleton()->compute_list_dispatch_indirect(compute_list, dispatch_args_buffer, 0);
 	RD::get_singleton()->compute_list_end();
 
 	return result;
