@@ -211,8 +211,19 @@ OPEN perf items (parked, user said keep in mind):
 STILL TODO (needs the live scene, user A/B):
 - **P5d**: camera-relative projection (P2b/P3/P4/P5a use absolute - fine standalone; revisit for
   large-world precision, matching meshlet_render.glsl).
-- **P5e**: once validated, retire the color render() path + its CULL_BACK/depth-bias hacks; consider the
-  visbuffer moving into RenderSceneBuffers (per-view, resize-managed) vs the current single shared buffer.
+- **P5e (opt-in productionization) — DONE & VERIFIED (2026-07-04).** User chose the clean opt-in over
+  retiring render(): the debug-only `--meshlet-software-raster` cmdline gate is promoted to a project
+  setting `rendering/meshlet/software_raster` (bool, default OFF, restart-to-apply) + a companion
+  `rendering/meshlet/software_raster_cluster_px` (float, default 8.0) for the classifier threshold. The
+  cmdline flag still works as a session override; `--meshlet-swraster-px=N` overrides the threshold.
+  render() stays the DEFAULT path (flag off + setting false = byte-identical to before), so this is safe
+  to push without changing default behavior. Verified: selftest unchanged (1 known center-pixel fail);
+  neesan default run = render() path, no visbuffer, no validation errors; neesan with the *project
+  setting* on (no cmdline flag) = visbuffer engages (coverage ~49.7k), no errors.
+  NOT done (deferred, needs the perf story + gpu-counter fix first): actually retiring render() + the
+  meshlet_renderer.cpp::_ensure_pipeline CULL_BACK/winding/depth-bias workarounds, and visbuffer →
+  RenderSceneBuffers. Those wait until the software path is a proven win and the gpu(render) counter is
+  fixed - making it the always-on default now would pay the sw=0 overhead + break profiling every frame.
 
 ## P0 result (files added)
 - `shaders/meshlet_geometry_inc.glsl` — oct_decode_normal + fetch_triangle_local_vertex.

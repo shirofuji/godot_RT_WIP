@@ -2200,29 +2200,31 @@ static _FORCE_INLINE_ float _meshlet_lod_threshold_px() {
 // readback below. NOTE: with the split ON, small clusters are removed from the hardware draw but the
 // software rasterizer that would draw them doesn't exist yet (P2/P3) - so they visibly vanish. This
 // is a diagnostic-only switch until P5 wires the real, rendered path behind a project setting.
-// P5 live software-raster path (debug gate, default OFF): --meshlet-software-raster routes qualifying
-// meshlet geometry through the visibility-buffer pipeline (classify -> sw compute + hw draw into one
-// visbuffer -> fragment resolve compositing color+depth) INSTEAD of the meshlet color render(). Default
-// off so the game renders exactly as before; flip it on to A/B the software rasterizer. Occlusion is
-// intentionally skipped in this path for now (hidden meshlets just lose the visbuffer atomicMax - the
-// image stays correct, only less perf-optimal; occlusion routing is a later step).
+// Live software-raster path (experimental, default OFF): routes qualifying meshlet geometry through the
+// visibility-buffer pipeline (classify -> sw compute + hw draw into one visbuffer -> fragment resolve
+// compositing color+depth) INSTEAD of the meshlet color render(). Gated by the rendering/meshlet/
+// software_raster project setting, or forced on for a session by --meshlet-software-raster. Default off
+// so the game renders exactly as the direct path. Both lists are occluded against the mid Hi-Z (P5b).
+// Read once at startup (restart-to-apply), so the visbuffer resources are allocated lazily and only when
+// actually used.
 static bool _meshlet_software_raster_enabled() {
-	static bool enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-software-raster") != nullptr;
+	static bool enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-software-raster") != nullptr ||
+			GLOBAL_GET_CACHED(bool, "rendering/meshlet/software_raster");
 	return enabled;
 }
 
 static float _meshlet_sw_cluster_px() {
 	static float threshold = []() {
 		const List<String> &args = OS::get_singleton()->get_cmdline_args();
-		// The cull must split into hw/sw lists whenever either the diagnostic OR the live software-raster
-		// path is active.
-		if (args.find("--meshlet-swraster-diag") == nullptr && args.find("--meshlet-software-raster") == nullptr) {
+		// The cull must split into hw/sw lists whenever either the coverage diagnostic OR the live
+		// software-raster path is active; otherwise no split is needed (threshold 0).
+		if (args.find("--meshlet-swraster-diag") == nullptr && !_meshlet_software_raster_enabled()) {
 			return 0.0f;
 		}
-		float px = 8.0f;
+		float px = (float)GLOBAL_GET_CACHED(double, "rendering/meshlet/software_raster_cluster_px");
 		for (const String &a : args) {
 			if (a.begins_with("--meshlet-swraster-px=")) {
-				px = a.get_slicec('=', 1).to_float();
+				px = a.get_slicec('=', 1).to_float(); // Session override.
 			}
 		}
 		return px;
