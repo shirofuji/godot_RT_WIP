@@ -149,6 +149,25 @@ resolve -> shaded pixel count EQUALS visbuffer coverage exactly, colors in [0,1]
   early-pass depth conflict would no longer occur, but the early pass stays disabled under software
   raster anyway (occlusion is skipped) - harmless.
 
+## Perf findings (2026-07-04, user A/B in real scene) — parked, revisit later
+Correctness DONE: renders correctly incl. MultiMesh flora, no holes. Perf: NO FPS change (1-2 fps).
+Why: (1) the test scene is CPU-bound - `process` (animal AI) ~163ms/frame dominates; the GPU/render
+(cpu-render ~66ms + GPU) runs on the render thread IN PARALLEL and is fully hidden under the AI wall,
+so no GPU change can move FPS. (2) At the default view sw=0 (no subpixel clusters), so the visbuffer
+path is strictly MORE work than render() (raster-into-visbuffer + fullscreen resolve) for zero
+benefit - it can only help where sw>0 (distant/dense geometry). So the feature is correct but can't
+show a win under these conditions (GPU isn't the bottleneck; no subpixel tris).
+OPEN perf items (parked, user said keep in mind):
+- **sw≈0 fallback gate**: when the subpixel fraction is ~0, skip the whole visbuffer path and use the
+  normal render(), skipping the resolve - makes --meshlet-software-raster free when it can't help
+  (removes the 1-2 fps overhead). The right "kicks in only when it helps" productionization.
+- **gpu(render) counter corruption**: with --meshlet-software-raster ON, the perf overlay's gpu-render
+  timestamp reads garbage (~1.78e12 ns; sane ~300 with it off). Measurement artifact only (rendering
+  is correct). My extra GPU passes disrupt the frame's timestamp span read; NOT a RENDER_TIMESTAMP
+  count mismatch (the late pass adds none). Needs a debug iteration to pin; use Nsight/RenderDoc to
+  profile sw>0 meanwhile. Blocks trustworthy in-engine GPU-time profiling of the sw path.
+- Note: the real FPS lever for this scene is the AI (process=163ms), unrelated to this meshlet work.
+
 STILL TODO (needs the live scene, user A/B):
 - **P5b occlusion routing**: occlude BOTH lists before raster (currently skipped in the gated path -
   correct but not perf-optimal). occlude() uses one shared occluded_buffer - needs a 2nd, or occlude
