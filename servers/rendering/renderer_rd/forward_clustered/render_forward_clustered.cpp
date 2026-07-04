@@ -2522,18 +2522,22 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 
 	if (_meshlet_software_raster_enabled()) {
 		// P5 debug path: visibility-buffer software rasterizer instead of the color render(). Rasterize
-		// the small (software) and large (hardware) clusters from *this frame's* frustum result into one
-		// shared visbuffer, then a fragment resolve shades + composites color+depth into the scene
-		// framebuffer. Occlusion (occlusion_result) is intentionally not used here yet - see the gate's
-		// comment. Uses the same projection/camera/shading params the render() path uses just below.
+		// the small (software) and large (hardware) clusters into one shared visbuffer, then a fragment
+		// resolve shades + composites color+depth into the scene framebuffer. Uses the same projection/
+		// camera/shading params the render() path uses just below.
 		MeshletSoftwareRasterizer *sw_rast = MeshletSoftwareRasterizer::get_singleton();
 		if (sw_rast && frustum_result.has_software()) {
-			RendererRD::MeshletCuller::CullResult sw_list;
-			sw_list.visible_buffer = frustum_result.sw_visible_buffer;
-			sw_list.max_visible = frustum_result.sw_max_visible;
-			RendererRD::MeshletCuller::CullResult hw_list;
-			hw_list.visible_buffer = frustum_result.visible_buffer;
-			hw_list.max_visible = frustum_result.max_visible;
+			// P5b: occlude BOTH lists against this frame's mid Hi-Z (built above from the current depth =
+			// non-meshlet scene geometry), so clusters fully hidden behind the scene aren't rastered.
+			// occlusion_result already holds the occluded HARDWARE list (computed above); occlude the
+			// SOFTWARE list into the culler's secondary buffer so it doesn't clobber it. (Meshlet-vs-
+			// meshlet occlusion would additionally need this frame's resolved depth fed back as temporal
+			// Hi-Z - a later refinement; this already culls meshlets behind terrain/other opaque geometry.)
+			RendererRD::MeshletCuller::CullResult sw_frustum;
+			sw_frustum.visible_buffer = frustum_result.sw_visible_buffer;
+			sw_frustum.max_visible = frustum_result.sw_max_visible;
+			RendererRD::MeshletCuller::CullResult sw_list = meshlet_culler->occlude(transforms_buffer, sw_frustum, mid_hiz.texture, mid_hiz.mip_count, camera_transform, projection, screen_size, MESHLET_LIVE_CAPACITY, /*secondary=*/true);
+			RendererRD::MeshletCuller::CullResult hw_list = occlusion_result;
 
 			// Software (small/subpixel) clusters via compute - this call clears the shared visbuffer.
 			sw_rast->rasterize(sw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, false);

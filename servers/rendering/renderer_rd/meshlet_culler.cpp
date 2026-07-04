@@ -97,6 +97,9 @@ MeshletCuller::~MeshletCuller() {
 	if (occluded_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(occluded_buffer);
 	}
+	if (occluded_buffer_2.is_valid()) {
+		RD::get_singleton()->free_rid(occluded_buffer_2);
+	}
 	if (command_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(command_buffer);
 	}
@@ -148,16 +151,16 @@ void MeshletCuller::_ensure_sw_visible_capacity(uint32_t p_capacity) {
 	sw_visible_capacity = p_capacity;
 }
 
-void MeshletCuller::_ensure_occluded_capacity(uint32_t p_capacity) {
-	if (occluded_capacity >= p_capacity) {
+void MeshletCuller::_ensure_buffer_capacity(RID &r_buffer, uint32_t &r_capacity, uint32_t p_capacity) {
+	if (r_capacity >= p_capacity) {
 		return;
 	}
-	if (occluded_buffer.is_valid()) {
-		RD::get_singleton()->free_rid(occluded_buffer);
+	if (r_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(r_buffer);
 	}
 	uint32_t size_bytes = sizeof(uint32_t) + p_capacity * sizeof(uint32_t) * 2;
-	occluded_buffer = RD::get_singleton()->storage_buffer_create(size_bytes);
-	occluded_capacity = p_capacity;
+	r_buffer = RD::get_singleton()->storage_buffer_create(size_bytes);
+	r_capacity = p_capacity;
 }
 
 void MeshletCuller::_ensure_command_capacity(uint32_t p_capacity) {
@@ -369,18 +372,21 @@ static void transform_to_mat4_columns(const Transform3D &p_transform, float r_ou
 	r_out[15] = 1.0f;
 }
 
-MeshletCuller::CullResult MeshletCuller::occlude(RID p_transforms_buffer, const CullResult &p_frustum_result, RID p_hiz_texture, uint32_t p_hiz_mip_count, const Transform3D &p_camera_transform, const Projection &p_projection, const Size2i &p_screen_size, uint32_t p_max_visible) {
+MeshletCuller::CullResult MeshletCuller::occlude(RID p_transforms_buffer, const CullResult &p_frustum_result, RID p_hiz_texture, uint32_t p_hiz_mip_count, const Transform3D &p_camera_transform, const Projection &p_projection, const Size2i &p_screen_size, uint32_t p_max_visible, bool p_secondary) {
 	CullResult result;
 
 	ERR_FAIL_COND_V(!p_frustum_result.is_valid(), result);
 	ERR_FAIL_COND_V(!p_hiz_texture.is_valid() || p_hiz_mip_count == 0, result);
 
-	_ensure_occluded_capacity(p_max_visible);
+	// Select the primary or secondary output so two lists can be occluded in one frame.
+	RID &occ_buffer = p_secondary ? occluded_buffer_2 : occluded_buffer;
+	uint32_t &occ_capacity = p_secondary ? occluded_capacity_2 : occluded_capacity;
+	_ensure_buffer_capacity(occ_buffer, occ_capacity, p_max_visible);
 
 	uint32_t zero = 0;
-	RD::get_singleton()->buffer_update(occluded_buffer, 0, sizeof(uint32_t), &zero);
+	RD::get_singleton()->buffer_update(occ_buffer, 0, sizeof(uint32_t), &zero);
 
-	result.visible_buffer = occluded_buffer;
+	result.visible_buffer = occ_buffer;
 	result.max_visible = p_max_visible;
 
 	// No CPU readback of Pass B's survivor count - dispatch p_frustum_result's full fixed buffer
@@ -415,7 +421,7 @@ MeshletCuller::CullResult MeshletCuller::occlude(RID p_transforms_buffer, const 
 		RD::Uniform u;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		u.binding = 4;
-		u.append_id(occluded_buffer);
+		u.append_id(occ_buffer);
 		uniforms.push_back(u);
 	}
 	RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(occlusion_shader_rid, 0, uniforms);

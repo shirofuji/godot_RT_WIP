@@ -181,10 +181,17 @@ OPEN perf items (parked, user said keep in mind):
   profile sw>0 meanwhile. Blocks trustworthy in-engine GPU-time profiling of the sw path.
 - Note: the real FPS lever for this scene is the AI (process=163ms), unrelated to this meshlet work.
 
+- **P5b occlusion routing — DONE (2026-07-04).** The gated software path now occludes BOTH lists
+  against this frame's mid Hi-Z before rastering. MeshletCuller gained a secondary occluded buffer
+  (`occlude(..., p_secondary=true)`; `_ensure_occluded_capacity` refactored to `_ensure_buffer_capacity`
+  taking refs). Late pass reuses `occlusion_result` (occluded hardware list) + occludes the software
+  list into the secondary buffer, then rasterizes/resolves the occluded lists. Culls clusters behind
+  opaque scene geometry (terrain etc.); meshlet-vs-meshlet occlusion still needs this frame's resolved
+  depth fed back as temporal Hi-Z (later refinement - the early pass that did this for render() is
+  disabled under software raster). Verified: occlusion selftests unchanged; neesan smoke stable,
+  coverage unchanged (test sphere has no occluders).
+
 STILL TODO (needs the live scene, user A/B):
-- **P5b occlusion routing**: occlude BOTH lists before raster (currently skipped in the gated path -
-  correct but not perf-optimal). occlude() uses one shared occluded_buffer - needs a 2nd, or occlude
-  both in one call.
 - **P5d**: camera-relative projection (P2b/P3/P4/P5a use absolute - fine standalone; revisit for
   large-world precision, matching meshlet_render.glsl).
 - **P5e**: once validated, retire the color render() path + its CULL_BACK/depth-bias hacks; consider the

@@ -136,6 +136,9 @@ private:
 	RID occluded_buffer; // occlude()'s own output buffer - distinct from visible_buffer, since
 			// occlude() reads a CullResult (often visible_buffer itself) as input.
 	uint32_t occluded_capacity = 0;
+	RID occluded_buffer_2; // occlude()'s SECONDARY output (p_secondary=true) - lets the caller occlude
+			// two lists (hardware + software) in one frame without the second overwriting the first.
+	uint32_t occluded_capacity_2 = 0;
 	RID command_buffer;
 	uint32_t command_capacity = 0;
 	RID draw_count_buffer; // 4-byte SSBO for vkCmdDrawIndexedIndirectCount.
@@ -143,7 +146,7 @@ private:
 	void _ensure_work_items_capacity(uint32_t p_capacity);
 	void _ensure_visible_capacity(uint32_t p_capacity);
 	void _ensure_sw_visible_capacity(uint32_t p_capacity);
-	void _ensure_occluded_capacity(uint32_t p_capacity);
+	void _ensure_buffer_capacity(RID &r_buffer, uint32_t &r_capacity, uint32_t p_capacity); // grow-and-reuse for occluded buffers.
 	void _ensure_command_capacity(uint32_t p_capacity);
 
 public:
@@ -166,7 +169,9 @@ public:
 	// Tests p_frustum_result's survivors (e.g. from cull() above) against a Hi-Z depth pyramid
 	// (see HiZBuilder) and returns a new, final CullResult. p_camera_transform/p_projection
 	// describe the same camera the Hi-Z texture's source depth was rendered with.
-	CullResult occlude(RID p_transforms_buffer, const CullResult &p_frustum_result, RID p_hiz_texture, uint32_t p_hiz_mip_count, const Transform3D &p_camera_transform, const Projection &p_projection, const Size2i &p_screen_size, uint32_t p_max_visible = 1 << 16);
+	// p_secondary selects a distinct output buffer, so a caller can occlude a hardware list and a
+	// software list against the same Hi-Z in one frame without the second clobbering the first.
+	CullResult occlude(RID p_transforms_buffer, const CullResult &p_frustum_result, RID p_hiz_texture, uint32_t p_hiz_mip_count, const Transform3D &p_camera_transform, const Projection &p_projection, const Size2i &p_screen_size, uint32_t p_max_visible = 1 << 16, bool p_secondary = false);
 
 	// Converts p_result's survivors into an indirect draw command buffer, one command per
 	// surviving meshlet, with each command's index_count set to that specific meshlet's actual
