@@ -135,16 +135,20 @@ public:
 	// Rasterizes the meshlet list in p_list (its visible_buffer / max_visible) into the visbuffer.
 	// p_force_fallback forces the 32-bit path even when int64 is supported (for testing that path on
 	// int64 hardware); otherwise int64 is used whenever supported.
-	void rasterize(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_force_fallback = false);
+	void rasterize(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_force_fallback = false);
 
 	// Hardware raster of p_list's meshlets into the SAME visbuffer (for the large clusters kept on
 	// hardware). p_clear controls whether the visbuffer is cleared first (false to accumulate on top of
 	// a prior software-raster pass into the same buffer). Uses the same visbuffer layout / mode as
 	// rasterize(); pass p_force_fallback consistently across both if mixing.
-	void rasterize_hardware(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_clear = true, bool p_force_fallback = false);
+	void rasterize_hardware(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_clear = true, bool p_force_fallback = false);
 
 	void _ensure_hw_framebuffer(const Size2i &p_screen_size);
 	void _ensure_out_color(const Size2i &p_screen_size);
+	// Appends the alpha-scissor bindings (8: vertex attributes, 9: material ids, 10: materials,
+	// 11: material textures, 12: sampler) that both raster shaders declare - so a cutout material can be
+	// tested at raster time.
+	void _append_alpha_scissor_uniforms(LocalVector<RD::Uniform> &r_uniforms, RID p_material_ids_buffer);
 
 	// Material-resolve pass: reads the current visbuffer (whichever layout the last rasterize()/
 	// rasterize_hardware() wrote), shades each covered pixel via meshlet_shade(), writes the lit color

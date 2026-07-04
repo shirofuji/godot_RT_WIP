@@ -149,6 +149,19 @@ resolve -> shaded pixel count EQUALS visbuffer coverage exactly, colors in [0,1]
   early-pass depth conflict would no longer occur, but the early pass stays disabled under software
   raster anyway (occlusion is skipped) - harmless.
 
+## Post-P5 hardening (2026-07-04)
+- **Alpha-scissor at raster time — DONE & VERIFIED.** A visbuffer stores one surface per pixel, so
+  cutout materials MUST be tested at raster time (not just in the resolve) - else the cutout quad wins
+  the depth and the resolve, discarding it, shows the background instead of the geometry behind the
+  hole. Added meshlet_alpha_test_inc.glsl (`meshlet_alpha_scissor_discard(material_id, uv)`, uses
+  textureLod so it works in the compute stage). Both rasters now sample albedo alpha per covered pixel
+  for scissor materials (flags bit 0) and skip the atomicMax; opaque materials no-op (no sample). Needed
+  new bindings 8-12 on both raster shaders (vertex attrs/uv, material ids, materials, textures[256],
+  sampler) - shared C++ helper `_append_alpha_scissor_uniforms`; rasterize()/rasterize_hardware() gained
+  a `p_material_ids_buffer` arg. Verified: test_meshlet_visbuffer_alpha_scissor - a fully-transparent
+  cutout material writes ~nothing to the visbuffer, opaque covers fully. (The resolve's own alpha-scissor
+  in meshlet_shade is now redundant-but-harmless - scissored fragments never reach it.)
+
 ## Perf findings (2026-07-04, user A/B in real scene) — parked, revisit later
 Correctness DONE: renders correctly incl. MultiMesh flora, no holes. Perf: NO FPS change (1-2 fps).
 Why: (1) the test scene is CPU-bound - `process` (animal AI) ~163ms/frame dominates; the GPU/render

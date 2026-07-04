@@ -1095,6 +1095,12 @@ void test_meshlet_visbuffer_rasterize() {
 	r.meshlet_count = upload.meshlet_range.count;
 	ranges.push_back(r);
 
+	// Default opaque material + per-instance material-id buffer (needed for the raster's alpha-scissor
+	// binding; opaque flags=0 makes the test a no-op).
+	uint32_t material_id = storage->upload_material(RID(), RendererRD::MeshletStorage::MeshletMaterialGPU());
+	RID material_ids_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t));
+	RD::get_singleton()->buffer_update(material_ids_buffer, 0, sizeof(uint32_t), &material_id);
+
 	Transform3D camera_xform(Basis(), Vector3(0, 0, 5));
 	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 0.05f, 20.0f);
 	Projection depth_correction;
@@ -1120,7 +1126,7 @@ void test_meshlet_visbuffer_rasterize() {
 
 	// Int64 path (primary on this GPU).
 	if (rasterizer->is_int64_supported()) {
-		rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, false);
+		rasterizer->rasterize(sw_list, transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, false);
 		check(rasterizer->visbuffer_is_int64_layout(), "Visbuffer(int64): allocated the int64 layout");
 		VisbufferReadback rb = read_visbuffer_int64(rasterizer->get_visbuffer_u64(), W, H, sw_count);
 		check(rb.non_zero > 50, "Visbuffer(int64): rasterizer covered a meaningful number of pixels");
@@ -1129,14 +1135,14 @@ void test_meshlet_visbuffer_rasterize() {
 
 		// Fallback path forced on int64 hardware - must produce the SAME coverage (which pixels get a
 		// fragment is identical; only how the winner is stored differs).
-		rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, true);
+		rasterizer->rasterize(sw_list, transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, true);
 		check(!rasterizer->visbuffer_is_int64_layout(), "Visbuffer(fallback): allocated the 32-bit layout");
 		VisbufferReadback fb = read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, sw_count);
 		check(fb.non_zero > 50, "Visbuffer(fallback): rasterizer covered a meaningful number of pixels");
 		check(fb.payloads_valid, "Visbuffer(fallback): every covered pixel has a valid (slot, triangle) payload");
 		check(fb.non_zero == rb.non_zero, "Visbuffer: fallback path covers exactly the same pixels as the int64 path");
 	} else {
-		rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, false);
+		rasterizer->rasterize(sw_list, transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, false);
 		VisbufferReadback fb = read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, sw_count);
 		check(fb.non_zero > 50, "Visbuffer(fallback-only): rasterizer covered a meaningful number of pixels");
 		check(fb.payloads_valid, "Visbuffer(fallback-only): every covered pixel has a valid (slot, triangle) payload");
@@ -1144,6 +1150,7 @@ void test_meshlet_visbuffer_rasterize() {
 
 	storage->free_mesh_meshlets(upload);
 	RD::get_singleton()->free_rid(transforms_buffer);
+	RD::get_singleton()->free_rid(material_ids_buffer);
 }
 
 // P3: rasterize the hardware worklist into the SAME visbuffer via the side-effect fragment path, and
@@ -1198,6 +1205,10 @@ void test_meshlet_visbuffer_hardware_raster() {
 	Projection projection = depth_correction * raw_projection;
 	Vector<Plane> planes = projection.get_projection_planes(camera_xform);
 
+	uint32_t material_id = storage->upload_material(RID(), RendererRD::MeshletStorage::MeshletMaterialGPU());
+	RID material_ids_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t));
+	RD::get_singleton()->buffer_update(material_ids_buffer, 0, sizeof(uint32_t), &material_id);
+
 	const int W = 128;
 	const int H = 128;
 	bool i64 = rasterizer->is_int64_supported();
@@ -1206,7 +1217,7 @@ void test_meshlet_visbuffer_hardware_raster() {
 	RendererRD::MeshletCuller::CullResult hw_cull = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin, 1 << 16, 1 << 16, 500.0f, 100.0f, 0.0f);
 	uint32_t hw_count = culler->debug_read_visible_count(hw_cull.visible_buffer);
 	check(hw_count > 0, "HW visbuffer: hardware worklist is non-empty");
-	rasterizer->rasterize_hardware(hw_cull, transforms_buffer, Size2i(W, H), projection, camera_xform, true, false);
+	rasterizer->rasterize_hardware(hw_cull, transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, true, false);
 	VisbufferReadback hw_rb = i64
 			? read_visbuffer_int64(rasterizer->get_visbuffer_u64(), W, H, hw_count)
 			: read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, hw_count);
@@ -1220,7 +1231,7 @@ void test_meshlet_visbuffer_hardware_raster() {
 	RendererRD::MeshletCuller::CullResult sw_list;
 	sw_list.visible_buffer = sw_cull.sw_visible_buffer;
 	sw_list.max_visible = sw_cull.sw_max_visible;
-	rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, false);
+	rasterizer->rasterize(sw_list, transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, false);
 	VisbufferReadback sw_rb = i64
 			? read_visbuffer_int64(rasterizer->get_visbuffer_u64(), W, H, sw_count)
 			: read_visbuffer_fallback(rasterizer->get_vis_depth(), rasterizer->get_vis_payload(), W, H, sw_count);
@@ -1231,6 +1242,7 @@ void test_meshlet_visbuffer_hardware_raster() {
 
 	storage->free_mesh_meshlets(upload);
 	RD::get_singleton()->free_rid(transforms_buffer);
+	RD::get_singleton()->free_rid(material_ids_buffer);
 }
 
 // P4: rasterize a mesh into the visbuffer, then run the material-resolve pass and confirm it shades
@@ -1301,7 +1313,7 @@ void test_meshlet_visbuffer_resolve() {
 	RendererRD::MeshletCuller::CullResult sw_list;
 	sw_list.visible_buffer = sw_cull.sw_visible_buffer;
 	sw_list.max_visible = sw_cull.sw_max_visible;
-	rasterizer->rasterize(sw_list, transforms_buffer, Size2i(W, H), projection, camera_xform, false);
+	rasterizer->rasterize(sw_list, transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, false);
 
 	// Resolve: flat ambient, no lights/SVOGI/sky/textures.
 	rasterizer->resolve(sw_list, RendererRD::MeshletCuller::CullResult(), transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, lights_buffer, 0, Color(0.4f, 0.4f, 0.4f), 0.0f, RID(), Vector3(), 0.0f, 0.0f, RID(), 1.0f, 0.0f);
@@ -1384,6 +1396,92 @@ void test_meshlet_visbuffer_resolve() {
 	RD::get_singleton()->free_rid(lights_buffer);
 }
 
+// Alpha-scissor at raster time: a fully-transparent alpha-scissor material must write ~nothing to the
+// visbuffer (so geometry behind a cutout hole survives), while the same mesh with an opaque material
+// covers it fully. Uses a flat albedo alpha (no texture) so the test needs no texture upload.
+void test_meshlet_visbuffer_alpha_scissor() {
+	RendererRD::MeshletStorage *storage = RendererRD::MeshletStorage::get_singleton();
+	RendererRD::MeshletCuller *culler = RendererRD::MeshletCuller::get_singleton();
+	MeshletSoftwareRasterizer *rasterizer = MeshletSoftwareRasterizer::get_singleton();
+	if (!storage || !culler || !rasterizer) {
+		return;
+	}
+
+	PackedVector3Array vertices;
+	PackedInt32Array indices;
+	get_sphere_geometry(vertices, indices);
+	PackedInt32Array meshlet_vertices;
+	PackedByteArray meshlet_triangles;
+	Vector<SurfaceTool::MeshletBounds> bounds_st;
+	Vector<SurfaceTool::Meshlet> meshlets_st = SurfaceTool::build_meshlets(vertices, indices, 64, 124, 0.5f, meshlet_vertices, meshlet_triangles, bounds_st);
+	Vector<RenderingServerTypes::MeshletInfo> meshlets_info;
+	meshlets_info.resize(meshlets_st.size());
+	memcpy(meshlets_info.ptrw(), meshlets_st.ptr(), sizeof(SurfaceTool::Meshlet) * meshlets_st.size());
+	Vector<RenderingServerTypes::MeshletBoundsInfo> bounds_info;
+	bounds_info.resize(bounds_st.size());
+	memcpy(bounds_info.ptrw(), bounds_st.ptr(), sizeof(SurfaceTool::MeshletBounds) * bounds_st.size());
+	PackedVector3Array normals;
+	normals.resize(vertices.size());
+	for (int i = 0; i < vertices.size(); i++) {
+		normals.write[i] = vertices[i].normalized();
+	}
+	RendererRD::MeshletStorage::UploadResult upload = storage->upload_mesh_meshlets(vertices, normals, PackedVector2Array(), meshlets_info, meshlet_vertices, meshlet_triangles, bounds_info);
+
+	Transform3D instance_transform(Basis(), Vector3(0, 0, 0));
+	LocalVector<float> transforms_data;
+	transforms_data.resize(16);
+	transform_to_mat4_columns(instance_transform, &transforms_data[0]);
+	RID transforms_buffer = RD::get_singleton()->storage_buffer_create(transforms_data.size() * sizeof(float));
+	RD::get_singleton()->buffer_update(transforms_buffer, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
+
+	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> ranges;
+	RendererRD::MeshletCuller::InstanceMeshletRange r;
+	r.instance_index = 0;
+	r.meshlet_offset = upload.meshlet_range.offset;
+	r.meshlet_count = upload.meshlet_range.count;
+	ranges.push_back(r);
+
+	Transform3D camera_xform(Basis(), Vector3(0, 0, 5));
+	Projection raw_projection = Projection::create_perspective(70.0f, 1.0f, 0.05f, 20.0f);
+	Projection depth_correction;
+	depth_correction.set_depth_correction();
+	Projection projection = depth_correction * raw_projection;
+	Vector<Plane> planes = projection.get_projection_planes(camera_xform);
+
+	RendererRD::MeshletCuller::CullResult sw_cull = culler->cull(transforms_buffer, ranges, planes, camera_xform.origin, 1 << 16, 1 << 16, 500.0f, 100.0f, 1.0e9f);
+	RendererRD::MeshletCuller::CullResult sw_list;
+	sw_list.visible_buffer = sw_cull.sw_visible_buffer;
+	sw_list.max_visible = sw_cull.sw_max_visible;
+
+	const int W = 128;
+	const int H = 128;
+
+	// One material slot, re-uploaded between the two rasters (upload_material dedups on the RID, so
+	// RID() maps to the same slot). The per-instance material-id buffer keeps pointing at it.
+	uint32_t slot = storage->upload_material(RID(), RendererRD::MeshletStorage::MeshletMaterialGPU()); // opaque default.
+	RID material_ids_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t));
+	RD::get_singleton()->buffer_update(material_ids_buffer, 0, sizeof(uint32_t), &slot);
+
+	rasterizer->rasterize(sw_list, transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, false);
+	uint32_t cov_opaque = rasterizer->debug_visbuffer_coverage(Size2i(W, H));
+	check(cov_opaque > 50, "Alpha-scissor: opaque reference covers the mesh");
+
+	// Re-upload a fully-transparent alpha-scissor material to the same slot (flags bit 0 + alpha 0 <
+	// threshold 0.5), so every fragment is scissored away.
+	RendererRD::MeshletStorage::MeshletMaterialGPU cut;
+	cut.flags = 1u; // alpha_scissor
+	cut.albedo[3] = 0.0f; // fully transparent
+	cut.alpha_scissor_threshold = 0.5f;
+	storage->upload_material(RID(), cut);
+	rasterizer->rasterize(sw_list, transforms_buffer, material_ids_buffer, Size2i(W, H), projection, camera_xform, false);
+	uint32_t cov_cut = rasterizer->debug_visbuffer_coverage(Size2i(W, H));
+	check(cov_cut * 20 < cov_opaque, "Alpha-scissor: a fully-transparent cutout material writes ~nothing to the visbuffer");
+
+	storage->free_mesh_meshlets(upload);
+	RD::get_singleton()->free_rid(transforms_buffer);
+	RD::get_singleton()->free_rid(material_ids_buffer);
+}
+
 } // namespace
 
 void run_meshlet_selftest_if_requested() {
@@ -1406,6 +1504,7 @@ void run_meshlet_selftest_if_requested() {
 	test_meshlet_visbuffer_rasterize();
 	test_meshlet_visbuffer_hardware_raster();
 	test_meshlet_visbuffer_resolve();
+	test_meshlet_visbuffer_alpha_scissor();
 	if (g_failures == 0) {
 		print_line("MESHLET_SELFTEST: all checks passed");
 	} else {

@@ -236,7 +236,40 @@ void MeshletSoftwareRasterizer::_ensure_visbuffer(const Size2i &p_screen_size, b
 	visbuffer_is_int64 = p_int64;
 }
 
-void MeshletSoftwareRasterizer::rasterize(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_force_fallback) {
+void MeshletSoftwareRasterizer::_append_alpha_scissor_uniforms(LocalVector<RD::Uniform> &r_uniforms, RID p_material_ids_buffer) {
+	RendererRD::MeshletStorage *ms = RendererRD::MeshletStorage::get_singleton();
+	RendererRD::TextureStorage *ts = RendererRD::TextureStorage::get_singleton();
+	RID default_white = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+	auto add_ssbo = [&](uint32_t p_binding, RID p_buffer) {
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = p_binding;
+		u.append_id(p_buffer);
+		r_uniforms.push_back(u);
+	};
+	add_ssbo(8, ms->get_vertex_attribute_buffer_rid());
+	add_ssbo(9, p_material_ids_buffer);
+	add_ssbo(10, ms->get_meshlet_material_buffer_rid());
+	{
+		const Vector<RID> &tex_table = ms->get_material_texture_rids();
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 11;
+		for (uint32_t i = 0; i < RendererRD::MeshletStorage::MAX_MATERIAL_TEXTURES; i++) {
+			u.append_id(i < (uint32_t)tex_table.size() ? tex_table[i] : default_white);
+		}
+		r_uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+		u.binding = 12;
+		u.append_id(resolve_material_sampler);
+		r_uniforms.push_back(u);
+	}
+}
+
+void MeshletSoftwareRasterizer::rasterize(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_force_fallback) {
 	if (!p_list.is_valid()) {
 		return;
 	}
@@ -318,6 +351,7 @@ void MeshletSoftwareRasterizer::rasterize(const RendererRD::MeshletCuller::CullR
 			add_ssbo(6, vis_depth_u32);
 			add_ssbo(7, vis_payload_u32);
 		}
+		_append_alpha_scissor_uniforms(uniforms, p_material_ids_buffer);
 		RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
 
 		Projection view_projection = _meshlet_camera_relative_vp(p_projection, p_camera_transform);
@@ -358,7 +392,7 @@ void MeshletSoftwareRasterizer::_ensure_hw_framebuffer(const Size2i &p_screen_si
 	hw_framebuffer_dims = p_screen_size;
 }
 
-void MeshletSoftwareRasterizer::rasterize_hardware(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_clear, bool p_force_fallback) {
+void MeshletSoftwareRasterizer::rasterize_hardware(const RendererRD::MeshletCuller::CullResult &p_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, bool p_clear, bool p_force_fallback) {
 	if (!p_list.is_valid()) {
 		return;
 	}
@@ -414,6 +448,7 @@ void MeshletSoftwareRasterizer::rasterize_hardware(const RendererRD::MeshletCull
 		add_ssbo(6, vis_depth_u32);
 		add_ssbo(7, vis_payload_u32);
 	}
+	_append_alpha_scissor_uniforms(uniforms, p_material_ids_buffer);
 	RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
 
 	Projection view_projection = _meshlet_camera_relative_vp(p_projection, p_camera_transform);

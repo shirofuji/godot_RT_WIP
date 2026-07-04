@@ -2536,9 +2536,9 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 			hw_list.max_visible = frustum_result.max_visible;
 
 			// Software (small/subpixel) clusters via compute - this call clears the shared visbuffer.
-			sw_rast->rasterize(sw_list, transforms_buffer, screen_size, projection, camera_transform, false);
+			sw_rast->rasterize(sw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, false);
 			// Hardware (large) clusters via a draw - accumulate into the SAME visbuffer (p_clear = false).
-			sw_rast->rasterize_hardware(hw_list, transforms_buffer, screen_size, projection, camera_transform, false, false);
+			sw_rast->rasterize_hardware(hw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, false, false);
 
 			static bool swraster_covdiag = OS::get_singleton()->get_cmdline_args().find("--meshlet-swraster-diag") != nullptr;
 			if (swraster_covdiag) {

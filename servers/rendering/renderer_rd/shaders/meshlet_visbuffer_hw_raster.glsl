@@ -12,6 +12,8 @@
 
 layout(location = 0) out flat uint slot_out;
 layout(location = 1) out flat uint tri_out;
+layout(location = 2) out vec2 uv_out; // For the fragment's alpha-scissor test.
+layout(location = 3) out flat uint material_id_out;
 
 struct VisibleMeshlet {
 	uint instance_index;
@@ -60,6 +62,17 @@ layout(set = 0, binding = 5, std430) restrict readonly buffer VertexPositions {
 }
 vertex_positions;
 
+// Alpha-scissor inputs (bindings 8-9 in the vertex stage; 10-12 material lookup in the fragment).
+layout(set = 0, binding = 8, std430) restrict readonly buffer VertexAttributes {
+	vec4 data[]; // xy = octahedral normal, zw = uv.
+}
+vertex_attributes;
+
+layout(set = 0, binding = 9, std430) restrict readonly buffer InstanceMaterialIds {
+	uint data[];
+}
+instance_material_ids;
+
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection; // Camera-RELATIVE: applied to (world_pos - camera_position).
 	vec3 camera_position;
@@ -91,6 +104,8 @@ void main() {
 	gl_Position = params.view_projection * vec4(world_pos - params.camera_position, 1.0);
 	slot_out = slot;
 	tri_out = local_tri;
+	uv_out = vertex_attributes.data[global_v].zw;
+	material_id_out = instance_material_ids.data[item.instance_index] & 0x7FFFFFFFu;
 }
 
 #[fragment]
@@ -106,6 +121,8 @@ void main() {
 
 layout(location = 0) in flat uint slot_in;
 layout(location = 1) in flat uint tri_in;
+layout(location = 2) in vec2 uv_in;
+layout(location = 3) in flat uint material_id_in;
 
 #ifndef MESHLET_VISBUFFER_FALLBACK
 layout(set = 0, binding = 6, std430) restrict buffer VisBuffer {
@@ -123,6 +140,17 @@ layout(set = 0, binding = 7, std430) restrict buffer VisPayload {
 vis_payload;
 #endif
 
+// Alpha-scissor material lookup (structs + bindings 10-12 shared with the software raster's scheme).
+#include "meshlet_shade_types_inc.glsl"
+
+layout(set = 0, binding = 10, std430) restrict readonly buffer MeshletMaterials {
+	MeshletMaterial data[];
+}
+meshlet_materials;
+
+layout(set = 0, binding = 11) uniform texture2D material_textures[256];
+layout(set = 0, binding = 12) uniform sampler material_sampler;
+
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection; // Camera-relative (must match the vertex stage's block).
 	vec3 camera_position;
@@ -133,10 +161,17 @@ layout(push_constant, std430) uniform Params {
 }
 params;
 
+// meshlet_alpha_scissor_discard() (reads meshlet_materials / material_textures declared above).
+#include "meshlet_alpha_test_inc.glsl"
+
 void main() {
-	// gl_FragCoord.z is the same [0,1] reverse-Z NDC depth the compute rasterizer computes (both use
-	// the same absolute view_projection), so the packed values are directly comparable in the shared
-	// visbuffer. Payload matches meshlet_software_rasterize.glsl: 25-bit slot, 7-bit triangle.
+	// Alpha-scissor cutout: skip the visbuffer write where the material is transparent, so the surface
+	// behind the hole survives (a visbuffer stores one surface per pixel). Opaque materials no-op.
+	if (meshlet_alpha_scissor_discard(material_id_in, uv_in)) {
+		discard;
+	}
+	// gl_FragCoord.z is the reverse-Z NDC depth (camera-relative view_projection), directly comparable
+	// in the shared visbuffer. Payload matches meshlet_software_rasterize.glsl.
 	ivec2 p = ivec2(gl_FragCoord.xy);
 	int pixel_index = p.y * int(params.viewport_width) + p.x;
 	uint z_bits = floatBitsToUint(gl_FragCoord.z);

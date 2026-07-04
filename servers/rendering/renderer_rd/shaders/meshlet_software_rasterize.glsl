@@ -88,6 +88,28 @@ layout(set = 0, binding = 7, std430) restrict buffer VisPayload {
 vis_payload;
 #endif
 
+// Alpha-scissor (cutout) support: material lookup + per-vertex UV, to skip transparent fragments at
+// raster time so the visbuffer keeps the geometry BEHIND a cutout hole (see meshlet_alpha_test_inc.glsl).
+#include "meshlet_shade_types_inc.glsl"
+
+layout(set = 0, binding = 8, std430) restrict readonly buffer VertexAttributes {
+	vec4 data[]; // xy = octahedral normal, zw = uv.
+}
+vertex_attributes;
+
+layout(set = 0, binding = 9, std430) restrict readonly buffer InstanceMaterialIds {
+	uint data[];
+}
+instance_material_ids;
+
+layout(set = 0, binding = 10, std430) restrict readonly buffer MeshletMaterials {
+	MeshletMaterial data[];
+}
+meshlet_materials;
+
+layout(set = 0, binding = 11) uniform texture2D material_textures[256];
+layout(set = 0, binding = 12) uniform sampler material_sampler;
+
 layout(push_constant, std430) uniform Params {
 	mat4 view_projection; // Camera-RELATIVE: applied to (world_pos - camera_position).
 	vec3 camera_position;
@@ -101,6 +123,8 @@ params;
 
 // oct_decode_normal (unused here) + fetch_triangle_local_vertex (reads meshlet_triangles above).
 #include "meshlet_geometry_inc.glsl"
+// meshlet_alpha_scissor_discard() (reads meshlet_materials / material_textures declared above).
+#include "meshlet_alpha_test_inc.glsl"
 
 // Safety net against a large triangle slipping past the per-cluster classifier: skip scan-converting
 // any triangle whose screen bounding box exceeds this many pixels (software raster is only a win for
@@ -145,11 +169,13 @@ void main() {
 	// constant's view_projection comment).
 	uint base = d.triangle_offset + tri * 3u;
 	vec4 clip[3];
+	vec2 uv[3];
 	for (uint c = 0u; c < 3u; c++) {
 		uint local_v = fetch_triangle_local_vertex(base + c);
 		uint global_v = meshlet_vertex_remap.data[d.vertex_remap_offset + local_v];
 		vec3 world_pos = (model * vec4(vertex_positions.data[global_v].xyz, 1.0)).xyz;
 		clip[c] = params.view_projection * vec4(world_pos - params.camera_position, 1.0);
+		uv[c] = vertex_attributes.data[global_v].zw; // For the per-pixel alpha-scissor test below.
 	}
 
 	// Reject if any vertex is behind the camera (w <= 0); a proper near-clip is future work - subpixel
@@ -205,6 +231,11 @@ void main() {
 	// (instance, meshlet) - both raster paths share one visbuffer, so the bit disambiguates.
 	uint payload = (1u << 31) | ((slot & 0xFFFFFFu) << 7) | (tri & 0x7Fu);
 
+	// Alpha-scissor materials must be tested per pixel (below); opaque materials skip it entirely (no
+	// texture sample). material_id's bit 31 is the "owns own depth" flag - strip it.
+	uint material_id = instance_material_ids.data[instance_id] & 0x7FFFFFFFu;
+	bool is_scissor = (meshlet_materials.data[material_id].flags & 1u) != 0u;
+
 	for (int y = min_y; y <= max_y; y++) {
 		for (int x = min_x; x <= max_x; x++) {
 			vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
@@ -215,6 +246,14 @@ void main() {
 			float w2 = (e0.x * (p.y - screen[0].y) - e0.y * (p.x - screen[0].x)) * inv_area;
 			if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) {
 				continue;
+			}
+			if (is_scissor) {
+				// Screen-space (affine) UV is fine for a cutout test on the small triangles the software
+				// path handles. Skip the visbuffer write where the material is transparent.
+				vec2 uv_p = w0 * uv[0] + w1 * uv[1] + w2 * uv[2];
+				if (meshlet_alpha_scissor_discard(material_id, uv_p)) {
+					continue;
+				}
 			}
 			float z = w0 * ndc_z[0] + w1 * ndc_z[1] + w2 * ndc_z[2];
 			int pixel_index = y * int(params.viewport_width) + x;
