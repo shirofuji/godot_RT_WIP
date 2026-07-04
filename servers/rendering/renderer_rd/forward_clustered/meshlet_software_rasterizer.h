@@ -152,6 +152,9 @@ public:
 	RID get_out_color() const { return out_color; }
 	Size2i get_out_color_dims() const { return out_color_dims; }
 
+	// Debug: read back the current visbuffer and count non-zero (covered) pixels. GPU stall - debug only.
+	uint32_t debug_visbuffer_coverage(const Size2i &p_screen_size);
+
 	void _ensure_resolve_raster_pipeline(RD::FramebufferFormatID p_fb_format);
 
 	// Fragment resolve into an existing color+depth framebuffer (live path): shades the visbuffer,

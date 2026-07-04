@@ -108,12 +108,45 @@ bool resolve_visbuffer_pixel(ivec2 pix, ivec2 dims, out vec3 r_color, out float 
 
 	uint material_id = instance_material_ids.data[vm.instance_index] & 0x7FFFFFFFu; // Strip owns-own-depth flag.
 
+	r_depth = uintBitsToFloat(z_bits);
+
+	// Debug visualization modes packed into the top 4 bits of light_count (0 = normal shading):
+	//   1 = coverage (white where the visbuffer has a fragment) - isolates coverage vs shading.
+	//   2 = world normal (rgb = N*0.5+0.5) - shows flipped/back-facing normals.
+	//   3 = per-source-list-slot hash color - shows which meshlets landed where.
+	uint dbg = (params.light_count >> 28) & 0xFu;
+	if (dbg == 1u) {
+		r_color = vec3(1.0);
+		return true;
+	}
+	if (dbg == 2u) {
+		r_color = world_normal * 0.5 + 0.5;
+		return true;
+	}
+	if (dbg == 3u) {
+		float s = float(slot);
+		r_color = vec3(fract(s * 0.6180340), fract(s * 0.3541961), fract(s * 0.8017094));
+		return true;
+	}
+	if (dbg == 4u) {
+		// Depth as grayscale (reverse-Z: near = bright, far = dark). Shows if the winning surface's
+		// depth looks right, and reveals depth banding.
+		r_color = vec3(uintBitsToFloat(z_bits));
+		return true;
+	}
+	if (dbg == 5u) {
+		// Front/back facing of the WINNING surface: green = normal toward camera (correct front), red =
+		// away (a back face won the depth test). Patchy red = the atomicMax kept the wrong surface there.
+		vec3 vdir = normalize(params.camera_position - world_pos);
+		r_color = (dot(world_normal, vdir) >= 0.0) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+		return true;
+	}
+
 	bool do_discard = false;
-	vec4 shaded = meshlet_shade(material_id, world_normal, world_pos, tex_uv, params.camera_position, params.ambient_color, params.svogi_bounds, params.svogi_params, params.light_count, dpdx, dpdy, duvdx, duvdy, do_discard);
+	vec4 shaded = meshlet_shade(material_id, world_normal, world_pos, tex_uv, params.camera_position, params.ambient_color, params.svogi_bounds, params.svogi_params, params.light_count & 0x0FFFFFFFu, dpdx, dpdy, duvdx, duvdy, do_discard);
 	if (do_discard) {
 		return false; // Alpha-scissor cutout.
 	}
 	r_color = shaded.rgb;
-	r_depth = uintBitsToFloat(z_bits);
 	return true;
 }

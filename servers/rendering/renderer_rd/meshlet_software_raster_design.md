@@ -110,6 +110,32 @@ resolve -> shaded pixel count EQUALS visbuffer coverage exactly, colors in [0,1]
   NB: resolve_raster assumes p_color_only_framebuffer has exactly 1 color attachment + depth (same as
   render()'s pipeline) - holds for the common Forward+ opaque target.
 
+- **P5c HOLES — REAL FIX = backface cull (2026-07-04, confirmed clean by user).** The holes were
+  BACK FACES winning the visbuffer depth in patches. The rasterizers ran with NO cull ("atomicMax
+  keeps nearest") - but with both front+back faces written, a back face won in blocky patches and
+  shaded as the dark mesh interior -> looked like holes. Debug proof: `--meshlet-visbuffer-debug=1`
+  (coverage) = solid disc (coverage 100%), `=2` (normals) = smooth gradient with blocky WRONG-facing
+  patches. Fix: cull back faces like render() does - `POLYGON_CULL_BACK` on the hardware raster
+  pipeline + a signed-area test in the software shader (front = positive area in y-down screen space;
+  cull <= 0). Coverage unchanged after (49,676, so it culled back not front). Debug viz modes kept
+  (packed into light_count top 4 bits; --meshlet-visbuffer-debug=N: 1 coverage, 2 normal, 3 slot-hash,
+  4 depth-gray, 5 front/back-facing). `--meshlet-swraster-diag` also prints MESHLET_VISBUFFER_COV
+  (covered px). SOFTWARE-path cull sign not yet visually confirmed (coverage can't tell front-cull
+  from back-cull for a sphere - both project to the disc); if px=1e9 looks inverted, flip the sw
+  `<= 0` to `>= 0`.
+- **P5c depth-conflict fix (2026-07-04, also needed):** first live A/B showed the mesh full of holes (sw=0 = all hardware,
+  so it was the hw path). Cause: the meshlet EARLY depth pass writes meshlet depth with camera-relative
+  projection; the visbuffer resolve writes gl_FragDepth with absolute projection; resolve_raster's
+  GREATER_OR_EQUAL test against that early depth fails on ~half the covered pixels (float precision
+  gap) -> they keep the background -> holes. (The P5a selftest passed because it used p_clear=true =
+  test against far; the live path uses p_clear=false = composite.) Fix: `_meshlet_early_pass_should_engage`
+  returns false when --meshlet-software-raster is on, so plain INSTANCE_MESH meshlets (already skipped
+  from the Forward+ depth pre-pass by the per-surface filter) have NO pre-existing depth -> resolve
+  always wins against the far-cleared background, exactly like the normal render() path. NB: MULTIMESH
+  meshlets still stay in the depth pre-pass (bit-31 clear + depth-bias band-aid), so flora could still
+  show holes under software raster - handle by also skipping multimesh from the pre-pass when the gate
+  is on (follow-up; test scene is plain meshes). Real fix for both = P5d camera-relative projection.
+
 STILL TODO (needs the live scene, user A/B):
 - **P5b occlusion routing**: occlude BOTH lists before raster (currently skipped in the gated path -
   correct but not perf-optimal). occlude() uses one shared occluded_buffer - needs a 2nd, or occlude

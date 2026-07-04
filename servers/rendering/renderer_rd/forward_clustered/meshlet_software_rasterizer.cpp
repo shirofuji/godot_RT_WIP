@@ -3,6 +3,7 @@
 /**************************************************************************/
 
 #include "meshlet_software_rasterizer.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
@@ -65,7 +66,13 @@ MeshletSoftwareRasterizer::MeshletSoftwareRasterizer() {
 
 	hw_framebuffer_format = RD::get_singleton()->framebuffer_format_create_empty();
 
-	RD::PipelineRasterizationState hw_rs; // No cull (POLYGON_CULL_DISABLED default) - atomicMax picks nearest.
+	RD::PipelineRasterizationState hw_rs;
+	// CULL_BACK, matching MeshletRenderer::render()'s pipeline. Originally POLYGON_CULL_DISABLED on the
+	// theory that atomicMax would just keep the nearest of the front+back faces - but in practice
+	// keeping back faces let a back face win the depth in patches (confirmed: full visbuffer coverage
+	// but blocky wrong-facing normals), showing the dark mesh interior as "holes". Culling back faces
+	// (as the working color path does) leaves only front surfaces in the visbuffer.
+	hw_rs.cull_mode = RD::POLYGON_CULL_BACK;
 	RD::PipelineDepthStencilState hw_ds; // Depth test off (default) - the atomicMax IS the depth test.
 	RD::PipelineColorBlendState hw_blend = RD::PipelineColorBlendState::create_disabled(0); // Zero color attachments.
 	hw_raster_pipeline_fallback = RD::get_singleton()->render_pipeline_create(hw_raster_shader.version_get_shader(hw_raster_shader_version, 1), hw_framebuffer_format, hw_vertex_format, RD::RENDER_PRIMITIVE_TRIANGLES, hw_rs, RD::PipelineMultisampleState(), hw_ds, hw_blend);
@@ -567,6 +574,38 @@ void MeshletSoftwareRasterizer::resolve(const RendererRD::MeshletCuller::CullRes
 	RD::get_singleton()->compute_list_end();
 }
 
+uint32_t MeshletSoftwareRasterizer::debug_visbuffer_coverage(const Size2i &p_screen_size) {
+	uint32_t pixel_count = (uint32_t)(p_screen_size.x * p_screen_size.y);
+	if (pixel_count == 0) {
+		return 0;
+	}
+	uint32_t covered = 0;
+	if (visbuffer_is_int64) {
+		if (visbuffer_u64.is_null()) {
+			return 0;
+		}
+		Vector<uint8_t> bytes = RD::get_singleton()->buffer_get_data(visbuffer_u64, 0, pixel_count * sizeof(uint64_t));
+		const uint64_t *v = (const uint64_t *)bytes.ptr();
+		for (uint32_t i = 0; i < pixel_count; i++) {
+			if (v[i] != 0) {
+				covered++;
+			}
+		}
+	} else {
+		if (vis_depth_u32.is_null()) {
+			return 0;
+		}
+		Vector<uint8_t> bytes = RD::get_singleton()->buffer_get_data(vis_depth_u32, 0, pixel_count * sizeof(uint32_t));
+		const uint32_t *v = (const uint32_t *)bytes.ptr();
+		for (uint32_t i = 0; i < pixel_count; i++) {
+			if (v[i] != 0) {
+				covered++;
+			}
+		}
+	}
+	return covered;
+}
+
 void MeshletSoftwareRasterizer::_ensure_resolve_raster_pipeline(RD::FramebufferFormatID p_fb_format) {
 	if (resolve_raster_pipeline_format == p_fb_format && resolve_raster_pipeline_fallback.is_valid()) {
 		return;
@@ -695,7 +734,17 @@ void MeshletSoftwareRasterizer::resolve_raster(RID p_target_framebuffer, const R
 	pc.camera_position[0] = p_camera_transform.origin.x;
 	pc.camera_position[1] = p_camera_transform.origin.y;
 	pc.camera_position[2] = p_camera_transform.origin.z;
-	pc.light_count = p_light_count;
+	// Debug visualization mode from --meshlet-visbuffer-debug=N, packed into the top 4 bits of
+	// light_count (0 = normal shading; see meshlet_visbuffer_resolve_inc.glsl for the modes).
+	static uint32_t dbg_mode = []() {
+		for (const String &a : OS::get_singleton()->get_cmdline_args()) {
+			if (a.begins_with("--meshlet-visbuffer-debug=")) {
+				return (uint32_t)CLAMP(a.get_slicec('=', 1).to_int(), 0, 15);
+			}
+		}
+		return (uint32_t)0;
+	}();
+	pc.light_count = (p_light_count & 0x0FFFFFFFu) | (dbg_mode << 28);
 	pc.ambient_color[0] = p_ambient_color.r;
 	pc.ambient_color[1] = p_ambient_color.g;
 	pc.ambient_color[2] = p_ambient_color.b;

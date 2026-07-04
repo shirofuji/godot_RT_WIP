@@ -2282,6 +2282,15 @@ bool RenderForwardClustered::_meshlet_early_pass_should_engage(Ref<RenderSceneBu
 	if (p_is_reflection_probe) {
 		return false;
 	}
+	// P5: the visibility-buffer software-raster path owns meshlet depth entirely (the fragment resolve
+	// writes gl_FragDepth). The early pass writes meshlet depth with a *camera-relative* projection,
+	// but the visbuffer path uses *absolute* projection - the float-precision gap between the two makes
+	// the resolve's GREATER_OR_EQUAL depth test fail on ~half the covered pixels (they keep the
+	// background), i.e. holes in the mesh. Skip the early pass when software raster is on so the depth
+	// buffer stays clear at meshlet pixels and the resolve always wins.
+	if (_meshlet_software_raster_enabled()) {
+		return false;
+	}
 	if (!meshlet_replace_default_active || meshlet_scan_ranges.is_empty()) {
 		return false;
 	}
@@ -2530,6 +2539,12 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 			sw_rast->rasterize(sw_list, transforms_buffer, screen_size, projection, camera_transform, false);
 			// Hardware (large) clusters via a draw - accumulate into the SAME visbuffer (p_clear = false).
 			sw_rast->rasterize_hardware(hw_list, transforms_buffer, screen_size, projection, camera_transform, false, false);
+
+			static bool swraster_covdiag = OS::get_singleton()->get_cmdline_args().find("--meshlet-swraster-diag") != nullptr;
+			if (swraster_covdiag) {
+				uint32_t covered = sw_rast->debug_visbuffer_coverage(screen_size);
+				print_line(vformat("MESHLET_VISBUFFER_COV: covered_px=%d of %d (%.1f%%)", (int)covered, (int)(screen_size.x * screen_size.y), 100.0 * covered / MAX(1, screen_size.x * screen_size.y)));
+			}
 			// Resolve: shade every covered pixel and composite color + gl_FragDepth into the scene's
 			// color-only framebuffer (p_clear = false - the opaque pass already filled it).
 			sw_rast->resolve_raster(p_color_only_framebuffer, sw_list, hw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, lights_buffer, (uint32_t)lights.size(), meshlet_ambient_color, meshlet_sky_ambient_mix, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_radiance_exposure, meshlet_max_roughness_lod, false);

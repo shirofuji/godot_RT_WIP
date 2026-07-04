@@ -163,9 +163,15 @@ void main() {
 		ndc_z[c] = ndc.z;
 	}
 
-	// No backface cull: atomicMax keeps the nearest surface deterministically, so rendering both
-	// windings is Z-fight-free and correct for closed meshes (the front face is nearer and wins).
-	// Matching the hardware path's CULL_BACK exactly is a P5 consistency concern, not needed here.
+	// Backface cull, matching the hardware raster's CULL_BACK (+ Godot's default clockwise front face).
+	// Keeping back faces let a back face win the depth in patches (dark mesh interior read as holes) -
+	// see the hardware pipeline's cull comment. In screen space (y-down, post Y-flip), a front-facing
+	// triangle has a positive signed area; cull when it's <= 0.
+	float signed_area = (screen[1].x - screen[0].x) * (screen[2].y - screen[0].y) - (screen[1].y - screen[0].y) * (screen[2].x - screen[0].x);
+	if (signed_area <= 0.0) {
+		return;
+	}
+
 	vec2 lo = min(min(screen[0], screen[1]), screen[2]);
 	vec2 hi = max(max(screen[0], screen[1]), screen[2]);
 	int min_x = max(0, int(floor(lo.x)));
