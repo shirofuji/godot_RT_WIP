@@ -89,11 +89,13 @@ vis_payload;
 #endif
 
 layout(push_constant, std430) uniform Params {
-	mat4 view_projection;
+	mat4 view_projection; // Camera-RELATIVE: applied to (world_pos - camera_position).
+	vec3 camera_position;
 	uint viewport_width;
 	uint viewport_height;
 	uint max_visible; // Cap for visible_meshlets.count (buffer capacity - the count is an atomic that can overrun it).
-	uint pad;
+	uint pad0;
+	uint pad1;
 }
 params;
 
@@ -137,15 +139,17 @@ void main() {
 	}
 
 	mat4 model = transforms.data[instance_id];
-	mat4 mvp = params.view_projection * model;
 
 	// Fetch this triangle's three vertices (triangle-local index -> meshlet vertex remap -> global).
+	// Camera-relative: transform to absolute world, subtract the camera, then project (see the push
+	// constant's view_projection comment).
 	uint base = d.triangle_offset + tri * 3u;
 	vec4 clip[3];
 	for (uint c = 0u; c < 3u; c++) {
 		uint local_v = fetch_triangle_local_vertex(base + c);
 		uint global_v = meshlet_vertex_remap.data[d.vertex_remap_offset + local_v];
-		clip[c] = mvp * vec4(vertex_positions.data[global_v].xyz, 1.0);
+		vec3 world_pos = (model * vec4(vertex_positions.data[global_v].xyz, 1.0)).xyz;
+		clip[c] = params.view_projection * vec4(world_pos - params.camera_position, 1.0);
 	}
 
 	// Reject if any vertex is behind the camera (w <= 0); a proper near-clip is future work - subpixel

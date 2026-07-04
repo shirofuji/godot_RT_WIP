@@ -136,6 +136,19 @@ resolve -> shaded pixel count EQUALS visbuffer coverage exactly, colors in [0,1]
   show holes under software raster - handle by also skipping multimesh from the pre-pass when the gate
   is on (follow-up; test scene is plain meshes). Real fix for both = P5d camera-relative projection.
 
+- **P5d camera-relative projection — DONE & VERIFIED (2026-07-04).** Switched all three visbuffer
+  rasterizers + the resolve from absolute (`view_projection * world_pos`) to camera-relative
+  (`(projection * rotation-only-inverse-camera) * (world_pos - camera_position)`), matching
+  meshlet_render.glsl/Forward+. Same NDC, small operands -> no float32 cancellation, so no depth
+  flicker for geometry far from the world origin, and the resolve's gl_FragDepth now matches Forward+'s
+  depth convention -> MultiMesh flora (which stays in the depth pre-pass with Forward+ camera-relative
+  depth) composites correctly under software raster too. C++ helper `_meshlet_camera_relative_vp()`
+  used by rasterize/rasterize_hardware/resolve/resolve_raster; camera_position added to the sw (96B)
+  and hw (92B) push constants (resolve already had it). Selftest unchanged (NDC-identical, resolve
+  coverage still == visbuffer coverage exactly); neesan smoke stable. NOTE: with camera-relative the
+  early-pass depth conflict would no longer occur, but the early pass stays disabled under software
+  raster anyway (occlusion is skipped) - harmless.
+
 STILL TODO (needs the live scene, user A/B):
 - **P5b occlusion routing**: occlude BOTH lists before raster (currently skipped in the gated path -
   correct but not perf-optimal). occlude() uses one shared occluded_buffer - needs a 2nd, or occlude

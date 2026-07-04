@@ -22,14 +22,16 @@
 // visbuffer (one atomicMax), and a 32-bit fallback (separate depth + payload buffers).
 class MeshletSoftwareRasterizer {
 public:
-	// Must match meshlet_software_rasterize.glsl's Params block exactly (std430): mat4 (64) + 4 uints
-	// (16) = 80 bytes.
+	// Must match meshlet_software_rasterize.glsl's Params block exactly (std430, 96 bytes): mat4 (64) +
+	// vec3 camera_position (12) + viewport_width (fills the vec3's 16-byte slot) + 4 uints.
 	struct RasterizePushConstant {
-		float view_projection_matrix[16];
+		float view_projection_matrix[16]; // Camera-RELATIVE (projection * rotation-only inverse camera).
+		float camera_position[3];
 		uint32_t viewport_width;
 		uint32_t viewport_height;
 		uint32_t max_visible;
-		uint32_t pad;
+		uint32_t pad0;
+		uint32_t pad1;
 	};
 
 	// Must match meshlet_visbuffer_dispatch_args.glsl's Params block (std430): 4 uints (16 bytes).
@@ -40,9 +42,11 @@ public:
 		uint32_t pad2;
 	};
 
-	// Must match meshlet_visbuffer_hw_raster.glsl's Params block (std430): mat4 (64) + 4 uints (16).
+	// Must match meshlet_visbuffer_hw_raster.glsl's Params block (std430, 92 bytes): mat4 (64) +
+	// vec3 camera_position (12) + viewport_width (fills the slot) + viewport_height + 2 pads.
 	struct HwRasterPushConstant {
-		float view_projection_matrix[16];
+		float view_projection_matrix[16]; // Camera-RELATIVE.
+		float camera_position[3];
 		uint32_t viewport_width;
 		uint32_t viewport_height;
 		uint32_t pad0;

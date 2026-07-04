@@ -81,7 +81,10 @@ bool resolve_visbuffer_pixel(ivec2 pix, ivec2 dims, out vec3 r_color, out float 
 		wpos[c] = (model * vec4(lpos.xyz, 1.0)).xyz;
 		wnrm[c] = normalize(normal_matrix * oct_decode_normal(attrib.xy)) * det_sign;
 		uv[c] = attrib.zw;
-		vec4 clip = params.view_projection * vec4(wpos[c], 1.0);
+		// Camera-relative, matching the rasterizers so the reconstructed screen positions align with
+		// where the fragment was actually written (view_projection is projection * rotation-only inverse
+		// camera; world_pos stays absolute for shading).
+		vec4 clip = params.view_projection * vec4(wpos[c] - params.camera_position, 1.0);
 		invw[c] = 1.0 / clip.w;
 		vec3 ndc = clip.xyz * invw[c];
 		screen[c] = (ndc.xy * 0.5 + 0.5) * vec2(dims);

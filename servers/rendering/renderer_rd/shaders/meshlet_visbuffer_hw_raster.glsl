@@ -61,7 +61,8 @@ layout(set = 0, binding = 5, std430) restrict readonly buffer VertexPositions {
 vertex_positions;
 
 layout(push_constant, std430) uniform Params {
-	mat4 view_projection; // Absolute (projection * inverse-camera), matching the compute rasterizer.
+	mat4 view_projection; // Camera-RELATIVE: applied to (world_pos - camera_position).
+	vec3 camera_position;
 	uint viewport_width;
 	uint viewport_height;
 	uint pad0;
@@ -85,7 +86,9 @@ void main() {
 	uint local_v = fetch_triangle_local_vertex(d.triangle_offset + local_tri * 3u + corner);
 	uint global_v = meshlet_vertex_remap.data[d.vertex_remap_offset + local_v];
 
-	gl_Position = params.view_projection * model * vec4(vertex_positions.data[global_v].xyz, 1.0);
+	// Camera-relative (matches the compute rasterizer + resolve): to absolute world, minus camera, project.
+	vec3 world_pos = (model * vec4(vertex_positions.data[global_v].xyz, 1.0)).xyz;
+	gl_Position = params.view_projection * vec4(world_pos - params.camera_position, 1.0);
 	slot_out = slot;
 	tri_out = local_tri;
 }
@@ -121,7 +124,8 @@ vis_payload;
 #endif
 
 layout(push_constant, std430) uniform Params {
-	mat4 view_projection;
+	mat4 view_projection; // Camera-relative (must match the vertex stage's block).
+	vec3 camera_position;
 	uint viewport_width;
 	uint viewport_height;
 	uint pad0;

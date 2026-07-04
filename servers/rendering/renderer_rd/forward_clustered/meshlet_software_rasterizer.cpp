@@ -14,6 +14,16 @@ MeshletSoftwareRasterizer *MeshletSoftwareRasterizer::get_singleton() {
 	return singleton;
 }
 
+// Camera-relative view-projection: projection * the rotation-only inverse camera (translation
+// stripped). The shaders apply this to (world_pos - camera_position), which yields the same NDC as an
+// absolute view_projection * world_pos but keeps every operand small-magnitude, avoiding the float32
+// catastrophic cancellation that made distant geometry's depth flicker. Matches meshlet_render.glsl.
+static Projection _meshlet_camera_relative_vp(const Projection &p_projection, const Transform3D &p_camera_transform) {
+	Transform3D rot_only = p_camera_transform;
+	rot_only.origin = Vector3();
+	return p_projection * Projection(rot_only.affine_inverse());
+}
+
 MeshletSoftwareRasterizer::MeshletSoftwareRasterizer() {
 	singleton = this;
 
@@ -310,17 +320,21 @@ void MeshletSoftwareRasterizer::rasterize(const RendererRD::MeshletCuller::CullR
 		}
 		RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
 
-		Projection view_projection = p_projection * Projection(p_camera_transform.affine_inverse());
+		Projection view_projection = _meshlet_camera_relative_vp(p_projection, p_camera_transform);
 		RasterizePushConstant pc;
 		for (int col = 0; col < 4; col++) {
 			for (int row = 0; row < 4; row++) {
 				pc.view_projection_matrix[col * 4 + row] = view_projection.columns[col][row];
 			}
 		}
+		pc.camera_position[0] = p_camera_transform.origin.x;
+		pc.camera_position[1] = p_camera_transform.origin.y;
+		pc.camera_position[2] = p_camera_transform.origin.z;
 		pc.viewport_width = (uint32_t)p_screen_size.x;
 		pc.viewport_height = (uint32_t)p_screen_size.y;
 		pc.max_visible = p_list.max_visible;
-		pc.pad = 0;
+		pc.pad0 = 0;
+		pc.pad1 = 0;
 
 		RD::ComputeListID cl = RD::get_singleton()->compute_list_begin();
 		RD::get_singleton()->compute_list_bind_compute_pipeline(cl, use_int64 ? rasterize_pipeline_int64 : rasterize_pipeline_fallback);
@@ -402,13 +416,16 @@ void MeshletSoftwareRasterizer::rasterize_hardware(const RendererRD::MeshletCull
 	}
 	RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
 
-	Projection view_projection = p_projection * Projection(p_camera_transform.affine_inverse());
+	Projection view_projection = _meshlet_camera_relative_vp(p_projection, p_camera_transform);
 	HwRasterPushConstant pc;
 	for (int col = 0; col < 4; col++) {
 		for (int row = 0; row < 4; row++) {
 			pc.view_projection_matrix[col * 4 + row] = view_projection.columns[col][row];
 		}
 	}
+	pc.camera_position[0] = p_camera_transform.origin.x;
+	pc.camera_position[1] = p_camera_transform.origin.y;
+	pc.camera_position[2] = p_camera_transform.origin.z;
 	pc.viewport_width = (uint32_t)p_screen_size.x;
 	pc.viewport_height = (uint32_t)p_screen_size.y;
 	pc.pad0 = 0;
@@ -541,7 +558,7 @@ void MeshletSoftwareRasterizer::resolve(const RendererRD::MeshletCuller::CullRes
 	RID shader_rid = resolve_shader.version_get_shader(resolve_shader_version, use_int64 ? 0 : 1);
 	RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
 
-	Projection view_projection = p_projection * Projection(p_camera_transform.affine_inverse());
+	Projection view_projection = _meshlet_camera_relative_vp(p_projection, p_camera_transform);
 	ResolvePushConstant pc;
 	for (int col = 0; col < 4; col++) {
 		for (int row = 0; row < 4; row++) {
@@ -724,7 +741,7 @@ void MeshletSoftwareRasterizer::resolve_raster(RID p_target_framebuffer, const R
 	RID shader_rid = resolve_raster_shader.version_get_shader(resolve_raster_shader_version, use_int64 ? 0 : 1);
 	RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
 
-	Projection view_projection = p_projection * Projection(p_camera_transform.affine_inverse());
+	Projection view_projection = _meshlet_camera_relative_vp(p_projection, p_camera_transform);
 	ResolvePushConstant pc;
 	for (int col = 0; col < 4; col++) {
 		for (int row = 0; row < 4; row++) {
