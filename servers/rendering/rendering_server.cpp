@@ -3989,6 +3989,19 @@ void RenderingServer::init() {
 	// Default off until the terrain draw pass is complete (collection alone is a visible no-op).
 	GLOBAL_DEF_RST("rendering/meshlet/terrain_lod", false);
 
+	// Visibility-buffer software rasterizer (experimental, default OFF): routes qualifying meshlet
+	// geometry through a Nanite-style visbuffer pipeline (classify -> software compute + hardware draw
+	// into one visibility buffer -> fragment resolve compositing color+depth) instead of the meshlet
+	// color render(). Off by default so the game renders exactly as the direct path; enable to use the
+	// deferred visbuffer path (helps only where clusters go subpixel - distant/dense geometry - and does
+	// not move FPS when the frame is CPU-bound). The --meshlet-software-raster command-line flag forces
+	// it on for a session regardless of this setting. Restart-to-apply (read once at startup).
+	GLOBAL_DEF_RST("rendering/meshlet/software_raster", false);
+	// Cluster screen-size threshold (pixels) for the software raster's classifier: clusters that project
+	// smaller than this go to the software compute rasterizer, larger ones to the hardware draw. Only
+	// used when the software raster path is enabled. --meshlet-swraster-px=N overrides it for a session.
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/meshlet/software_raster_cluster_px", PROPERTY_HINT_RANGE, "0,64,0.5"), 8.0);
+
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);
 

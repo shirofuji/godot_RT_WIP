@@ -371,6 +371,13 @@ public:
 	virtual void soft_body_apply_central_impulse(RID p_body, const Vector3 &p_impulse) override {}
 	virtual void soft_body_apply_central_force(RID p_body, const Vector3 &p_force) override {}
 
+	/* MESHLET COLLIDER API */
+
+	virtual RID meshlet_collider_create() override { return RID(); }
+	virtual void meshlet_collider_set_data(RID p_collider, RID p_mesh, const Transform3D &p_transform = Transform3D()) override {}
+	virtual void meshlet_collider_set_transform(RID p_collider, const Transform3D &p_transform) override {}
+	virtual void meshlet_collider_clear(RID p_collider) override {}
+
 	/* JOINT API */
 
 	virtual RID joint_create() override { return RID(); }

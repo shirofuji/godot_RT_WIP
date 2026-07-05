@@ -273,6 +273,7 @@ public:
 	RID get_meshlet_triangle_buffer_rid() const { return meshlet_triangle_buffer.rid; }
 	RID get_meshlet_descriptor_buffer_rid() const { return meshlet_descriptor_buffer.rid; }
 	RID get_meshlet_lod_buffer_rid() const { return meshlet_lod_buffer.rid; }
+	uint32_t get_meshlet_capacity() const { return meshlet_allocator.get_capacity(); }
 
 	// Read-back helpers (stall the GPU - test/debug use only, never call these per-frame).
 	MeshletDescriptorGPU debug_get_meshlet_descriptor(uint32_t p_global_meshlet_index) const;

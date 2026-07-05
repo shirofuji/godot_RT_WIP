@@ -1586,7 +1586,22 @@ float RendererViewport::viewport_get_measured_render_time_gpu(RID p_viewport) co
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL_V(viewport, 0);
 
-	return double((viewport->time_gpu_end - viewport->time_gpu_begin) / 1000) / 1000.0;
+	// time_gpu_begin/end are absolute GPU timestamps resolved from the query pool. Unlike the
+	// CPU timestamps (captured in monotonic submission order), a GPU query slot can read back
+	// stale or unavailable (0) when work is reordered - e.g. extra compute/raster passes leaving
+	// the vp_begin slot unwritten. A raw unsigned subtraction then yields the absolute end
+	// timestamp (~1.78e18 ns) instead of a frame span, showing up as ~1.78e12 ms of garbage.
+	// Only accept a physically-plausible span; otherwise keep reporting the last good reading.
+	if (viewport->time_gpu_end > viewport->time_gpu_begin) {
+		const uint64_t span_ns = viewport->time_gpu_end - viewport->time_gpu_begin;
+		// No single viewport realistically spends >10s of GPU time in one frame; anything larger
+		// is a corrupted/stale timestamp, not a real measurement.
+		if (span_ns < 10000000000ULL) {
+			viewport->time_gpu_measured = double(span_ns / 1000) / 1000.0;
+		}
+	}
+
+	return viewport->time_gpu_measured;
 }
 
 void RendererViewport::viewport_set_snap_2d_transforms_to_pixel(RID p_viewport, bool p_enabled) {

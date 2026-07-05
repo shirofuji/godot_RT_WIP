@@ -33,6 +33,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
+#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 
 using namespace RendererRD;
 
@@ -288,7 +289,7 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 	if (p_visible.is_valid() && p_draws.is_valid() && p_draws.max_draw_count > 0) {
 		MeshletStorage *storage = MeshletStorage::get_singleton();
 
-		Vector<RD::Uniform> uniforms;
+		LocalVector<RD::Uniform> uniforms;
 		{
 			RD::Uniform u;
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
@@ -437,7 +438,13 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			uniforms.push_back(usmat);
 		}
 		RID render_shader_rid_to_use = p_depth_only ? depth_only_shader_rid : (use_virtual_textures ? vt_shader_rid : render_shader_rid);
-		RID uniform_set = RD::get_singleton()->uniform_set_create(uniforms, render_shader_rid_to_use, 0);
+		// Cached across frames (keyed by the shader + bound resource RIDs) rather than created+freed every
+		// frame: the meshlet storage/visibility/transform buffers are persistent (grow-and-reuse), so
+		// this cache-hits in steady state, avoiding a ~15-binding descriptor-set allocation (including
+		// the MAX_MATERIAL_TEXTURES array at binding 13) plus a free on every draw. The cache auto-
+		// invalidates the entry if any bound buffer is freed. Keying by render_shader_rid_to_use keeps
+		// the VT and non-VT shader variants in separate cache entries.
+		RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(render_shader_rid_to_use, 0, uniforms);
 
 		// Matches meshlet_render.glsl's Params push-constant block exactly (128 bytes). The same
 		// block is declared (outside any MESHLET_DEPTH_ONLY guard) by both the color and depth-only
@@ -498,8 +505,6 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, sizeof(push_constant));
 		RD::get_singleton()->draw_list_set_viewport(draw_list, Rect2(p_viewport));
 		RD::get_singleton()->draw_list_draw_indirect_count(draw_list, true, p_draws.command_buffer, 0, p_draws.count_buffer, 0, p_draws.max_draw_count, sizeof(MeshletCuller::IndirectCommand));
-
-		RD::get_singleton()->free_rid(uniform_set);
 	}
 
 	RD::get_singleton()->draw_list_end();

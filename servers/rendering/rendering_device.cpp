@@ -8180,16 +8180,26 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 		download_staging_buffers.used = false;
 	}
 
-	if (frames[frame].timestamp_count) {
-		driver->timestamp_query_pool_get_results(frames[frame].timestamp_pool, frames[frame].timestamp_count, frames[frame].timestamp_result_values.ptr());
-		driver->command_timestamp_query_pool_reset(frames[frame].command_buffer, frames[frame].timestamp_pool, frames[frame].timestamp_count);
-		SWAP(frames[frame].timestamp_names, frames[frame].timestamp_result_names);
-		SWAP(frames[frame].timestamp_cpu_values, frames[frame].timestamp_cpu_result_values);
-	}
+	// Only roll the captured-timestamp buffer over at a real presented frame boundary. A
+	// mid-frame stall (_flush_and_stall_for_all_frames, e.g. a synchronous buffer/texture
+	// readback) also runs _begin_frame, but with p_presented == false: rolling over there
+	// would discard every timestamp captured earlier in the display frame (including
+	// "vp_begin"), leaving only the ones captured after the stall. That corrupts per-viewport
+	// CPU/GPU render-time spans (a lost vp_begin reads back as 0, so the GPU span becomes an
+	// absolute timestamp of ~1.78e12 ms). Timestamps written before the stall persist in the
+	// query pool across the submit, so accumulating them until the real frame end is safe.
+	if (p_presented) {
+		if (frames[frame].timestamp_count) {
+			driver->timestamp_query_pool_get_results(frames[frame].timestamp_pool, frames[frame].timestamp_count, frames[frame].timestamp_result_values.ptr());
+			driver->command_timestamp_query_pool_reset(frames[frame].command_buffer, frames[frame].timestamp_pool, frames[frame].timestamp_count);
+			SWAP(frames[frame].timestamp_names, frames[frame].timestamp_result_names);
+			SWAP(frames[frame].timestamp_cpu_values, frames[frame].timestamp_cpu_result_values);
+		}
 
-	frames[frame].timestamp_result_count = frames[frame].timestamp_count;
-	frames[frame].timestamp_count = 0;
-	frames[frame].index = Engine::get_singleton()->get_frames_drawn();
+		frames[frame].timestamp_result_count = frames[frame].timestamp_count;
+		frames[frame].timestamp_count = 0;
+		frames[frame].index = Engine::get_singleton()->get_frames_drawn();
+	}
 }
 
 void RenderingDevice::_end_frame() {

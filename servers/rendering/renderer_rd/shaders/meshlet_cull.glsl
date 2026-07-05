@@ -13,7 +13,7 @@ layout(push_constant, std430) uniform Params {
 	float lod_threshold; // Max acceptable screen-space cluster error, in pixels. <=0 projection_scale = LOD cut off (leaf-only).
 	vec4 planes[6]; // xyz = normal, w = d; matches core/math/Plane: distance_to(p) = dot(normal,p) - d.
 	vec3 camera_position;
-	float pad2;
+	float sw_cluster_px; // HW/SW raster split: cluster whose projected radius < this -> software list. <=0 disables split. (was pad2)
 }
 params;
 
@@ -79,6 +79,15 @@ layout(set = 0, binding = 4, std430) restrict readonly buffer MeshletLODs {
 	MeshletLOD data[];
 }
 meshlet_lods;
+
+// Software-raster visible list (small/subpixel clusters). Same layout as visible_meshlets. When the
+// HW/SW split is disabled (params.sw_cluster_px <= 0) nothing is written here, but a valid 1-element
+// buffer is still bound so this declaration always resolves.
+layout(set = 0, binding = 5, std430) restrict buffer SoftwareVisibleMeshlets {
+	uint count;
+	VisibleMeshlet data[];
+}
+software_visible_meshlets;
 
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
@@ -182,9 +191,32 @@ void main() {
 		}
 	}
 
-	uint slot = atomicAdd(visible_meshlets.count, 1);
-	if (slot < params.max_visible) {
-		visible_meshlets.data[slot].instance_index = item.instance_index;
-		visible_meshlets.data[slot].meshlet_index = item.meshlet_index;
+	// Hardware/software raster classification by projected screen size. The cluster's world bounding
+	// sphere (world_center, world_radius) projects to ~ world_radius * projection_scale / dist pixels
+	// of radius; small clusters (subpixel-ish triangles) go to the compute rasterizer's software list,
+	// larger ones stay on hardware. sw_cluster_px <= 0 (or no projection info) disables the split, so
+	// everything lands in the hardware list exactly as before - the default until the visibility-buffer
+	// software path is wired up. `dist` is the camera->world_center distance computed above.
+	bool to_software = false;
+	if (params.sw_cluster_px > 0.0 && params.projection_scale > 0.0 && dist > 0.0001) {
+		float screen_radius_px = world_radius * params.projection_scale / dist;
+		to_software = screen_radius_px < params.sw_cluster_px;
+	}
+
+	if (to_software) {
+		// Bounded by max_visible: the software list shares the hardware list's capacity (the caller
+		// sizes both to the same MESHLET_LIVE_CAPACITY when the split is on), so no separate bound is
+		// pushed - keeps this push constant at the 128-byte Vulkan floor.
+		uint slot = atomicAdd(software_visible_meshlets.count, 1);
+		if (slot < params.max_visible) {
+			software_visible_meshlets.data[slot].instance_index = item.instance_index;
+			software_visible_meshlets.data[slot].meshlet_index = item.meshlet_index;
+		}
+	} else {
+		uint slot = atomicAdd(visible_meshlets.count, 1);
+		if (slot < params.max_visible) {
+			visible_meshlets.data[slot].instance_index = item.instance_index;
+			visible_meshlets.data[slot].meshlet_index = item.meshlet_index;
+		}
 	}
 }
