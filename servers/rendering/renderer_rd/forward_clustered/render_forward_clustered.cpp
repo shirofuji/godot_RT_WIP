@@ -2213,6 +2213,14 @@ static bool _meshlet_software_raster_enabled() {
 	return enabled;
 }
 
+// Whether the per-frame MESHLET_SWRASTER_DIAG console readout was explicitly requested. The hw/sw
+// counter readback it needs is a synchronous buffer_get_data → full-pipeline stall, twice per frame,
+// so it must NOT run just because software raster is enabled (the cull split it drives is separate).
+static bool _meshlet_swraster_diag_enabled() {
+	static bool enabled = OS::get_singleton()->get_cmdline_args().find("--meshlet-swraster-diag") != nullptr;
+	return enabled;
+}
+
 static float _meshlet_sw_cluster_px() {
 	static float threshold = []() {
 		const List<String> &args = OS::get_singleton()->get_cmdline_args();
@@ -2439,7 +2447,7 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	// counters straight off the frustum-cull output: hw= clusters kept on the hardware raster, sw=
 	// clusters routed to the (not-yet-built) software list. As the camera pulls back, projected
 	// cluster radii shrink and entries migrate hw->sw - that migration is what P1 exists to prove.
-	if (sw_cluster_px > 0.0f && frustum_result.has_software()) {
+	if (_meshlet_swraster_diag_enabled() && sw_cluster_px > 0.0f && frustum_result.has_software()) {
 		uint32_t hw_count = meshlet_culler->debug_read_visible_count(frustum_result.visible_buffer);
 		uint32_t sw_count = meshlet_culler->debug_read_visible_count(frustum_result.sw_visible_buffer);
 		print_line(vformat("MESHLET_SWRASTER_DIAG: threshold_px=%.1f hw=%d sw=%d (total=%d)", sw_cluster_px, (int)hw_count, (int)sw_count, (int)(hw_count + sw_count)));
