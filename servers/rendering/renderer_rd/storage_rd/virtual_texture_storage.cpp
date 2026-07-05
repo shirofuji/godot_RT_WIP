@@ -34,6 +34,7 @@
 #include "core/object/callable_mp.h" // callable_mp_static for the async readback callback.
 #include "core/os/os.h"
 #include "core/templates/hash_set.h"
+#include "servers/rendering/virtual_texture_file.h"
 
 using namespace RendererRD;
 
@@ -68,7 +69,17 @@ VirtualTextureStorage::~VirtualTextureStorage() {
 		if (feedback_image.is_valid()) {
 			rd->free_rid(feedback_image);
 		}
+		if (page_staging_texture.is_valid()) {
+			rd->free_rid(page_staging_texture);
+		}
 		blit_shader.version_free(blit_shader_version);
+	}
+	// Close any open `.svt` page providers (file-backed VTs).
+	for (uint32_t i = 0; i < virtual_textures.size(); i++) {
+		if (virtual_textures[i].file != nullptr) {
+			memdelete(virtual_textures[i].file);
+			virtual_textures[i].file = nullptr;
+		}
 	}
 	singleton = nullptr;
 }
@@ -141,6 +152,20 @@ bool VirtualTextureStorage::_ensure_initialized() {
 		page_pool_texture = rd->texture_create(tf, RD::TextureView());
 		ERR_FAIL_COND_V(page_pool_texture.is_null(), false);
 		rd->texture_clear(page_pool_texture, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	}
+
+	// One STORED_PAGE_SIZE^2 staging tile: CPU page bytes (from a `.svt`) are texture_update'd here, then
+	// GPU-copied into the target pool tile. Reused for every file-backed page upload.
+	{
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+		tf.width = STORED_PAGE_SIZE;
+		tf.height = STORED_PAGE_SIZE;
+		tf.texture_type = RD::TEXTURE_TYPE_2D;
+		tf.mipmaps = 1;
+		tf.usage_bits = RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		page_staging_texture = rd->texture_create(tf, RD::TextureView());
+		ERR_FAIL_COND_V(page_staging_texture.is_null(), false);
 	}
 
 	// Indirection (page-table) array: one mipped layer per virtual texture. RGBA8_UINT texel =
@@ -392,6 +417,146 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 	return vt_id;
 }
 
+void VirtualTextureStorage::_upload_page_bytes_to_tile(const uint8_t *p_page_rgba8, uint32_t p_tile_index) {
+	RD *rd = RD::get_singleton();
+	// Stage the CPU page (already STORED_PAGE_SIZE^2 with baked borders), then GPU-copy it into the pool
+	// tile's pixel rect. The draw graph serializes the update->copy pair (and successive pages that reuse
+	// the one staging tile) via automatic barriers.
+	Vector<uint8_t> data;
+	data.resize(POOL_TILE_BYTES);
+	memcpy(data.ptrw(), p_page_rgba8, POOL_TILE_BYTES);
+	rd->texture_update(page_staging_texture, 0, data);
+
+	const uint32_t tile_x = p_tile_index % pool_tiles_dim;
+	const uint32_t tile_y = p_tile_index / pool_tiles_dim;
+	rd->texture_copy(page_staging_texture, page_pool_texture,
+			Vector3(0, 0, 0),
+			Vector3(tile_x * STORED_PAGE_SIZE, tile_y * STORED_PAGE_SIZE, 0),
+			Vector3(STORED_PAGE_SIZE, STORED_PAGE_SIZE, 1),
+			0, 0, 0, 0);
+}
+
+uint32_t VirtualTextureStorage::register_virtual_texture_file(const String &p_svt_path) {
+	if (p_svt_path.is_empty()) {
+		return 0xFFFFFFFF;
+	}
+	HashMap<String, uint32_t>::Iterator it = source_path_to_vt_id.find(p_svt_path);
+	if (it != source_path_to_vt_id.end()) {
+		return it->value;
+	}
+	if (!_ensure_initialized()) {
+		return 0xFFFFFFFF;
+	}
+	if (virtual_textures.size() >= MAX_VIRTUAL_TEXTURES) {
+		WARN_PRINT_ONCE("VirtualTextureStorage: virtual-texture table full (MAX_VIRTUAL_TEXTURES); extra textures fall back to scalar PBR factors.");
+		return 0xFFFFFFFF;
+	}
+
+	VirtualTextureFile *vtf = memnew(VirtualTextureFile);
+	if (vtf->open(p_svt_path) != OK) {
+		memdelete(vtf);
+		return 0xFFFFFFFF;
+	}
+	const uint32_t width = vtf->get_header().width;
+	const uint32_t height = vtf->get_header().height;
+	const uint32_t mip_count = MIN(vtf->get_header().mip_count, INDIRECTION_MIPS);
+	if (width == 0 || height == 0 || mip_count == 0) {
+		memdelete(vtf);
+		return 0xFFFFFFFF;
+	}
+
+	RD *rd = RD::get_singleton();
+	const uint32_t vt_id = virtual_textures.size();
+
+	VirtualTexture vt;
+	vt.file = vtf; // Ownership transfers to the stored VT (freed in free_virtual_texture / destructor).
+	vt.width = width;
+	vt.height = height;
+	vt.mip_count = mip_count;
+	vt.vt_id = vt_id;
+
+	// Per-mip byte offsets into one indirection layer's packed page-grid chain (identical to the
+	// RD-source path so the shader reads the file-backed page table exactly the same way).
+	uint32_t mip_offsets[INDIRECTION_MIPS];
+	uint32_t layer_bytes = 0;
+	for (uint32_t m = 0; m < INDIRECTION_MIPS; m++) {
+		mip_offsets[m] = layer_bytes;
+		uint32_t dim = MAX(INDIRECTION_DIM >> m, 1u);
+		layer_bytes += dim * dim * 4; // RGBA8_UINT.
+	}
+	Vector<uint8_t> indirection_data;
+	indirection_data.resize_initialized(layer_bytes); // Zero = not resident.
+	uint8_t *ind_ptr = indirection_data.ptrw();
+
+	// Always-resident coarse base: from the finest single-page mip up to the coarsest (same rule as the
+	// RD-source path). Finer mips stream on demand (S1B.1b) or, for now, fall back to this floor.
+	uint32_t always_resident_from = mip_count - 1;
+	for (uint32_t m = 0; m < mip_count; m++) {
+		uint32_t mw = MAX(width >> m, 1u);
+		uint32_t mh = MAX(height >> m, 1u);
+		uint32_t pgx = (mw + PAGE_SIZE - 1) / PAGE_SIZE;
+		uint32_t pgy = (mh + PAGE_SIZE - 1) / PAGE_SIZE;
+		if (pgx * pgy <= 1) {
+			always_resident_from = m;
+			break;
+		}
+	}
+
+	rd->draw_command_begin_label("VT register file (resident base upload)");
+	bool out_of_tiles = false;
+	for (uint32_t m = always_resident_from; m < mip_count && !out_of_tiles; m++) {
+		uint32_t mip_w = MAX(width >> m, 1u);
+		uint32_t mip_h = MAX(height >> m, 1u);
+		uint32_t ind_dim = MAX(INDIRECTION_DIM >> m, 1u);
+		uint32_t pages_x = MIN((mip_w + PAGE_SIZE - 1) / PAGE_SIZE, ind_dim);
+		uint32_t pages_y = MIN((mip_h + PAGE_SIZE - 1) / PAGE_SIZE, ind_dim);
+		pages_x = MIN(pages_x, vtf->get_pages_x(m));
+		pages_y = MIN(pages_y, vtf->get_pages_y(m));
+
+		for (uint32_t py = 0; py < pages_y && !out_of_tiles; py++) {
+			for (uint32_t px = 0; px < pages_x; px++) {
+				uint32_t tile = _allocate_tile();
+				if (tile == 0xFFFFFFFF) {
+					WARN_PRINT_ONCE("VirtualTextureStorage: page pool full while making the file-backed always-resident base resident. Raise pool_size_mb or reduce the resident base footprint.");
+					out_of_tiles = true;
+					break;
+				}
+				vt.resident_tiles.push_back(tile);
+
+				const PackedByteArray page = vtf->read_page(m, px, py);
+				if (page.size() == (int)POOL_TILE_BYTES) {
+					_upload_page_bytes_to_tile(page.ptr(), tile);
+				}
+
+				uint32_t tile_x = tile % pool_tiles_dim;
+				uint32_t tile_y = tile / pool_tiles_dim;
+				uint8_t *texel = ind_ptr + mip_offsets[m] + (py * ind_dim + px) * 4;
+				texel[0] = uint8_t(tile_x);
+				texel[1] = uint8_t(tile_y);
+				texel[2] = 1; // Resident.
+				texel[3] = 0;
+			}
+		}
+	}
+	rd->draw_command_end_label();
+
+	rd->texture_update(indirection_texture, vt_id, indirection_data);
+
+	VTMetadataGPU meta;
+	meta.width = width;
+	meta.height = height;
+	meta.mip_count = mip_count;
+	meta.resident_mip_floor = always_resident_from;
+	rd->buffer_update(vt_metadata_buffer, vt_id * sizeof(VTMetadataGPU), sizeof(VTMetadataGPU), &meta);
+
+	vt.resident_mip_floor = always_resident_from;
+	vt.indirection_cpu = indirection_data;
+
+	virtual_textures.push_back(vt);
+	source_path_to_vt_id[p_svt_path] = vt_id;
+	return vt_id;
+}
+
 void VirtualTextureStorage::free_virtual_texture(uint32_t p_vt_id) {
 	if (p_vt_id >= virtual_textures.size()) {
 		return;
@@ -401,6 +566,10 @@ void VirtualTextureStorage::free_virtual_texture(uint32_t p_vt_id) {
 		_free_tile(vt.resident_tiles[i]);
 	}
 	vt.resident_tiles.clear();
+	if (vt.file != nullptr) {
+		memdelete(vt.file); // Close the `.svt` page provider (file-backed VT).
+		vt.file = nullptr;
+	}
 	// Leaves the slot in place (append-only vt_id space in S0a); a full free-list of vt_ids is an
 	// S0c concern alongside indirection-layer reuse.
 }

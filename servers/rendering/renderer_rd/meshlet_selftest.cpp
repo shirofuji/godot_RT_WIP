@@ -31,9 +31,11 @@
 #include "meshlet_selftest.h"
 
 #include "core/config/project_settings.h"
+#include "core/io/dir_access.h"
 #include "core/io/image.h"
 #include "core/math/projection.h"
 #include "core/os/os.h"
+#include "servers/rendering/virtual_texture_file.h"
 #include "scene/resources/3d/primitive_meshes.h"
 #include "scene/resources/surface_tool.h"
 #include "servers/rendering/renderer_rd/forward_clustered/meshlet_software_rasterizer.h"
@@ -1606,6 +1608,116 @@ void test_virtual_texture_blit_and_indirection() {
 	rd->free_rid(source);
 }
 
+// S1B.1: the import-baked path. Bakes a known source to a `.svt` page file (VirtualTextureFile), then
+// registers it via register_virtual_texture_file() - which uploads the resident base pages straight from
+// the file into the pool, WITHOUT a resident source texture. Reads the pool tile back and asserts its
+// content exactly matches the source, proving the bake -> .svt -> CPU-page-upload -> pool round-trip is
+// correct end to end on the GPU.
+void test_virtual_texture_file_backed() {
+	RendererRD::VirtualTextureStorage *vts = RendererRD::VirtualTextureStorage::get_singleton();
+	check(vts != nullptr, "VT file: VirtualTextureStorage singleton exists");
+	if (vts == nullptr) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+
+	// 128x128 per-channel/per-axis pattern (same style as the blit test, so a swizzle/transpose/duplicate
+	// in the file-backed round-trip is caught). 128px = a single page, so mip 0 is the always-resident
+	// base and holds the exact source - the cleanest exact-match check of the file->pool upload. (The
+	// multi-mip "only the coarse base is resident, fine mips stream" behavior is exercised by the VRAM
+	// scene and S1B.1b, not this unit check.)
+	const uint32_t W = 128;
+	const uint32_t H = 128;
+	PackedByteArray src_data;
+	src_data.resize(W * H * 4);
+	{
+		uint8_t *p = src_data.ptrw();
+		for (uint32_t y = 0; y < H; y++) {
+			for (uint32_t x = 0; x < W; x++) {
+				uint8_t *t = p + (y * W + x) * 4;
+				t[0] = uint8_t(x);
+				t[1] = uint8_t(y);
+				t[2] = uint8_t((x * 3 + y) & 0xFF);
+				t[3] = 255;
+			}
+		}
+	}
+	Ref<Image> src_img = Image::create_from_data(W, H, false, Image::FORMAT_RGBA8, src_data);
+
+	const String path = "user://vt_file_selftest.svt";
+	Error bake_err = VirtualTextureFile::bake(src_img, path);
+	check(bake_err == OK, "VT file: baked source image to a .svt page file");
+	if (bake_err != OK) {
+		return;
+	}
+
+	uint32_t vt_id = vts->register_virtual_texture_file(path);
+	check(vt_id != 0xFFFFFFFFu, "VT file: register_virtual_texture_file returned a valid vt_id");
+	if (vt_id == 0xFFFFFFFFu) {
+		DirAccess::remove_absolute(path);
+		return;
+	}
+
+	// 128x128 => a single mip-0 page, resident from the file.
+	const uint32_t IND_DIM = RendererRD::VirtualTextureStorage::INDIRECTION_DIM;
+	Vector<uint8_t> ind = rd->texture_get_data(vts->get_indirection_texture_rid(), vt_id);
+	bool ind_size_ok = (uint32_t)ind.size() >= IND_DIM * IND_DIM * 4;
+	check(ind_size_ok, "VT file: indirection layer read back at expected size");
+	if (!ind_size_ok) {
+		vts->free_virtual_texture(vt_id);
+		DirAccess::remove_absolute(path);
+		return;
+	}
+	const uint8_t *ip = ind.ptr();
+	auto ind_entry = [&](uint32_t px, uint32_t py, int ch) -> uint32_t {
+		return ip[(py * IND_DIM + px) * 4 + ch];
+	};
+	check(ind_entry(0, 0, 2) == 1u, "VT file: the mip-0 page of the file-backed VT is resident (uploaded from disk)");
+
+	// Copy page (0,0)'s physical pool tile out and verify content + a clamped border texel.
+	const uint32_t STORED = RendererRD::VirtualTextureStorage::STORED_PAGE_SIZE;
+	const uint32_t BORDER = RendererRD::VirtualTextureStorage::PAGE_BORDER;
+	uint32_t tile_x = ind_entry(0, 0, 0);
+	uint32_t tile_y = ind_entry(0, 0, 1);
+
+	RD::TextureFormat ttf;
+	ttf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	ttf.width = STORED;
+	ttf.height = STORED;
+	ttf.texture_type = RD::TEXTURE_TYPE_2D;
+	ttf.mipmaps = 1;
+	ttf.usage_bits = RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+	RID tile_tex = rd->texture_create(ttf, RD::TextureView());
+	rd->texture_copy(vts->get_page_pool_texture_rid(), tile_tex, Vector3(tile_x * STORED, tile_y * STORED, 0), Vector3(0, 0, 0), Vector3(STORED, STORED, 1), 0, 0, 0, 0);
+	Vector<uint8_t> tile_data = rd->texture_get_data(tile_tex, 0);
+	const uint8_t *tp = tile_data.ptr();
+	auto tile_texel = [&](uint32_t x, uint32_t y, int ch) -> int {
+		return tp[(y * STORED + x) * 4 + ch];
+	};
+
+	bool content_ok = ((uint32_t)tile_data.size() == STORED * STORED * 4);
+	const uint32_t samples[5][2] = { { 0, 0 }, { 64, 64 }, { 127, 127 }, { 0, 127 }, { 127, 0 } };
+	for (uint32_t s = 0; s < 5 && content_ok; s++) {
+		uint32_t ix = samples[s][0];
+		uint32_t iy = samples[s][1];
+		int r = tile_texel(BORDER + ix, BORDER + iy, 0);
+		int g = tile_texel(BORDER + ix, BORDER + iy, 1);
+		int b = tile_texel(BORDER + ix, BORDER + iy, 2);
+		if (r != (int)(ix & 0xFF) || g != (int)(iy & 0xFF) || b != (int)((ix * 3 + iy) & 0xFF)) {
+			content_ok = false;
+		}
+	}
+	check(content_ok, "VT file: pool tile content exactly matches the source texels (bake+upload round-trip)");
+
+	// Border: stored (0,0) = clamp(-4,-4) = source(0,0) = (0,0,0).
+	bool border_ok = (tile_texel(0, 0, 0) == 0 && tile_texel(0, 0, 1) == 0 && tile_texel(0, 0, 2) == 0);
+	check(border_ok, "VT file: page (0,0) top-left border replicates source(0,0)");
+
+	rd->free_rid(tile_tex);
+	vts->free_virtual_texture(vt_id);
+	DirAccess::remove_absolute(path);
+}
+
 // S0b: renders a sphere whose albedo is a virtual texture and verifies (1) sampleVirtual() actually
 // fetched the pool (the in-shader VT sampling that S0a never exercised), and (2) the GPU feedback
 // reported the page(s) sampled. Only meaningful with --vt-enable (the VT shader variant + feedback
@@ -1916,6 +2028,7 @@ void run_meshlet_selftest_if_requested() {
 	test_virtual_texture_blit_and_indirection();
 	test_virtual_texture_render_and_feedback();
 	test_virtual_texture_streaming();
+	test_virtual_texture_file_backed();
 	test_meshlet_visbuffer_rasterize();
 	test_meshlet_visbuffer_hardware_raster();
 	test_meshlet_visbuffer_resolve();

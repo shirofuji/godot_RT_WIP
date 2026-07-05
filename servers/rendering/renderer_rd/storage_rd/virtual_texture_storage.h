@@ -36,6 +36,8 @@
 #include "servers/rendering/renderer_rd/shaders/virtual_texture_blit.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
+class VirtualTextureFile; // Import-baked .svt page-file provider (servers/rendering/virtual_texture_file.h).
+
 namespace RendererRD {
 
 // Software virtual-texturing (SVT) residency manager. Owns one physical page-pool atlas and a
@@ -135,6 +137,11 @@ public:
 	// writes the indirection texels. The returned vt_id is what a material stores in place of the old
 	// per-texture slot index, and what the shader passes to the VT-sample helper.
 	uint32_t register_virtual_texture(const RID &p_source_rd_texture);
+	// Import-baked path (SVT S1): register a virtual texture backed by an on-disk `.svt` page file
+	// (VirtualTextureFile) instead of a resident RD texture. The always-resident base pages are uploaded
+	// straight from the file into the pool, so the full-resolution source is NEVER held in VRAM - this is
+	// what finally makes VT bound VRAM to the pool. Dedups by path. Returns 0xFFFFFFFF on failure.
+	uint32_t register_virtual_texture_file(const String &p_svt_path);
 
 	// Records that p_normal_vt and p_orm_vt are the same material's normal/ORM siblings of the albedo
 	// p_albedo_vt, so update_streaming() streams their matching pages together (GPU feedback only
@@ -208,6 +215,7 @@ private:
 	uint32_t pool_tiles_dim = 64; // Pool tiles per side (square). Set from get_pool_tiles_dim() at init.
 
 	RID page_pool_texture; // 2D, (pool_tiles_dim*STORED_PAGE_SIZE) square.
+	RID page_staging_texture; // STORED_PAGE_SIZE^2 RGBA8 scratch: CPU page bytes -> pool tile via texture_copy (file-backed VTs).
 	RID indirection_texture; // 2D_ARRAY, MAX_VIRTUAL_TEXTURES layers, mipped to the page-grid chain.
 	RID vt_metadata_buffer; // Storage buffer of VTMetadataGPU[MAX_VIRTUAL_TEXTURES].
 
@@ -235,8 +243,14 @@ private:
 	uint32_t _allocate_tile(); // 0xFFFFFFFF if the pool is full.
 	void _free_tile(uint32_t p_tile_index);
 
+	// Uploads one STORED_PAGE_SIZE^2 RGBA8 page (borders already baked in, e.g. read from a `.svt`) into
+	// the given pool tile via the staging texture + a GPU copy. The file-backed counterpart of the blit
+	// compute path (which produces the same bordered tile from a resident source texture).
+	void _upload_page_bytes_to_tile(const uint8_t *p_page_rgba8, uint32_t p_tile_index);
+
 	struct VirtualTexture {
-		RID source;
+		RID source; // Resident source texture (runtime/procedural path). Null for file-backed VTs.
+		VirtualTextureFile *file = nullptr; // Import-baked path: owns the open `.svt`, freed in free_virtual_texture(). Null otherwise.
 		uint32_t width = 0;
 		uint32_t height = 0;
 		uint32_t mip_count = 0;
@@ -251,7 +265,8 @@ private:
 		LocalVector<uint32_t> siblings;
 	};
 	LocalVector<VirtualTexture> virtual_textures; // Indexed by vt_id.
-	HashMap<RID, uint32_t> source_rid_to_vt_id; // Dedup.
+	HashMap<RID, uint32_t> source_rid_to_vt_id; // Dedup (runtime source-texture path).
+	HashMap<String, uint32_t> source_path_to_vt_id; // Dedup (import-baked .svt path).
 
 	// S0c streaming / LRU-eviction state.
 	static constexpr uint32_t MAX_STREAMS_PER_FRAME = 128; // Cap new pages blitted per update_streaming.
