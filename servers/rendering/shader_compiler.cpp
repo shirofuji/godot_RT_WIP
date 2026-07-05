@@ -1238,6 +1238,7 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					// sampler2D and sampler2D array and vec2 UV and vec3 UV.
 					bool multiview_uv_needed = false;
 					bool is_normal_roughness_texture = false;
+					StringName texture_uniform_name_for_vt;
 
 					for (int i = 1; i < onode->arguments.size(); i++) {
 						if (i > 1) {
@@ -1300,6 +1301,9 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 								} break;
 								default:
 									break;
+							}
+							if (correct_texture_uniform) {
+								texture_uniform_name_for_vt = texture_uniform;
 							}
 
 							if (correct_texture_uniform && !RS::get_singleton()->is_low_end()) {
@@ -1422,6 +1426,19 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					}
 					if (is_normal_roughness_texture && !texture_func_returns_data) {
 						code = "normal_roughness_compatibility(" + code + ")";
+					}
+
+					if (texture_func_simple && texture_uniform_name_for_vt != StringName() && shader->uniforms.has(texture_uniform_name_for_vt)) {
+						const ShaderLanguage::ShaderNode::Uniform &u = shader->uniforms[texture_uniform_name_for_vt];
+						if (u.hint != ShaderLanguage::ShaderNode::Uniform::HINT_SCREEN_TEXTURE &&
+							u.hint != ShaderLanguage::ShaderNode::Uniform::HINT_DEPTH_TEXTURE &&
+							u.hint != ShaderLanguage::ShaderNode::Uniform::HINT_NORMAL_ROUGHNESS_TEXTURE &&
+							texture_uniform_name_for_vt != SNAME("RADIANCE")) {
+							
+							String vt_id_name = _mkid(texture_uniform_name_for_vt) + "_vt_id";
+							String uv_code = _dump_node_code(onode->arguments[2], p_level, r_gen_code, p_actions, p_default_actions, p_assigning);
+							code = "((" + vt_id_name + " != 0xFFFFFFFFu) ? sampleVirtual(" + vt_id_name + ", " + uv_code + ") : " + code + ")";
+						}
 					}
 				} break;
 				case SL::OP_INDEX: {

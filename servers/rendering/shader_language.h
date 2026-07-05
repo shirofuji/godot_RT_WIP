@@ -711,6 +711,7 @@ public:
 			PackedStringArray hint_enum_names;
 			int instance_index = 0;
 			String group;
+			bool is_virtual_texture_id = false;
 
 			_FORCE_INLINE_ bool is_texture() const {
 				// Order is assigned to -1 for texture uniforms.

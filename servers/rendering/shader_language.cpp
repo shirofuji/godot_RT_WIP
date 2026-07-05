@@ -9792,6 +9792,40 @@ Error ShaderLanguage::_parse_shader(const HashMap<StringName, FunctionInfo> &p_f
 						}
 						uniform.order = -1;
 						uniform.prop_order = prop_index++;
+
+						// SVT Phase 2: Inject a hidden uniform to store the vt_id for this sampler
+						ShaderNode::Uniform vt_id_uniform;
+						vt_id_uniform.type = TYPE_UINT;
+						vt_id_uniform.scope = uniform_scope;
+						vt_id_uniform.precision = PRECISION_DEFAULT;
+						vt_id_uniform.array_size = array_size;
+						vt_id_uniform.group = current_uniform_group_name;
+						vt_id_uniform.order = uniforms++;
+						vt_id_uniform.prop_order = prop_index++;
+						vt_id_uniform.texture_order = -1;
+						vt_id_uniform.is_virtual_texture_id = true;
+						
+						ShaderLanguage::Scalar vt_id_scalar;
+						vt_id_scalar.uint = 0xFFFFFFFFu;
+						vt_id_uniform.default_value.push_back(vt_id_scalar);
+
+						StringName vt_id_name = String(name) + "_vt_id";
+						shader->uniforms[vt_id_name] = vt_id_uniform;
+
+#ifdef DEBUG_ENABLED
+						if (check_device_limit_warnings) {
+							if (vt_id_uniform.array_size > 0) {
+								int size = get_datatype_size(vt_id_uniform.type) * vt_id_uniform.array_size;
+								int m = (16 * vt_id_uniform.array_size);
+								if ((size % m) != 0U) {
+									size += m - (size % m);
+								}
+								uniform_buffer_size += size;
+							} else {
+								uniform_buffer_size += get_datatype_size(vt_id_uniform.type);
+							}
+						}
+#endif
 					} else {
 						if (uniform_scope == ShaderNode::Uniform::SCOPE_INSTANCE && (type == TYPE_MAT2 || type == TYPE_MAT3 || type == TYPE_MAT4)) {
 							_set_error(vformat(RTR("The '%s' qualifier is not supported for matrix types."), "SCOPE_INSTANCE"));
