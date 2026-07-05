@@ -294,22 +294,33 @@ TEST_CASE("[SceneTree][Meshlet] mesh_create_surface_data_from_arrays bakes meshl
 	CHECK(surface_data.meshlets.size() == surface_data.meshlet_bounds.size());
 	CHECK(surface_data.meshlet_positions.size() == vertices.size());
 
-	// surface_data.meshlets is now the full Nanite-style cluster DAG (every LOD level baked into one
-	// pool), with parallel per-cluster LOD-cut data in surface_data.meshlet_lods. The coarse levels
-	// hold SIMPLIFIED geometry that intentionally isn't in the source mesh, so only the LEAF clusters
-	// (self_error == 0 - the finest LOD) are expected to exactly cover the source triangles. Filter
-	// to the leaves and verify coverage over those.
-	REQUIRE(surface_data.meshlet_lods.size() == surface_data.meshlets.size());
+	// Surface creation only does the cheap single-level (LOD-0) meshlet split synchronously; the full
+	// Nanite-style cluster-LOD DAG is baked ASYNCHRONOUSLY on a worker thread and swapped in later, so
+	// surface_data.meshlet_lods is empty at this point (leaf-only, "always the right LOD"). Bake the DAG
+	// synchronously via the same public entry point the background queue uses, and verify its behavior
+	// directly: the coarse levels hold SIMPLIFIED geometry that intentionally isn't in the source mesh,
+	// so only the LEAF clusters (self_error == 0 - the finest LOD) are expected to exactly cover the
+	// source triangles. Filter to the leaves and verify coverage over those.
+	Vector<RenderingServerTypes::MeshletInfo> dag_meshlets;
+	PackedInt32Array dag_meshlet_vertices;
+	PackedByteArray dag_meshlet_triangles;
+	Vector<RenderingServerTypes::MeshletBoundsInfo> dag_bounds;
+	Vector<RenderingServerTypes::MeshletLODInfo> dag_lods;
+	REQUIRE(RenderingServer::get_singleton()->bake_meshlet_dag(vertices, indices, dag_meshlets, dag_meshlet_vertices, dag_meshlet_triangles, dag_bounds, dag_lods));
+	REQUIRE(dag_meshlets.size() > 0);
+	REQUIRE(dag_lods.size() == dag_meshlets.size());
+	CHECK(dag_bounds.size() == dag_meshlets.size());
+
 	Vector<SurfaceTool::Meshlet> leaf_meshlets;
-	for (int i = 0; i < surface_data.meshlets.size(); i++) {
-		if (surface_data.meshlet_lods[i].self_error == 0.0f) {
+	for (int i = 0; i < dag_meshlets.size(); i++) {
+		if (dag_lods[i].self_error == 0.0f) {
 			SurfaceTool::Meshlet ml;
-			memcpy(&ml, &surface_data.meshlets[i], sizeof(SurfaceTool::Meshlet)); // Layout-identical mirror.
+			memcpy(&ml, &dag_meshlets[i], sizeof(SurfaceTool::Meshlet)); // Layout-identical mirror.
 			leaf_meshlets.push_back(ml);
 		}
 	}
 	CHECK_MESSAGE(leaf_meshlets.size() > 0, "DAG must contain LOD-0 leaf clusters.");
-	check_meshlets_cover_triangles(indices, leaf_meshlets, surface_data.meshlet_vertices, surface_data.meshlet_triangles);
+	check_meshlets_cover_triangles(indices, leaf_meshlets, dag_meshlet_vertices, dag_meshlet_triangles);
 }
 
 TEST_CASE("[SceneTree][Meshlet] A real PrimitiveMesh uploads meshlets into MeshletStorage automatically") {
