@@ -125,6 +125,7 @@
 #include "scene/resources/compositor.h"
 #include "scene/resources/compressed_texture.h"
 #include "scene/resources/compressed_texture_resource_format.h"
+#include "scene/resources/virtual_texture.h"
 #include "scene/resources/curve_texture.h"
 #include "scene/resources/drawable_texture_2d.h"
 #include "scene/resources/environment.h"
@@ -378,6 +379,7 @@ static Ref<ResourceFormatSaverText> resource_saver_text;
 static Ref<ResourceFormatLoaderText> resource_loader_text;
 
 static Ref<ResourceFormatLoaderCompressedTexture2D> resource_loader_stream_texture;
+static Ref<ResourceFormatLoaderVirtualTexture2D> resource_loader_virtual_texture;
 static Ref<ResourceFormatLoaderCompressedTextureLayered> resource_loader_texture_layered;
 static Ref<ResourceFormatLoaderCompressedTexture3D> resource_loader_texture_3d;
 
@@ -399,6 +401,11 @@ void register_scene_types() {
 	if constexpr (GD_IS_CLASS_ENABLED(CompressedTexture2D)) {
 		resource_loader_stream_texture.instantiate();
 		ResourceLoader::add_resource_format_loader(resource_loader_stream_texture);
+	}
+
+	if constexpr (GD_IS_CLASS_ENABLED(VirtualTexture2D)) {
+		resource_loader_virtual_texture.instantiate();
+		ResourceLoader::add_resource_format_loader(resource_loader_virtual_texture);
 	}
 
 	if constexpr (GD_IS_CLASS_ENABLED(TextureLayered)) {
@@ -942,6 +949,7 @@ void register_scene_types() {
 	GDREGISTER_CLASS(World2D);
 	GDREGISTER_CLASS(Sky);
 	GDREGISTER_CLASS(CompressedTexture2D);
+	GDREGISTER_CLASS(VirtualTexture2D);
 	GDREGISTER_CLASS(PortableCompressedTexture2D);
 	GDREGISTER_CLASS(ImageTexture);
 	GDREGISTER_CLASS(AtlasTexture);
@@ -1335,6 +1343,11 @@ void unregister_scene_types() {
 	if constexpr (GD_IS_CLASS_ENABLED(CompressedTexture2D)) {
 		ResourceLoader::remove_resource_format_loader(resource_loader_stream_texture);
 		resource_loader_stream_texture.unref();
+	}
+
+	if constexpr (GD_IS_CLASS_ENABLED(VirtualTexture2D)) {
+		ResourceLoader::remove_resource_format_loader(resource_loader_virtual_texture);
+		resource_loader_virtual_texture.unref();
 	}
 
 	ResourceSaver::remove_resource_format_saver(resource_saver_text);

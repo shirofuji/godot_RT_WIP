@@ -102,6 +102,7 @@
 #include "editor/import/resource_importer_dynamic_font.h"
 #include "editor/import/resource_importer_image.h"
 #include "editor/import/resource_importer_imagefont.h"
+#include "editor/import/resource_importer_virtual_texture.h"
 #include "editor/import/resource_importer_layered_texture.h"
 #include "editor/import/resource_importer_shader_file.h"
 #include "editor/import/resource_importer_svg.h"
@@ -8543,6 +8544,10 @@ EditorNode::EditorNode() {
 		Ref<ResourceImporterImage> import_image;
 		import_image.instantiate();
 		ResourceFormatImporter::get_singleton()->add_importer(import_image);
+
+		Ref<ResourceImporterVirtualTexture> import_virtual_texture;
+		import_virtual_texture.instantiate();
+		ResourceFormatImporter::get_singleton()->add_importer(import_virtual_texture);
 
 		Ref<ResourceImporterSVG> import_svg;
 		import_svg.instantiate();

@@ -1914,8 +1914,13 @@ uint32_t RenderForwardClustered::_meshlet_resolve_material_id(const RID &p_mater
 			if (tv.get_type() != Variant::RID) {
 				return 0xFFFFFFFF;
 			}
-			RID rd_tex = texture_storage->texture_get_rd_texture((RID)tv);
+			RID texture_rid = (RID)tv;
+			RID rd_tex = texture_storage->texture_get_rd_texture(texture_rid);
 			if (use_virtual_textures) {
+				String path = RS::get_singleton()->texture_get_path(texture_rid);
+				if (path.get_extension() == "svt") {
+					return RendererRD::VirtualTextureStorage::get_singleton()->register_virtual_texture_file(path);
+				}
 				return RendererRD::VirtualTextureStorage::get_singleton()->register_virtual_texture(rd_tex);
 			}
 			return meshlet_storage->register_material_texture(rd_tex);

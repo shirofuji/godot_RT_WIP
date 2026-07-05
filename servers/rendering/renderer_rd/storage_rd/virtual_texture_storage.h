@@ -36,7 +36,8 @@
 #include "servers/rendering/renderer_rd/shaders/virtual_texture_blit.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
-class VirtualTextureFile; // Import-baked .svt page-file provider (servers/rendering/virtual_texture_file.h).
+#include "core/os/mutex.h"
+#include "servers/rendering/virtual_texture_file.h"
 
 namespace RendererRD {
 
@@ -250,7 +251,7 @@ private:
 
 	struct VirtualTexture {
 		RID source; // Resident source texture (runtime/procedural path). Null for file-backed VTs.
-		VirtualTextureFile *file = nullptr; // Import-baked path: owns the open `.svt`, freed in free_virtual_texture(). Null otherwise.
+		Ref<VirtualTextureFile> file; // Import-baked path: owns the open `.svt`, freed in free_virtual_texture(). Null otherwise.
 		uint32_t width = 0;
 		uint32_t height = 0;
 		uint32_t mip_count = 0;
@@ -276,6 +277,25 @@ private:
 			// (a base tile / free tile) - only != sentinel tiles are LRU-evictable.
 	LocalVector<uint32_t> tile_last_used; // Per pool tile: last stream_frame it was sampled (LRU key).
 	uint32_t stream_frame = 0;
+
+	// S1B.1b file streaming state
+	struct FileStreamRequest {
+		uint32_t vt_id = 0;
+		uint32_t mip = 0;
+		uint32_t page_x = 0;
+		uint32_t page_y = 0;
+		uint32_t tile = 0;
+		Ref<VirtualTextureFile> file;
+	};
+	struct FileStreamResult {
+		FileStreamRequest req;
+		PackedByteArray data;
+	};
+	Mutex file_stream_mutex;
+	Vector<FileStreamRequest> file_stream_queue;
+	Vector<FileStreamResult> file_stream_results;
+	bool file_stream_task_queued = false;
+	static void _file_stream_worker_task(void *p_userdata);
 
 	static uint64_t _page_key(uint32_t p_vt_id, uint32_t p_mip, uint32_t p_page_x, uint32_t p_page_y);
 	static uint32_t _indirection_mip_offset(uint32_t p_mip); // Byte offset of mip p_mip within one layer.

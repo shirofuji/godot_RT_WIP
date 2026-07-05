@@ -34,6 +34,7 @@
 #include "core/object/callable_mp.h" // callable_mp_static for the async readback callback.
 #include "core/os/os.h"
 #include "core/templates/hash_set.h"
+#include "core/object/worker_thread_pool.h"
 #include "servers/rendering/virtual_texture_file.h"
 
 using namespace RendererRD;
@@ -76,9 +77,8 @@ VirtualTextureStorage::~VirtualTextureStorage() {
 	}
 	// Close any open `.svt` page providers (file-backed VTs).
 	for (uint32_t i = 0; i < virtual_textures.size(); i++) {
-		if (virtual_textures[i].file != nullptr) {
-			memdelete(virtual_textures[i].file);
-			virtual_textures[i].file = nullptr;
+		if (virtual_textures[i].file.is_valid()) {
+			virtual_textures[i].file.unref();
 		}
 	}
 	singleton = nullptr;
@@ -452,16 +452,15 @@ uint32_t VirtualTextureStorage::register_virtual_texture_file(const String &p_sv
 		return 0xFFFFFFFF;
 	}
 
-	VirtualTextureFile *vtf = memnew(VirtualTextureFile);
+	Ref<VirtualTextureFile> vtf;
+	vtf.instantiate();
 	if (vtf->open(p_svt_path) != OK) {
-		memdelete(vtf);
 		return 0xFFFFFFFF;
 	}
 	const uint32_t width = vtf->get_header().width;
 	const uint32_t height = vtf->get_header().height;
 	const uint32_t mip_count = MIN(vtf->get_header().mip_count, INDIRECTION_MIPS);
 	if (width == 0 || height == 0 || mip_count == 0) {
-		memdelete(vtf);
 		return 0xFFFFFFFF;
 	}
 
@@ -566,9 +565,8 @@ void VirtualTextureStorage::free_virtual_texture(uint32_t p_vt_id) {
 		_free_tile(vt.resident_tiles[i]);
 	}
 	vt.resident_tiles.clear();
-	if (vt.file != nullptr) {
-		memdelete(vt.file); // Close the `.svt` page provider (file-backed VT).
-		vt.file = nullptr;
+	if (vt.file.is_valid()) {
+		vt.file.unref(); // Close the `.svt` page provider (file-backed VT).
 	}
 	// Leaves the slot in place (append-only vt_id space in S0a); a full free-list of vt_ids is an
 	// S0c concern alongside indirection-layer reuse.
@@ -686,7 +684,65 @@ void VirtualTextureStorage::_ingest_feedback_data(const PackedByteArray &p_data)
 	pending_stream_valid = true;
 }
 
+void VirtualTextureStorage::_file_stream_worker_task(void *p_userdata) {
+	VirtualTextureStorage *self = (VirtualTextureStorage *)p_userdata;
+
+	self->file_stream_mutex.lock();
+	Vector<FileStreamRequest> local_queue = self->file_stream_queue;
+	self->file_stream_queue.clear();
+	self->file_stream_mutex.unlock();
+
+	Vector<FileStreamResult> local_results;
+	for (int i = 0; i < local_queue.size(); i++) {
+		FileStreamResult res;
+		res.req = local_queue[i];
+		res.data = res.req.file->read_page(res.req.mip, res.req.page_x, res.req.page_y);
+		local_results.push_back(res);
+	}
+
+	self->file_stream_mutex.lock();
+	self->file_stream_results.append_array(local_results);
+	self->file_stream_task_queued = false;
+	self->file_stream_mutex.unlock();
+}
+
 void VirtualTextureStorage::poll_pending_streams() {
+	if (!initialized) {
+		return;
+	}
+
+	Vector<FileStreamResult> completed_streams;
+	file_stream_mutex.lock();
+	if (!file_stream_results.is_empty()) {
+		completed_streams = file_stream_results;
+		file_stream_results.clear();
+	}
+	file_stream_mutex.unlock();
+
+	if (!completed_streams.is_empty()) {
+		HashSet<uint32_t> dirty_layers;
+		for (int i = 0; i < completed_streams.size(); i++) {
+			const FileStreamResult &res = completed_streams[i];
+			uint64_t key = _page_key(res.req.vt_id, res.req.mip, res.req.page_x, res.req.page_y);
+			HashMap<uint64_t, uint32_t>::Iterator it = streamed_page_to_tile.find(key);
+			if (it != streamed_page_to_tile.end() && it->value == res.req.tile) {
+				if (res.data.size() == (int)POOL_TILE_BYTES) {
+					_upload_page_bytes_to_tile(res.data.ptr(), res.req.tile);
+					_set_page_indirection(res.req.vt_id, res.req.mip, res.req.page_x, res.req.page_y, res.req.tile, true, dirty_layers);
+				} else {
+					streamed_page_to_tile.erase(key);
+					tile_page_key[res.req.tile] = NO_STREAMED_PAGE;
+					_free_tile(res.req.tile);
+				}
+			}
+		}
+		for (const uint32_t &vt_id : dirty_layers) {
+			if (vt_id < virtual_textures.size()) {
+				RD::get_singleton()->texture_update(indirection_texture, vt_id, virtual_textures[vt_id].indirection_cpu);
+			}
+		}
+	}
+
 	// Apply the most recently completed async feedback readback (if any). Runs where the synchronous
 	// drain used to - a valid point for update_streaming's GPU work - but on already-available data,
 	// so there is no readback stall.
@@ -806,7 +862,7 @@ void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_reques
 			continue;
 		}
 		VirtualTexture &vt = virtual_textures[req.vt_id];
-		if (vt.source.is_null() || req.mip >= vt.resident_mip_floor) {
+		if ((vt.source.is_null() && vt.file.is_null()) || req.mip >= vt.resident_mip_floor) {
 			continue; // invalid, or an always-resident base mip
 		}
 		uint64_t key = _page_key(req.vt_id, req.mip, req.page_x, req.page_y);
@@ -825,16 +881,30 @@ void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_reques
 		streamed_page_to_tile[key] = tile;
 		tile_page_key[tile] = key;
 		tile_last_used[tile] = stream_frame;
-		_set_page_indirection(req.vt_id, req.mip, req.page_x, req.page_y, tile, true, dirty_layers);
 
-		StreamOp op;
-		op.vt_id = req.vt_id;
-		op.mip = req.mip;
-		op.page_x = req.page_x;
-		op.page_y = req.page_y;
-		op.tile = tile;
-		op.source = vt.source;
-		ops.push_back(op);
+		if (vt.source.is_valid()) {
+			_set_page_indirection(req.vt_id, req.mip, req.page_x, req.page_y, tile, true, dirty_layers);
+
+			StreamOp op;
+			op.vt_id = req.vt_id;
+			op.mip = req.mip;
+			op.page_x = req.page_x;
+			op.page_y = req.page_y;
+			op.tile = tile;
+			op.source = vt.source;
+			ops.push_back(op);
+		} else if (vt.file.is_valid()) {
+			FileStreamRequest f_req;
+			f_req.vt_id = req.vt_id;
+			f_req.mip = req.mip;
+			f_req.page_x = req.page_x;
+			f_req.page_y = req.page_y;
+			f_req.tile = tile;
+			f_req.file = vt.file;
+			file_stream_mutex.lock();
+			file_stream_queue.push_back(f_req);
+			file_stream_mutex.unlock();
+		}
 		streamed++;
 	}
 
@@ -891,4 +961,11 @@ void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_reques
 	for (const uint32_t &vt_id : dirty_layers) {
 		rd->texture_update(indirection_texture, vt_id, virtual_textures[vt_id].indirection_cpu);
 	}
+
+	file_stream_mutex.lock();
+	if (!file_stream_queue.is_empty() && !file_stream_task_queued) {
+		WorkerThreadPool::get_singleton()->add_native_task(&_file_stream_worker_task, this, false, "VT File Streaming");
+		file_stream_task_queued = true;
+	}
+	file_stream_mutex.unlock();
 }

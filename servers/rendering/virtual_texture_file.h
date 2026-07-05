@@ -34,6 +34,8 @@
 #include "core/io/image.h"
 #include "core/string/ustring.h"
 #include "core/templates/local_vector.h"
+#include "core/object/ref_counted.h"
+#include "core/os/mutex.h"
 
 // On-disk tiled page file (`.svt`) for Streaming Virtual Texturing (SVT S1, import-baked path). A source
 // image is baked offline into bordered mip pages so the runtime page provider can stream a single page
@@ -46,7 +48,7 @@
 //
 // This class is deliberately RenderingDevice-free (pure Image + FileAccess) so the baker runs at import
 // time in the editor and the format is unit-testable offline under `--test` (no GPU needed).
-class VirtualTextureFile {
+class VirtualTextureFile : public RefCounted {
 public:
 	static constexpr uint32_t MAGIC = 0x54565347u; // "GSVT" tag.
 	static constexpr uint32_t VERSION = 1;
@@ -83,6 +85,7 @@ public:
 	void close();
 
 private:
+	Mutex file_mutex;
 	Ref<FileAccess> file;
 	Header header;
 	uint32_t pages_x[MAX_MIPS] = {};

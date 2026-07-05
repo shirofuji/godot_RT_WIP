@@ -148,6 +148,8 @@ PackedByteArray VirtualTextureFile::read_page(uint32_t p_mip, uint32_t p_page_x,
 
 	const uint64_t idx = (uint64_t)p_page_y * pages_x[p_mip] + p_page_x;
 	const uint64_t off = mip_offset[p_mip] + idx * PAGE_BYTES;
+	
+	MutexLock lock(file_mutex);
 	file->seek(off);
 	out.resize(PAGE_BYTES);
 	const uint64_t read = file->get_buffer(out.ptrw(), PAGE_BYTES);
