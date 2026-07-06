@@ -1435,7 +1435,7 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 							u.hint != ShaderLanguage::ShaderNode::Uniform::HINT_NORMAL_ROUGHNESS_TEXTURE &&
 							texture_uniform_name_for_vt != SNAME("RADIANCE")) {
 							
-							String vt_id_name = _mkid(texture_uniform_name_for_vt) + "_vt_id";
+							String vt_id_name = actions.base_uniform_string + _mkid(texture_uniform_name_for_vt) + "_vt_id";
 							String uv_code = _dump_node_code(onode->arguments[2], p_level, r_gen_code, p_actions, p_default_actions, p_assigning);
 							code = "((" + vt_id_name + " != 0xFFFFFFFFu) ? sampleVirtual(" + vt_id_name + ", " + uv_code + ") : " + code + ")";
 						}
@@ -1653,6 +1653,7 @@ Error ShaderCompiler::compile(RSE::ShaderMode p_mode, const String &p_code, Iden
 	r_gen_code.code.clear();
 	for (int i = 0; i < STAGE_MAX; i++) {
 		r_gen_code.stage_globals[i] = String();
+		r_gen_code.stage_globals[i] += "\n#ifndef VIRTUAL_TEXTURES_ENABLED\n#define sampleVirtual(id, uv) vec4(0.0)\n#endif\n";
 	}
 	r_gen_code.uses_fragment_time = false;
 	r_gen_code.uses_vertex_time = false;

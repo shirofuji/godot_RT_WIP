@@ -38,6 +38,7 @@
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_mobile/scene_shader_forward_mobile.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
 #include "servers/rendering/storage/variant_converters.h"
 
 using namespace RendererRD;
@@ -738,11 +739,45 @@ bool MaterialStorage::ShaderData::blend_mode_uses_blend_alpha(BlendMode p_mode) 
 ///////////////////////////////////////////////////////////////////////////
 // MaterialStorage::MaterialData
 
-void MaterialStorage::MaterialData::update_uniform_buffer(const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms, const uint32_t *p_uniform_offsets, const HashMap<StringName, Variant> &p_parameters, uint8_t *p_buffer, uint32_t p_buffer_size, bool p_use_linear_color) {
+void MaterialStorage::MaterialData::update_uniform_buffer(const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms, const uint32_t *p_uniform_offsets, const HashMap<StringName, Variant> &p_parameters, const HashMap<StringName, HashMap<int, RID>> &p_default_textures, uint8_t *p_buffer, uint32_t p_buffer_size, bool p_use_linear_color) {
 	MaterialStorage *material_storage = MaterialStorage::get_singleton();
 	bool uses_global_buffer = false;
 
+	uint32_t albedo_vt_id = 0xFFFFFFFF;
+	uint32_t normal_vt_id = 0xFFFFFFFF;
+	uint32_t orm_vt_id = 0xFFFFFFFF;
+
 	for (const KeyValue<StringName, ShaderLanguage::ShaderNode::Uniform> &E : p_uniforms) {
+		if (E.value.is_virtual_texture_id) {
+			uint32_t vt_id = 0xFFFFFFFF;
+			String sampler_name = String(E.key).trim_suffix("_vt_id");
+
+			// find the RID for this sampler
+			RID tex_rid;
+			HashMap<StringName, Variant>::ConstIterator VTex = p_parameters.find(sampler_name);
+			if (VTex && VTex->value.get_type() == Variant::RID) {
+				tex_rid = VTex->value;
+			} else {
+				HashMap<StringName, HashMap<int, RID>>::ConstIterator W = p_default_textures.find(sampler_name);
+				if (W && W->value.has(0)) {
+					tex_rid = W->value[0];
+				}
+			}
+
+			if (tex_rid.is_valid() && VirtualTextureStorage::get_singleton() != nullptr) {
+				vt_id = VirtualTextureStorage::get_singleton()->register_virtual_texture(tex_rid);
+			}
+
+			if (sampler_name == "texture_albedo") albedo_vt_id = vt_id;
+			else if (sampler_name == "texture_normal") normal_vt_id = vt_id;
+			else if (sampler_name == "texture_orm") orm_vt_id = vt_id;
+
+			uint32_t offset = p_uniform_offsets[E.value.order];
+			uint32_t *gui = (uint32_t *)&p_buffer[offset];
+			gui[0] = vt_id;
+			continue;
+		}
+
 		if (E.value.is_texture()) {
 			continue; // texture, does not go here
 		}
@@ -832,6 +867,12 @@ void MaterialStorage::MaterialData::update_uniform_buffer(const HashMap<StringNa
 		} else {
 			material_storage->global_shader_uniforms.materials_using_buffer.erase(global_buffer_E);
 			global_buffer_E = nullptr;
+		}
+	}
+
+	if (albedo_vt_id != 0xFFFFFFFF || normal_vt_id != 0xFFFFFFFF || orm_vt_id != 0xFFFFFFFF) {
+		if (VirtualTextureStorage::get_singleton() != nullptr) {
+			VirtualTextureStorage::get_singleton()->link_material_siblings(albedo_vt_id, normal_vt_id, orm_vt_id);
 		}
 	}
 }
@@ -1153,6 +1194,10 @@ void MaterialStorage::MaterialData::free_parameters_uniform_set(RID p_uniform_se
 }
 
 bool MaterialStorage::MaterialData::update_parameters_uniform_set(const HashMap<StringName, Variant> &p_parameters, bool p_uniform_dirty, bool p_textures_dirty, const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms, const uint32_t *p_uniform_offsets, const Vector<ShaderCompiler::GeneratedCode::Texture> &p_texture_uniforms, const HashMap<StringName, HashMap<int, RID>> &p_default_texture_params, uint32_t p_ubo_size, RID &uniform_set, RID p_shader, uint32_t p_shader_uniform_set, bool p_use_linear_color, bool p_3d_material) {
+	if (p_textures_dirty) {
+		p_uniform_dirty = true;
+	}
+
 	if ((uint32_t)ubo_data[p_use_linear_color].size() != p_ubo_size) {
 		p_uniform_dirty = true;
 		if (uniform_buffer[p_use_linear_color].is_valid()) {
@@ -1176,7 +1221,7 @@ bool MaterialStorage::MaterialData::update_parameters_uniform_set(const HashMap<
 
 	//check whether buffer changed
 	if (p_uniform_dirty && ubo_data[p_use_linear_color].size()) {
-		update_uniform_buffer(p_uniforms, p_uniform_offsets, p_parameters, ubo_data[p_use_linear_color].ptrw(), ubo_data[p_use_linear_color].size(), p_use_linear_color);
+		update_uniform_buffer(p_uniforms, p_uniform_offsets, p_parameters, p_default_texture_params, ubo_data[p_use_linear_color].ptrw(), ubo_data[p_use_linear_color].size(), p_use_linear_color);
 		RD::get_singleton()->buffer_update(uniform_buffer[p_use_linear_color], 0, ubo_data[p_use_linear_color].size(), ubo_data[p_use_linear_color].ptrw());
 	}
 

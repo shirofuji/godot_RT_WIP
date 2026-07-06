@@ -277,6 +277,9 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 	}
 
 	RD *rd = RD::get_singleton();
+	if (!rd->texture_is_valid(p_source_rd_texture)) {
+		return 0xFFFFFFFF;
+	}
 	RD::TextureFormat src_fmt = rd->texture_get_format(p_source_rd_texture);
 	uint32_t width = src_fmt.width;
 	uint32_t height = src_fmt.height;
@@ -859,9 +862,12 @@ void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_reques
 	for (uint32_t i = 0; i < expanded.size(); i++) {
 		const PageRequest &req = expanded[i];
 		if (req.vt_id >= virtual_textures.size()) {
-			continue;
+			continue; // Stale or invalid ID
 		}
 		VirtualTexture &vt = virtual_textures[req.vt_id];
+		if (vt.source.is_valid() && !rd->texture_is_valid(vt.source)) {
+			continue; // Texture was freed
+		}
 		if ((vt.source.is_null() && vt.file.is_null()) || req.mip >= vt.resident_mip_floor) {
 			continue; // invalid, or an always-resident base mip
 		}

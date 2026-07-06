@@ -1746,10 +1746,11 @@ void TextureStorage::texture_drawable_blit_rect(const TypedArray<RID> &p_texture
 		u.binding = i;
 		if (i < p_source_textures.size()) {
 			src_textures[i] = get_texture(p_source_textures[i]);
-			if (!src_textures[i]) {
+			RID tex_rid = texture_get_rd_texture(p_source_textures[i]);
+			if (!src_textures[i] || !tex_rid.is_valid()) {
 				u.append_id(default_tex_rid);
 			} else {
-				u.append_id(src_textures[i]->rd_texture);
+				u.append_id(tex_rid);
 			}
 		} else {
 			u.append_id(default_tex_rid);
