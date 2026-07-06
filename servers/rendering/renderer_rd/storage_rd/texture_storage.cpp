@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
+#include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
 #include "servers/rendering/rendering_server_globals.h"
 
 using namespace RendererRD;
@@ -942,6 +943,10 @@ void TextureStorage::texture_free(RID p_texture) {
 	ERR_FAIL_COND(t->is_render_target);
 
 	t->cleanup();
+
+	if (VirtualTextureStorage::get_singleton()) {
+		VirtualTextureStorage::get_singleton()->free_virtual_texture_by_source(p_texture);
+	}
 
 	if (t->is_proxy && t->proxy_to.is_valid()) {
 		Texture *proxy_to = texture_owner.get_or_null(t->proxy_to);

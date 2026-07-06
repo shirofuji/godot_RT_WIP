@@ -82,6 +82,7 @@ public:
 	uint32_t get_pages_y(uint32_t p_mip) const { return p_mip < header.mip_count ? pages_y[p_mip] : 0; }
 	// Reads one STORED_PAGE_SIZE^2 RGBA8 page (PAGE_BYTES). Returns an empty array on any error.
 	PackedByteArray read_page(uint32_t p_mip, uint32_t p_page_x, uint32_t p_page_y);
+	String get_path() const { return file.is_valid() ? file->get_path() : String(); }
 	void close();
 
 private:

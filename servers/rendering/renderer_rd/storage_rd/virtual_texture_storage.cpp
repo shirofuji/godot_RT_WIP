@@ -271,7 +271,7 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 	if (!_ensure_initialized()) {
 		return 0xFFFFFFFF;
 	}
-	if (virtual_textures.size() >= MAX_VIRTUAL_TEXTURES) {
+	if (virtual_textures.size() >= MAX_VIRTUAL_TEXTURES && free_vt_ids.is_empty()) {
 		WARN_PRINT_ONCE("VirtualTextureStorage: virtual-texture table full (MAX_VIRTUAL_TEXTURES); extra textures fall back to scalar PBR factors.");
 		return 0xFFFFFFFF;
 	}
@@ -296,9 +296,19 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 	uint32_t mip_count = MIN(src_fmt.mipmaps, INDIRECTION_MIPS);
 	mip_count = MAX(mip_count, 1u);
 
-	uint32_t vt_id = virtual_textures.size();
+	uint32_t vt_id;
+	if (!free_vt_ids.is_empty()) {
+		vt_id = free_vt_ids[free_vt_ids.size() - 1];
+		free_vt_ids.remove_at(free_vt_ids.size() - 1);
+	} else if (virtual_textures.size() < MAX_VIRTUAL_TEXTURES) {
+		vt_id = virtual_textures.size();
+		virtual_textures.push_back(VirtualTexture());
+	} else {
+		WARN_PRINT_ONCE("VirtualTextureStorage: virtual-texture table full (MAX_VIRTUAL_TEXTURES); extra textures fall back to scalar PBR factors.");
+		return 0xFFFFFFFF;
+	}
 
-	VirtualTexture vt;
+	VirtualTexture &vt = virtual_textures[vt_id];
 	vt.source = p_source_rd_texture;
 	vt.width = width;
 	vt.height = height;
@@ -411,11 +421,11 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 	rd->buffer_update(vt_metadata_buffer, vt_id * sizeof(VTMetadataGPU), sizeof(VTMetadataGPU), &meta);
 
 	// Keep a CPU shadow of the page table + the floor so update_streaming() can patch individual page
-	// texels (resident on stream-in, not-resident on eviction) and re-upload just the changed layers.
-	vt.resident_mip_floor = always_resident_from;
+	// texels (resident on stream-in, not-resident on eviction) and re-upload just the change
+	vt.resident_mip_floor = 0; // S0a: 0 = everything resident.
 	vt.indirection_cpu = indirection_data;
+	vt.siblings.clear();
 
-	virtual_textures.push_back(vt);
 	source_rid_to_vt_id[p_source_rd_texture] = vt_id;
 	return vt_id;
 }
@@ -450,10 +460,6 @@ uint32_t VirtualTextureStorage::register_virtual_texture_file(const String &p_sv
 	if (!_ensure_initialized()) {
 		return 0xFFFFFFFF;
 	}
-	if (virtual_textures.size() >= MAX_VIRTUAL_TEXTURES) {
-		WARN_PRINT_ONCE("VirtualTextureStorage: virtual-texture table full (MAX_VIRTUAL_TEXTURES); extra textures fall back to scalar PBR factors.");
-		return 0xFFFFFFFF;
-	}
 
 	Ref<VirtualTextureFile> vtf;
 	vtf.instantiate();
@@ -468,9 +474,20 @@ uint32_t VirtualTextureStorage::register_virtual_texture_file(const String &p_sv
 	}
 
 	RD *rd = RD::get_singleton();
-	const uint32_t vt_id = virtual_textures.size();
+	uint32_t vt_id;
+	if (!free_vt_ids.is_empty()) {
+		vt_id = free_vt_ids[free_vt_ids.size() - 1];
+		free_vt_ids.remove_at(free_vt_ids.size() - 1);
+	} else if (virtual_textures.size() < MAX_VIRTUAL_TEXTURES) {
+		vt_id = virtual_textures.size();
+		virtual_textures.push_back(VirtualTexture());
+	} else {
+		WARN_PRINT_ONCE("VirtualTextureStorage: virtual-texture table full (MAX_VIRTUAL_TEXTURES); extra textures fall back to scalar PBR factors.");
+		return 0xFFFFFFFF;
+	}
 
-	VirtualTexture vt;
+	VirtualTexture &vt = virtual_textures[vt_id];
+	vt.source = RID();
 	vt.file = vtf; // Ownership transfers to the stored VT (freed in free_virtual_texture / destructor).
 	vt.width = width;
 	vt.height = height;
@@ -506,6 +523,7 @@ uint32_t VirtualTextureStorage::register_virtual_texture_file(const String &p_sv
 
 	rd->draw_command_begin_label("VT register file (resident base upload)");
 	bool out_of_tiles = false;
+	Vector<uint32_t> resident_tiles;
 	for (uint32_t m = always_resident_from; m < mip_count && !out_of_tiles; m++) {
 		uint32_t mip_w = MAX(width >> m, 1u);
 		uint32_t mip_h = MAX(height >> m, 1u);
@@ -523,7 +541,7 @@ uint32_t VirtualTextureStorage::register_virtual_texture_file(const String &p_sv
 					out_of_tiles = true;
 					break;
 				}
-				vt.resident_tiles.push_back(tile);
+				resident_tiles.push_back(tile);
 
 				const PackedByteArray page = vtf->read_page(m, px, py);
 				if (page.size() == (int)POOL_TILE_BYTES) {
@@ -551,10 +569,11 @@ uint32_t VirtualTextureStorage::register_virtual_texture_file(const String &p_sv
 	meta.resident_mip_floor = always_resident_from;
 	rd->buffer_update(vt_metadata_buffer, vt_id * sizeof(VTMetadataGPU), sizeof(VTMetadataGPU), &meta);
 
-	vt.resident_mip_floor = always_resident_from;
+	vt.resident_mip_floor = mip_count; // File is not fully resident.
+	vt.resident_tiles = resident_tiles;
 	vt.indirection_cpu = indirection_data;
+	vt.siblings.clear();
 
-	virtual_textures.push_back(vt);
 	source_path_to_vt_id[p_svt_path] = vt_id;
 	return vt_id;
 }
@@ -568,11 +587,38 @@ void VirtualTextureStorage::free_virtual_texture(uint32_t p_vt_id) {
 		_free_tile(vt.resident_tiles[i]);
 	}
 	vt.resident_tiles.clear();
+	if (vt.source.is_valid()) {
+		source_rid_to_vt_id.erase(vt.source);
+		vt.source = RID();
+	}
 	if (vt.file.is_valid()) {
+		source_path_to_vt_id.erase(vt.file->get_path());
 		vt.file.unref(); // Close the `.svt` page provider (file-backed VT).
 	}
-	// Leaves the slot in place (append-only vt_id space in S0a); a full free-list of vt_ids is an
-	// S0c concern alongside indirection-layer reuse.
+	
+	for (uint32_t i = 0; i < tile_page_key.size(); i++) {
+		uint64_t key = tile_page_key[i];
+		if (key != NO_STREAMED_PAGE) {
+			uint32_t key_vt_id = (key >> 48) & 0xFFFF;
+			if (key_vt_id == p_vt_id) {
+				streamed_page_to_tile.erase(key);
+				tile_page_key[i] = NO_STREAMED_PAGE;
+				_free_tile(i);
+			}
+		}
+	}
+	vt.vt_id = 0xFFFFFFFF;
+	free_vt_ids.push_back(p_vt_id);
+}
+
+void VirtualTextureStorage::free_virtual_texture_by_source(RID p_source) {
+	if (p_source.is_null()) {
+		return;
+	}
+	HashMap<RID, uint32_t>::Iterator it = source_rid_to_vt_id.find(p_source);
+	if (it != source_rid_to_vt_id.end()) {
+		free_virtual_texture(it->value);
+	}
 }
 
 RID VirtualTextureStorage::get_page_pool_texture_rid() {
@@ -858,14 +904,14 @@ void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_reques
 			}
 		}
 	}
-
+	LocalVector<FileStreamRequest> file_reqs;
 	for (uint32_t i = 0; i < expanded.size(); i++) {
 		const PageRequest &req = expanded[i];
 		if (req.vt_id >= virtual_textures.size()) {
 			continue; // Stale or invalid ID
 		}
 		VirtualTexture &vt = virtual_textures[req.vt_id];
-		if (vt.source.is_valid() && !rd->texture_is_valid(vt.source)) {
+		if (vt.source.is_valid() && vt.source.is_null()) {
 			continue; // Texture was freed
 		}
 		if ((vt.source.is_null() && vt.file.is_null()) || req.mip >= vt.resident_mip_floor) {
@@ -907,11 +953,17 @@ void VirtualTextureStorage::update_streaming(const Vector<PageRequest> &p_reques
 			f_req.page_y = req.page_y;
 			f_req.tile = tile;
 			f_req.file = vt.file;
-			file_stream_mutex.lock();
-			file_stream_queue.push_back(f_req);
-			file_stream_mutex.unlock();
+			file_reqs.push_back(f_req);
 		}
 		streamed++;
+	}
+	
+	if (!file_reqs.is_empty()) {
+		file_stream_mutex.lock();
+		for (uint32_t i = 0; i < file_reqs.size(); i++) {
+			file_stream_queue.push_back(file_reqs[i]);
+		}
+		file_stream_mutex.unlock();
 	}
 
 	// Blit all newly-resident pages in one compute list. Uniform sets (one per distinct source) must

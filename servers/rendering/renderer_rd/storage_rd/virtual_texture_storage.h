@@ -152,6 +152,7 @@ public:
 	// Releases a virtual texture's pool tiles and clears its indirection layer. Safe to call on an
 	// unregistered/invalid vt_id (no-op).
 	void free_virtual_texture(uint32_t p_vt_id);
+	void free_virtual_texture_by_source(RID p_source);
 
 	// --- Bindings the renderer hands to its uniform set (replacing the material_textures[256] array +
 	// its sampler). The pool is sampled with a clamp sampler (borders handle cross-page filtering);
@@ -266,6 +267,7 @@ private:
 		LocalVector<uint32_t> siblings;
 	};
 	LocalVector<VirtualTexture> virtual_textures; // Indexed by vt_id.
+	LocalVector<uint32_t> free_vt_ids; // Recycled vt_ids for newly registered textures.
 	HashMap<RID, uint32_t> source_rid_to_vt_id; // Dedup (runtime source-texture path).
 	HashMap<String, uint32_t> source_path_to_vt_id; // Dedup (import-baked .svt path).
 
