@@ -816,6 +816,56 @@ void ImporterMesh::generate_lods(float p_normal_merge_angle, Array p_bone_transf
 		LocalVector<int> current_indices(merged_indices);
 		float current_error = 0.0f;
 		bool allow_prune = true;
+		
+		bool is_foliage = false;
+		{
+			// Foliage is entirely made of disconnected alpha cards, meaning it is almost entirely
+			// boundary edges. If we lock boundary edges (the default), foliage cannot be simplified at all.
+			// We can detect this by counting unique edges vs boundary edges.
+			
+			struct Edge {
+				uint32_t a, b;
+				bool operator<(const Edge &p_edge) const {
+					if (a == p_edge.a) return b < p_edge.b;
+					return a < p_edge.a;
+				}
+				bool operator==(const Edge &p_edge) const {
+					return a == p_edge.a && b == p_edge.b;
+				}
+				Edge(uint32_t p_a, uint32_t p_b) {
+					a = MIN(p_a, p_b);
+					b = MAX(p_a, p_b);
+				}
+				Edge() {}
+			};
+			
+			LocalVector<Edge> edges;
+			edges.resize(current_indices.size());
+			for (int i = 0; i < current_indices.size(); i += 3) {
+				edges[i] = Edge(current_indices[i], current_indices[i + 1]);
+				edges[i + 1] = Edge(current_indices[i + 1], current_indices[i + 2]);
+				edges[i + 2] = Edge(current_indices[i + 2], current_indices[i]);
+			}
+			edges.sort();
+			
+			int total_edges = 0;
+			int boundary_edges = 0;
+			for (uint32_t i = 0; i < edges.size(); ) {
+				int count = 1;
+				while (i + count < edges.size() && edges[i] == edges[i + count]) {
+					count++;
+				}
+				total_edges++;
+				if (count == 1) {
+					boundary_edges++;
+				}
+				i += count;
+			}
+			
+			if (total_edges > 0 && (float)boundary_edges / (float)total_edges > 0.5f) {
+				is_foliage = true;
+			}
+		}
 
 		while (current_indices.size() > min_target_indices * 2) {
 			unsigned int current_index_count = current_indices.size();
@@ -827,7 +877,9 @@ void ImporterMesh::generate_lods(float p_normal_merge_angle, Array p_bone_transf
 			int simplify_options = SurfaceTool::SIMPLIFY_SPARSE; // Does not change appearance, but speeds up subsequent iterations.
 
 			// Lock geometric boundary in case the mesh is composed of multiple material subsets.
-			simplify_options |= SurfaceTool::SIMPLIFY_LOCK_BORDER;
+			if (!is_foliage) {
+				simplify_options |= SurfaceTool::SIMPLIFY_LOCK_BORDER;
+			}
 
 			if (allow_prune) {
 				// Remove small disconnected components.
@@ -840,19 +892,33 @@ void ImporterMesh::generate_lods(float p_normal_merge_angle, Array p_bone_transf
 			}
 
 			float step_error = 0.0f;
-			size_t new_index_count = SurfaceTool::simplify_with_attrib_func(
-					(unsigned int *)new_indices.ptrw(),
-					(const uint32_t *)current_indices.ptr(), current_index_count,
-					merged_vertices_f32.ptr(), merged_vertex_count,
-					sizeof(float) * 3, // Vertex stride
-					merged_attribs_ptr,
-					sizeof(float) * attrib_count, // Attribute stride
-					attrib_weights, attrib_count,
-					nullptr, // Vertex lock
-					target_index_count,
-					max_mesh_error,
-					simplify_options,
-					&step_error);
+			size_t new_index_count = 0;
+			
+			if (is_foliage) {
+				new_index_count = SurfaceTool::simplify_func(
+						(unsigned int *)new_indices.ptrw(),
+						(const uint32_t *)current_indices.ptr(), current_index_count,
+						merged_vertices_f32.ptr(), merged_vertex_count,
+						sizeof(float) * 3, // Vertex stride
+						target_index_count,
+						max_mesh_error,
+						simplify_options,
+						&step_error);
+			} else {
+				new_index_count = SurfaceTool::simplify_with_attrib_func(
+						(unsigned int *)new_indices.ptrw(),
+						(const uint32_t *)current_indices.ptr(), current_index_count,
+						merged_vertices_f32.ptr(), merged_vertex_count,
+						sizeof(float) * 3, // Vertex stride
+						merged_attribs_ptr,
+						sizeof(float) * attrib_count, // Attribute stride
+						attrib_weights, attrib_count,
+						nullptr, // Vertex lock
+						target_index_count,
+						max_mesh_error,
+						simplify_options,
+						&step_error);
+			}
 
 			if (new_index_count == 0 && allow_prune) {
 				// If the best result the simplifier could arrive at with pruning enabled is 0 triangles, there might still be an opportunity

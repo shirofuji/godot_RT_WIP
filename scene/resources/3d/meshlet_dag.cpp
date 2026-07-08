@@ -38,9 +38,9 @@
 
 namespace {
 
-// Triangle count we aim to keep per group when simplifying one level into the next. ~4 clusters of
-// ~124 tris merged and halved -> ~250 tris -> ~2-3 parent clusters, a ~2x reduction per level.
-constexpr uint32_t GROUP_SIZE = 4;
+// Triangle count we aim to keep per group when simplifying one level into the next. ~16 clusters of
+// ~124 tris merged and halved -> ~1000 tris -> ~8 parent clusters, a ~2x reduction per level.
+constexpr uint32_t GROUP_SIZE = 16;
 
 // Bounding sphere (centroid + max radius) of the unique vertices referenced by a flat index list.
 void compute_bounds(const LocalVector<uint32_t> &p_indices, const Vector3 *p_positions, Vector3 &r_center, float &r_radius) {
@@ -166,8 +166,8 @@ void group_clusters(const LocalVector<uint32_t> &p_working, const LocalVector<Me
 // inter-group boundary edge is used once in each of the two groups it separates, both groups lock
 // the same vertices independently -> the simplification can't move them on either side -> the seam
 // stays watertight. (Also locks mesh-open-border vertices, which is correct.) Sized to the full
-// shared vertex array and indexed by global vertex id.
-void compute_boundary_lock(const LocalVector<uint32_t> &p_merged, uint32_t p_vertex_count, LocalVector<uint8_t> &r_lock) {
+// shared vertex array and indexed by global vertex id. Returns true if foliage is detected.
+bool compute_boundary_lock(const LocalVector<uint32_t> &p_merged, uint32_t p_vertex_count, LocalVector<uint8_t> &r_lock) {
 	r_lock.clear();
 	r_lock.resize(p_vertex_count);
 	memset(r_lock.ptr(), 0, p_vertex_count);
@@ -186,14 +186,33 @@ void compute_boundary_lock(const LocalVector<uint32_t> &p_merged, uint32_t p_ver
 			edge_count[key] = edge_count.has(key) ? edge_count[key] + 1 : 1;
 		}
 	}
+	uint32_t boundary_edges = 0;
+	uint32_t total_edges = edge_count.size();
+
 	for (const KeyValue<uint64_t, uint32_t> &kv : edge_count) {
 		if (kv.value == 1) {
-			uint32_t lo = (uint32_t)(kv.key >> 32);
-			uint32_t hi = (uint32_t)(kv.key & 0xffffffff);
-			r_lock[lo] = 1;
-			r_lock[hi] = 1;
+			boundary_edges++;
 		}
 	}
+
+	// If more than 50% of the unique edges are boundary edges, this is likely 
+	// foliage (e.g. disconnected alpha cards). Locking the boundaries would lock 
+	// almost all vertices, completely stalling simplification.
+	// By skipping the lock, we allow aggressive simplification of the cards. 
+	// The resulting tearing at cluster boundaries is invisible for non-watertight meshes.
+	if (total_edges > 0 && (float)boundary_edges / (float)total_edges > 0.5f) {
+		return true;
+	}
+	
+	for (const KeyValue<uint64_t, uint32_t> &kv : edge_count) {
+		if (kv.value == 1) {
+			uint32_t v1 = kv.key >> 32;
+			uint32_t v2 = kv.key & 0xFFFFFFFF;
+			r_lock[v1] = 1; // 1 = lock vertex
+			r_lock[v2] = 1;
+		}
+	}
+	return false;
 }
 
 } // namespace
@@ -277,19 +296,35 @@ bool MeshletDAG::build(const PackedVector3Array &p_positions, const PackedInt32A
 
 			// Lock the group's outer boundary, then simplify the interior to ~half the triangles.
 			LocalVector<uint8_t> lock;
-			compute_boundary_lock(merged, vertex_count, lock);
+			bool is_foliage = compute_boundary_lock(merged, vertex_count, lock);
 
 			LocalVector<uint32_t> simplified;
 			simplified.resize(merged.size());
 			float sim_error = 0.0f;
-			size_t result_count = SurfaceTool::simplify_with_attrib_func(
+			
+			unsigned int simplify_options = SurfaceTool::SIMPLIFY_ERROR_ABSOLUTE;
+			size_t result_count = 0;
+			if (is_foliage) {
+				simplify_options |= SurfaceTool::SIMPLIFY_PRUNE;
+			}
+			
+			result_count = SurfaceTool::simplify_with_attrib_func(
 					(unsigned int *)simplified.ptr(), (const unsigned int *)merged.ptr(), merged.size(),
 					positions_f.ptr(), vertex_count, sizeof(float) * 3,
 					nullptr, 0, nullptr, 0, // No attributes.
 					lock.ptr(),
 					(size_t)((merged_tris / 2) * 3), FLT_MAX,
-					SurfaceTool::SIMPLIFY_ERROR_ABSOLUTE, &sim_error);
+					simplify_options, &sim_error);
+			
 			simplified.resize(result_count);
+			
+			if (is_foliage) {
+				// Foliage pruning produces massive geometric error (e.g. collapsing an entire leaf).
+				// We intentionally scale this error down so the renderer will aggressively select 
+				// this LOD at a much closer distance, drastically improving performance at the cost 
+				// of slight popping (which is acceptable for noisy foliage).
+				sim_error *= 0.01f;
+			}
 
 			// Monotonic error: a parent LOD can never have less error than any child it replaces.
 			float group_error = MAX(sim_error, child_max_error);
