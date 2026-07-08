@@ -4,6 +4,7 @@
 #include "core/object/object.h"
 #include "core/object/object_id.h"
 #include "core/templates/sort_array.h"
+#include "core/math/geometry_3d.h"
 
 #include "shaders/body_to_multimesh.glsl.gen.h"
 #include "shaders/grid_build.glsl.gen.h"
@@ -298,6 +299,15 @@ int KilosPhysicsServer3D::bulk_body_create(int p_count) {
 	if ((uint32_t)body_data.size() < body_high_water) {
 		body_data.resize(body_high_water);
 	}
+	// Grow the CPU velocity-input shadow in lockstep (4 floats/slot), zeroed so new
+	// slots have w=0 (no override) and just fall under gravity until the AI sets them.
+	if (velocity_shadow.size() < (uint32_t)body_high_water * 4u) {
+		const uint32_t old_size = velocity_shadow.size();
+		velocity_shadow.resize((uint32_t)body_high_water * 4u);
+		for (uint32_t i = old_size; i < velocity_shadow.size(); i++) {
+			velocity_shadow[i] = 0.0f;
+		}
+	}
 	for (uint32_t i = 0; i < (uint32_t)p_count; i++) {
 		RigidBodyData &d = body_data[base + i];
 		memset(&d, 0, sizeof(RigidBodyData));
@@ -376,6 +386,106 @@ void KilosPhysicsServer3D::bulk_body_free(int p_handle) {
 	r.count = bulk->count;
 	dirty_ranges.push_back(r);
 	bulk_ranges.erase(p_handle);
+}
+
+void KilosPhysicsServer3D::bulk_body_set_tracked(int p_handle, bool p_tracked) {
+	KilosBulk *bulk = bulk_ranges.getptr(p_handle);
+	if (!bulk) return;
+	
+	if (p_tracked) {
+		for (uint32_t i = 0; i < bulk->count; i++) {
+			uint32_t slot = bulk->base + i;
+			if (tracked_slots.find(slot) == -1) {
+				tracked_slots.push_back(slot);
+			}
+		}
+	} else {
+		for (uint32_t i = 0; i < bulk->count; i++) {
+			uint32_t slot = bulk->base + i;
+			tracked_slots.erase(slot);
+		}
+	}
+}
+
+void KilosPhysicsServer3D::bulk_body_set_velocity(int p_handle, int p_index, const Vector3 &p_velocity) {
+	KilosBulk *bulk = bulk_ranges.getptr(p_handle);
+	if (!bulk || p_index < 0 || p_index >= (int)bulk->count) return;
+
+	const uint32_t slot = bulk->base + p_index;
+	// Write into the CPU velocity-INPUT shadow (SoA), not the body struct. w=1 tells
+	// the integrator to use this as the base velocity. This never marks the body
+	// slot dirty, so it does NOT re-upload (and clobber) the GPU-owned position.
+	velocity_shadow[slot * 4 + 0] = p_velocity.x;
+	velocity_shadow[slot * 4 + 1] = p_velocity.y;
+	velocity_shadow[slot * 4 + 2] = p_velocity.z;
+	velocity_shadow[slot * 4 + 3] = 1.0f; // override flag
+	if (slot < vel_dirty_min) {
+		vel_dirty_min = slot;
+	}
+	if (slot > vel_dirty_max) {
+		vel_dirty_max = slot;
+	}
+}
+
+void KilosPhysicsServer3D::bulk_body_set_position(int p_handle, int p_index, const Vector3 &p_position) {
+	KilosBulk *bulk = bulk_ranges.getptr(p_handle);
+	if (!bulk || p_index < 0 || p_index >= (int)bulk->count) return;
+	
+	uint32_t slot = bulk->base + p_index;
+	RigidBodyData &d = body_data[slot];
+	d.position[0] = p_position.x;
+	d.position[1] = p_position.y;
+	d.position[2] = p_position.z;
+	_mark_dirty(slot);
+}
+
+Transform3D KilosPhysicsServer3D::bulk_body_get_transform(int p_handle, int p_index) const {
+	const KilosBulk *bulk = bulk_ranges.getptr(p_handle);
+	if (!bulk || p_index < 0 || p_index >= (int)bulk->count) return Transform3D();
+	
+	uint32_t slot = bulk->base + p_index;
+	
+	MutexLock lock(readback_mutex);
+	if (const RigidBodyData *d = readback_results.getptr(slot)) {
+		Vector3 pos(d->position[0], d->position[1], d->position[2]);
+		Quaternion q(d->rotation[0], d->rotation[1], d->rotation[2], d->rotation[3]);
+		if (!q.is_normalized()) q = Quaternion();
+		return Transform3D(Basis(q), pos);
+	}
+	
+	// Fallback to CPU shadow if not yet read back
+	const RigidBodyData &d = body_data[slot];
+	Vector3 pos(d.position[0], d.position[1], d.position[2]);
+	Quaternion q(d.rotation[0], d.rotation[1], d.rotation[2], d.rotation[3]);
+	if (!q.is_normalized()) q = Quaternion();
+	return Transform3D(Basis(q), pos);
+}
+
+Vector<Transform3D> KilosPhysicsServer3D::bulk_body_get_transforms(int p_handle) const {
+	Vector<Transform3D> out;
+	const KilosBulk *bulk = bulk_ranges.getptr(p_handle);
+	if (!bulk) {
+		return out;
+	}
+	out.resize((int)bulk->count);
+	Transform3D *w = out.ptrw();
+
+	MutexLock lock(readback_mutex);
+	for (uint32_t i = 0; i < bulk->count; i++) {
+		const uint32_t slot = bulk->base + i;
+		const RigidBodyData *d = readback_results.getptr(slot);
+		if (!d) {
+			// Not yet read back this frame - fall back to the CPU shadow.
+			d = &body_data[slot];
+		}
+		Vector3 pos(d->position[0], d->position[1], d->position[2]);
+		Quaternion q(d->rotation[0], d->rotation[1], d->rotation[2], d->rotation[3]);
+		if (!q.is_normalized()) {
+			q = Quaternion();
+		}
+		w[i] = Transform3D(Basis(q), pos);
+	}
+	return out;
 }
 
 void KilosPhysicsServer3D::bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) {
@@ -556,6 +666,7 @@ void KilosPhysicsServer3D::body_add_shape(RID p_body, RID p_shape, const Transfo
 	bs.xform = p_transform;
 	bs.disabled = p_disabled;
 	body->shapes.push_back(bs);
+	_update_body_radius(body);
 	// Shapes often added AFTER body_set_space (e.g. GridMap), so the broadphase
 	// must be rebuilt or the body (empty when added) stays absent from it.
 	_mark_space_dirty(body->space);
@@ -567,6 +678,7 @@ void KilosPhysicsServer3D::body_set_shape(RID p_body, int p_shape_idx, RID p_sha
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.write[p_shape_idx].shape = p_shape;
+	_update_body_radius(body);
 	_mark_space_dirty(body->space);
 }
 
@@ -576,6 +688,7 @@ void KilosPhysicsServer3D::body_set_shape_transform(RID p_body, int p_shape_idx,
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.write[p_shape_idx].xform = p_transform;
+	_update_body_radius(body);
 	_mark_space_dirty(body->space);
 }
 
@@ -605,6 +718,7 @@ void KilosPhysicsServer3D::body_set_shape_disabled(RID p_body, int p_shape_idx, 
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.write[p_shape_idx].disabled = p_disabled;
+	_update_body_radius(body);
 }
 
 void KilosPhysicsServer3D::body_remove_shape(RID p_body, int p_shape_idx) {
@@ -613,6 +727,7 @@ void KilosPhysicsServer3D::body_remove_shape(RID p_body, int p_shape_idx) {
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.remove_at(p_shape_idx);
+	_update_body_radius(body);
 	_mark_space_dirty(body->space);
 }
 
@@ -621,6 +736,7 @@ void KilosPhysicsServer3D::body_clear_shapes(RID p_body) {
 	KilosBody *body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL(body);
 	body->shapes.clear();
+	_update_body_radius(body);
 	_mark_space_dirty(body->space);
 }
 
@@ -768,16 +884,9 @@ Variant KilosPhysicsServer3D::body_get_state(RID p_body, BodyState p_state) cons
 		return Variant();
 	}
 
-	// Prefer the most recent GPU readback for tracked bodies; otherwise fall
-	// back to the CPU shadow (the last value we uploaded).
+	// body_data is now updated by step() taking into account CPU overrides,
+	// so it is the reliable source of truth.
 	RigidBodyData d = body_data[body->slot];
-	if (body->tracked) {
-		MutexLock lock(readback_mutex);
-		const RigidBodyData *r = readback_results.getptr(body->slot);
-		if (r) {
-			d = *r;
-		}
-	}
 
 	if (p_state == BODY_STATE_TRANSFORM) {
 		Vector3 pos(d.position[0], d.position[1], d.position[2]);
@@ -1312,6 +1421,85 @@ void KilosPhysicsServer3D::step(real_t p_step) {
 	// Runs on the physics thread (or main thread if physics is single-threaded).
 	// Must NOT touch the RenderingDevice here: we only assemble a StepJob and
 	// hand it to the render thread, which owns all GPU state.
+
+	// CPU-side Continuous Collision Detection (CCD) for RigidBody3D nodes
+	{
+		MutexLock lock(collision_mutex);
+		static uint64_t step_counter = 0;
+		step_counter++;
+		static HashMap<uint32_t, uint64_t> cpu_override;
+
+		// 1. Apply readback results so the CPU knows where the GPU moved the bodies
+		{
+			MutexLock rb_lock(readback_mutex);
+			for (const KeyValue<uint32_t, RigidBodyData> &E : readback_results) {
+				uint64_t override_frame = 0;
+				if (cpu_override.has(E.key)) {
+					override_frame = cpu_override[E.key];
+				}
+				// Only accept readback if the CPU hasn't overridden it recently (give GPU 3 frames to catch up)
+				if (step_counter > override_frame) {
+					body_data[E.key] = E.value;
+				}
+			}
+			readback_results.clear();
+		}
+		
+		// static int frame_count = 0;
+		// if (frame_count++ % 60 == 0) {
+		// 	print_line(vformat("KilosPhysics step! active_bodies=%d, tracked_slots=%d", active_bodies.size(), tracked_slots.size()));
+		// }
+		
+		for (int i = 0; i < active_bodies.size(); i++) {
+			RID body_rid = active_bodies[i];
+			KilosBody *body = body_owner.get_or_null(body_rid);
+			if (body && body->has_slot && body->mode != BODY_MODE_STATIC && body->mode != BODY_MODE_KINEMATIC) {
+				RigidBodyData &rbd = body_data[body->slot];
+				Vector3 pos = Vector3(rbd.position[0], rbd.position[1], rbd.position[2]);
+				Vector3 vel = Vector3(rbd.linear_velocity[0], rbd.linear_velocity[1], rbd.linear_velocity[2]);
+				real_t radius = rbd.center_of_mass[3];
+				
+				Vector3 gravity = Vector3(0, -9.8, 0);
+				Vector3 next_vel = vel + gravity * p_step;
+				Vector3 next_pos = pos + next_vel * p_step;
+				
+				KilosSpace *space = space_owner.get_or_null(body->space);
+				if (space && space->bvh_dirty) {
+					_build_space_bvh(space);
+				}
+				
+				Vector3 normal;
+				Vector3 push = _recover_capsule(body->space, body_rid, pos, next_pos, radius, body->collision_mask, normal);
+				
+				// if (i == 0) {
+				// 	print_line(vformat("CPU Col: pos=%v, next_pos=%v, radius=%f, push_len=%f, space_bvh_empty=%d", pos, next_pos, radius, push.length(), space ? space->bvh.is_empty() : 1));
+				// }
+				
+				if (push.length() > 0) {
+					next_pos += push;
+					
+					real_t dot = next_vel.dot(normal);
+					if (dot < 0) {
+						// Simple bounce/restitution
+						next_vel = next_vel - normal * dot * 1.5f; 
+					}
+					
+					// Set pos such that after GPU integration (pos += next_vel * dt), we reach next_pos
+					Vector3 final_pos = next_pos - next_vel * p_step;
+					rbd.position[0] = final_pos.x;
+					rbd.position[1] = final_pos.y;
+					rbd.position[2] = final_pos.z;
+					
+					rbd.linear_velocity[0] = next_vel.x;
+					rbd.linear_velocity[1] = next_vel.y;
+					rbd.linear_velocity[2] = next_vel.z;
+					cpu_override[body->slot] = step_counter + 4; // Ignore readbacks for 4 frames
+					_mark_dirty(body->slot);
+				}
+			}
+		}
+	}
+
 	StepJob job;
 	job.dt = p_step;
 	job.body_count = body_high_water;
@@ -1358,14 +1546,35 @@ void KilosPhysicsServer3D::step(real_t p_step) {
 	}
 	dirty_ranges.clear();
 
-	// Every frame: convert each bound bulk range into its MultiMesh on the GPU.
+	// Velocity-input span written since the last step -> ONE contiguous upload. The
+	// AI touches every steered body each frame, so this collapses to a single
+	// buffer_update covering [vel_dirty_min, vel_dirty_max].
+	if (vel_dirty_min <= vel_dirty_max) {
+		VelUpload vu;
+		vu.base = vel_dirty_min;
+		const uint32_t span = (vel_dirty_max - vel_dirty_min + 1u);
+		vu.data.resize(span * 4u);
+		for (uint32_t k = 0; k < span * 4u; k++) {
+			vu.data[k] = velocity_shadow[vel_dirty_min * 4u + k];
+		}
+		job.vel_uploads.push_back(vu);
+		vel_dirty_min = 0xffffffffu;
+		vel_dirty_max = 0;
+	}
+
+	// Bind each active bulk range so the render thread converts body_buffer -> its
+	// MultiMesh directly on the GPU (compute), from THIS frame's integrated positions.
+	// This replaces the old per-instance multimesh_instance_set_transform CPU loop,
+	// which read a 2-3 frame stale CPU shadow (visible render lag) and cost one
+	// RenderingServer call per instance per frame. The CPU never touches the MultiMesh
+	// data cache now, so it won't clobber the GPU compute writes.
 	for (const KeyValue<int, KilosBulk> &E : bulk_ranges) {
 		if (E.value.multimesh.is_valid()) {
-			BulkBind bind;
-			bind.base = E.value.base;
-			bind.count = E.value.count;
-			bind.multimesh = E.value.multimesh;
-			job.bulk_binds.push_back(bind);
+			BulkBind b;
+			b.base = E.value.base;
+			b.count = E.value.count;
+			b.multimesh = E.value.multimesh;
+			job.bulk_binds.push_back(b);
 		}
 	}
 
@@ -1462,6 +1671,19 @@ void KilosPhysicsServer3D::_rt_ensure_capacity(uint32_t p_capacity) {
 		buffers_to_free.push_back(body_buffer);
 	}
 
+	// Velocity-input buffer (SoA, vec4/slot) grows in lockstep. Zero-init so all
+	// slots start with w=0 (no override).
+	const uint32_t vel_stride = 4u * sizeof(float);
+	PackedByteArray vel_zero;
+	vel_zero.resize((int64_t)new_capacity * vel_stride);
+	vel_zero.fill(0);
+	RID new_vel_buffer = rd->storage_buffer_create(vel_zero.size(), vel_zero);
+	if (vel_input_buffer.is_valid() && gpu_capacity > 0) {
+		rd->buffer_copy(vel_input_buffer, new_vel_buffer, 0, 0, (uint32_t)gpu_capacity * vel_stride);
+		buffers_to_free.push_back(vel_input_buffer);
+	}
+	vel_input_buffer = new_vel_buffer;
+
 	body_buffer = new_buffer;
 	gpu_capacity = new_capacity;
 
@@ -1473,6 +1695,15 @@ void KilosPhysicsServer3D::_rt_ensure_capacity(uint32_t p_capacity) {
 	u.append_id(body_buffer);
 	uniforms.push_back(u);
 	body_uniform_set = rd->uniform_set_create(uniforms, integrate_shader, 0);
+
+	// Velocity input is bound at set 1 for the integrate dispatch only.
+	Vector<RD::Uniform> vel_uniforms;
+	RD::Uniform vu;
+	vu.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+	vu.binding = 0;
+	vu.append_id(vel_input_buffer);
+	vel_uniforms.push_back(vu);
+	vel_input_uniform_set = rd->uniform_set_create(vel_uniforms, integrate_shader, 1);
 }
 
 void KilosPhysicsServer3D::_rt_dispatch_integrate(const StepJob &p_job) {
@@ -1496,25 +1727,52 @@ void KilosPhysicsServer3D::_rt_dispatch_integrate(const StepJob &p_job) {
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, integrate_pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, body_uniform_set, 0);
+	rd->compute_list_bind_uniform_set(compute_list, vel_input_uniform_set, 1);
 	rd->compute_list_set_push_constant(compute_list, &pc, sizeof(Params));
 	rd->compute_list_dispatch(compute_list, (p_job.body_count + 63) / 64, 1, 1);
 	rd->compute_list_end();
 }
 
 void KilosPhysicsServer3D::_rt_readback(const LocalVector<uint32_t> &p_tracked) {
-	// Async, non-stalling: each callback lands after the GPU finishes this
-	// frame's work, so tracked bodies read one frame late (acceptable).
+	// Async, non-stalling: each callback lands after the GPU finishes this frame's
+	// work, so tracked bodies read one frame late (acceptable).
+	//
+	// Coalesce contiguous slot runs into a SINGLE async transfer each. A bulk body
+	// range is one contiguous run, so tracking 250k bulk bodies costs one readback
+	// per frame, not 250k. (The old per-slot loop issued one buffer_get_data_async
+	// plus one deferred callback per tracked slot - death by a thousand cuts.)
+	if (p_tracked.is_empty()) {
+		return;
+	}
 	const uint32_t stride = sizeof(RigidBodyData);
+	LocalVector<uint32_t> sorted;
+	sorted.resize(p_tracked.size());
 	for (uint32_t i = 0; i < p_tracked.size(); i++) {
-		const uint32_t slot = p_tracked[i];
-		if (slot >= gpu_capacity) {
-			continue;
+		sorted[i] = p_tracked[i];
+	}
+	sorted.sort();
+
+	uint32_t run_start = sorted[0];
+	uint32_t prev = sorted[0];
+	const uint32_t n = sorted.size();
+	for (uint32_t i = 1; i <= n; i++) {
+		const bool end_run = (i == n) || (sorted[i] != prev + 1);
+		if (end_run) {
+			if (run_start < gpu_capacity) {
+				const uint32_t run_count = MIN(prev - run_start + 1, gpu_capacity - run_start);
+				rd->buffer_get_data_async(
+						body_buffer,
+						callable_mp(this, &KilosPhysicsServer3D::_rt_on_readback_range).bind(run_start),
+						run_start * stride,
+						run_count * stride);
+			}
+			if (i < n) {
+				run_start = sorted[i];
+			}
 		}
-		rd->buffer_get_data_async(
-				body_buffer,
-				callable_mp(this, &KilosPhysicsServer3D::_rt_on_readback).bind(slot),
-				slot * stride,
-				stride);
+		if (i < n) {
+			prev = sorted[i];
+		}
 	}
 }
 
@@ -1526,6 +1784,21 @@ void KilosPhysicsServer3D::_rt_on_readback(const PackedByteArray &p_data, uint32
 	memcpy(&d, p_data.ptr(), sizeof(RigidBodyData));
 	MutexLock lock(readback_mutex);
 	readback_results[p_slot] = d;
+}
+
+void KilosPhysicsServer3D::_rt_on_readback_range(const PackedByteArray &p_data, uint32_t p_base) {
+	const uint32_t stride = sizeof(RigidBodyData);
+	const uint32_t count = (uint32_t)p_data.size() / stride;
+	if (count == 0) {
+		return;
+	}
+	const uint8_t *src = p_data.ptr();
+	MutexLock lock(readback_mutex);
+	for (uint32_t i = 0; i < count; i++) {
+		RigidBodyData d;
+		memcpy(&d, src + i * stride, stride);
+		readback_results[p_base + i] = d;
+	}
 }
 
 void KilosPhysicsServer3D::_rt_ensure_convert_pipeline() {
@@ -1837,6 +2110,17 @@ void KilosPhysicsServer3D::_render_process_step() {
 		}
 	}
 
+	// Apply the velocity-input span (bulk AI steering) as a single buffer_update.
+	const uint32_t vel_stride = 4u * sizeof(float);
+	for (uint32_t i = 0; i < job.vel_uploads.size(); i++) {
+		const VelUpload &vu = job.vel_uploads[i];
+		const uint32_t floats = vu.data.size();
+		const uint32_t slots = floats / 4u;
+		if (floats > 0 && vu.base + slots <= gpu_capacity) {
+			rd->buffer_update(vel_input_buffer, vu.base * vel_stride, floats * sizeof(float), vu.data.ptr());
+		}
+	}
+
 	if (job.body_count == 0) {
 		return;
 	}
@@ -1851,7 +2135,9 @@ void KilosPhysicsServer3D::_render_process_step() {
 		}
 	}
 
-	// GPU->GPU: write integrated transforms straight into each bound MultiMesh.
+	// GPU->GPU MultiMesh conversion: write each bound range's instance transforms
+	// straight from the (just-integrated) body_buffer into the MultiMesh's GPU buffer.
+	// No CPU shadow, no readback in the render loop -> zero visible lag.
 	if (!job.bulk_binds.is_empty()) {
 		_rt_ensure_convert_pipeline();
 		if (rt_convert_ready) {
@@ -1861,6 +2147,8 @@ void KilosPhysicsServer3D::_render_process_step() {
 		}
 	}
 
+	// Readback is now only for CPU consumers (AI reads body positions via
+	// bulk_body_get_transforms), not for rendering.
 	if (!job.tracked.is_empty()) {
 		_rt_readback(job.tracked);
 	}
@@ -1895,8 +2183,14 @@ KilosPhysicsServer3D::~KilosPhysicsServer3D() {
 		if (body_uniform_set.is_valid()) {
 			rd->free_rid(body_uniform_set);
 		}
+		if (vel_input_uniform_set.is_valid()) {
+			rd->free_rid(vel_input_uniform_set);
+		}
 		if (body_buffer.is_valid()) {
 			rd->free_rid(body_buffer);
+		}
+		if (vel_input_buffer.is_valid()) {
+			rd->free_rid(vel_input_buffer);
 		}
 		for (uint32_t i = 0; i < buffers_to_free.size(); i++) {
 			if (buffers_to_free[i].is_valid()) {
@@ -2441,6 +2735,39 @@ bool KilosPhysicsServer3D::_body_raycast(const KilosBody *p_body, RID p_body_rid
 	return hit_any;
 }
 
+void KilosPhysicsServer3D::_update_body_radius(KilosBody *p_body) {
+	if (!p_body || !p_body->has_slot || p_body->slot >= (uint32_t)body_data.size()) {
+		return;
+	}
+	real_t max_radius_sq = 0.0;
+	for (int i = 0; i < p_body->shapes.size(); i++) {
+		const KilosBody::BodyShape &bs = p_body->shapes[i];
+		if (bs.disabled) {
+			continue;
+		}
+		KilosShape *sh = shape_owner.get_or_null(bs.shape);
+		if (!sh) {
+			continue;
+		}
+		AABB la = sh->local_aabb;
+		if (la.size == Vector3() && sh->type != SHAPE_CONCAVE_POLYGON) {
+			real_t r = MAX(sh->radius, (real_t)0.01);
+			real_t h = MAX(sh->height, 2.0 * r);
+			la = AABB(Vector3(-r, -h * 0.5, -r), Vector3(2.0 * r, h, 2.0 * r));
+		}
+		for (int j = 0; j < 8; j++) {
+			Vector3 corner = bs.xform.xform(la.get_endpoint(j));
+			real_t d_sq = corner.length_squared();
+			if (d_sq > max_radius_sq) {
+				max_radius_sq = d_sq;
+			}
+		}
+	}
+	body_data[p_body->slot].center_of_mass[3] = Math::sqrt(max_radius_sq);
+	_mark_dirty(p_body->slot);
+}
+
+
 AABB KilosPhysicsServer3D::_body_world_aabb(const KilosBody *p_body) const {
 	AABB result;
 	bool first = true;
@@ -2480,16 +2807,22 @@ void KilosPhysicsServer3D::_build_space_bvh(KilosSpace *space) {
 
 	Vector<AABB> aabbs;
 	Vector<Vector3> centroids;
+	int static_count = 0;
+	int rigid_count = 0;
 	for (const RID &rid : space->bodies) {
 		KilosBody *b = body_owner.get_or_null(rid);
 		if (!b || b->shapes.is_empty()) {
 			continue;
 		}
+		if (b->mode == BODY_MODE_STATIC) static_count++;
+		else rigid_count++;
+		
 		AABB wa = _body_world_aabb(b);
 		space->bvh_bodies.push_back(rid);
 		aabbs.push_back(wa);
 		centroids.push_back(wa.position + wa.size * 0.5);
 	}
+	// print_line(vformat("DEBUG BUILD BVH: total=%d, static=%d, rigid=%d", space->bvh_bodies.size(), static_count, rigid_count));
 	const int n = space->bvh_bodies.size();
 	if (n == 0) {
 		return;
@@ -2571,7 +2904,8 @@ Vector3 KilosPhysicsServer3D::_recover_capsule(RID p_space, RID p_exclude, const
 	cap_aabb.expand_to(p_b);
 	cap_aabb = cap_aabb.grow(p_radius);
 
-	real_t best_pen = 0.0;
+	real_t best_pen = 2.0;
+	real_t best_max_pen = 0.0;
 	Vector3 best_push;
 	Vector3 best_normal;
 
@@ -2601,16 +2935,10 @@ Vector3 KilosPhysicsServer3D::_recover_capsule(RID p_space, RID p_exclude, const
 			}
 			const Transform3D world_xform = body->transform * bs.xform;
 			const Transform3D inv = world_xform.affine_inverse();
-			Vector3 ls[3];
-			AABB laabb;
-			for (int m = 0; m < 3; m++) {
-				ls[m] = inv.xform(samples[m]);
-				if (m == 0) {
-					laabb = AABB(ls[0], Vector3());
-				} else {
-					laabb.expand_to(ls[m]);
-				}
-			}
+			Vector3 local_a = inv.xform(p_a);
+			Vector3 local_b = inv.xform(p_b);
+			AABB laabb(local_a, Vector3());
+			laabb.expand_to(local_b);
 			laabb = laabb.grow(p_radius);
 			const uint16_t *qf = shape->qfaces.ptr();
 			const AABB &qbox = shape->local_aabb;
@@ -2618,28 +2946,69 @@ Vector3 KilosPhysicsServer3D::_recover_capsule(RID p_space, RID p_exclude, const
 			int ts[64];
 			int tsp = 0;
 			ts[tsp++] = 0;
+			
+			// Compute dense samples along the segment to prevent tunneling
+			real_t seg_len = local_a.distance_to(local_b);
+			int num_samples = MAX(3, int(Math::ceil(seg_len / (p_radius * 0.8))) + 1);
+			Vector3 step_vec = (local_b - local_a) / MAX(1, num_samples - 1);
+			
+			static int debug_print = 0;
+
 			while (tsp > 0) {
 				const BVHNode &tn = shape->bvh[ts[--tsp]];
-				if (!tn.bounds.intersects(laabb)) {
+				if (tn.bounds.intersects(laabb)) {
+				} else {
 					continue;
-				}
+				};
 				if (tn.left < 0) {
 					for (int j = 0; j < tn.tri_count; j++) {
 						const int tri = tri_order[tn.tri_start + j];
 						const Vector3 A = dequant(qf + tri * 9 + 0, qbox);
 						const Vector3 B = dequant(qf + tri * 9 + 3, qbox);
 						const Vector3 C = dequant(qf + tri * 9 + 6, qbox);
-						for (int m = 0; m < 3; m++) {
-							const Vector3 cp = closest_point_on_triangle(ls[m], A, B, C);
-							const Vector3 d = ls[m] - cp;
-							const real_t dist = d.length();
-							if (dist < p_radius && dist > 1e-6) {
-								const real_t pen = p_radius - dist;
-								if (pen > best_pen) {
-									best_pen = pen;
-									best_normal = world_xform.basis.xform(d / dist).normalized();
-									best_push = best_normal * pen;
+						
+						for (int i = 0; i < num_samples; i++) {
+							real_t fraction = (real_t)i / MAX(1, num_samples - 1);
+							if (fraction > best_pen) {
+								break; // Already found an strictly earlier hit, skip remaining samples
+							}
+							
+							Vector3 sample_pos = local_a + step_vec * i;
+							const Vector3 cp = closest_point_on_triangle(sample_pos, A, B, C);
+							real_t dist = sample_pos.distance_to(cp);
+							
+							if (dist < p_radius) {
+								Vector3 d = sample_pos - cp;
+								Vector3 n = (B - A).cross(C - A).normalized();
+								bool is_backface = (local_a - A).dot(n) < -1e-3; // Epsilon to prevent resting bodies from being treated as backface
+								if (is_backface && !shape->backface) {
+									continue;
 								}
+								if (is_backface) {
+									n = -n;
+								}
+								
+								if (dist > 1e-6) {
+									d /= dist;
+									if (d.dot(n) < 0.0) {
+										d = -d; // Force the push vector to be in the same hemisphere as the face normal
+									}
+								} else {
+									d = n; // If exactly on the surface, push along the normal
+								}
+								
+								real_t pen = p_radius - dist;
+								if (fraction < best_pen || (fraction == best_pen && pen > best_max_pen)) {
+									best_pen = fraction;
+									best_max_pen = pen;
+									best_normal = world_xform.basis.xform(d).normalized();
+									
+									Vector3 world_sample = p_a + (p_b - p_a) * fraction;
+									Vector3 safe_pos = world_sample + best_normal * pen;
+									best_push = safe_pos - p_b;
+								}
+								
+								break; // We found the earliest hit for THIS triangle
 							}
 						}
 					}
@@ -2655,9 +3024,16 @@ Vector3 KilosPhysicsServer3D::_recover_capsule(RID p_space, RID p_exclude, const
 	int stack[128];
 	int sp = 0;
 	stack[sp++] = 0;
+	
+	// static int debug_bp = 0;
+	// if (debug_bp++ < 50) print_line(vformat("DEBUG BP: cap_aabb=%v", cap_aabb));
+	
 	while (sp > 0) {
 		const BVHNode &node = space->bvh[stack[--sp]];
+		// if (debug_bp < 50) print_line(vformat("DEBUG BP NODE: bounds=%v", node.bounds));
+		
 		if (!node.bounds.intersects(cap_aabb)) {
+			// if (debug_bp < 50) print_line("DEBUG BP: no intersect");
 			continue;
 		}
 		if (node.left < 0) {

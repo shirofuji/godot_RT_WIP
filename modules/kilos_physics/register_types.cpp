@@ -1,11 +1,13 @@
 #include "register_types.h"
 
 #include "kilos_physics_server_3d.h"
+#include "kilos_ecs_system.h"
 
 #include "core/config/project_settings.h"
 #include "core/object/callable_mp.h"
 #include "servers/physics_3d/physics_server_3d.h"
 #include "servers/physics_3d/physics_server_3d_wrap_mt.h"
+#include "core/object/class_db.h"
 
 static PhysicsServer3D *_createKilosPhysics3DCallback() {
 #ifdef THREADS_ENABLED
@@ -19,17 +21,16 @@ static PhysicsServer3D *_createKilosPhysics3DCallback() {
 	return memnew(PhysicsServer3DWrapMT(physics_server_3d, using_threads));
 }
 
-#include "core/object/class_db.h"
-
 void initialize_kilos_physics_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SERVERS) {
-		return;
+	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
+		GDREGISTER_CLASS(KilosPhysicsServer3D);
+		GDREGISTER_CLASS(KilosDirectSpaceState3D);
+		PhysicsServer3DManager::get_singleton()->register_server("KilosPhysics3D", callable_mp_static(_createKilosPhysics3DCallback));
+		PhysicsServer3DManager::get_singleton()->set_default_server("KilosPhysics3D");
 	}
-
-	GDREGISTER_CLASS(KilosPhysicsServer3D);
-	GDREGISTER_CLASS(KilosDirectSpaceState3D);
-	PhysicsServer3DManager::get_singleton()->register_server("KilosPhysics3D", callable_mp_static(_createKilosPhysics3DCallback));
-	PhysicsServer3DManager::get_singleton()->set_default_server("KilosPhysics3D");
+	if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
+		GDREGISTER_CLASS(KilosECSSystem);
+	}
 }
 
 void uninitialize_kilos_physics_module(ModuleInitializationLevel p_level) {

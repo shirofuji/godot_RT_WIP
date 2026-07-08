@@ -651,6 +651,15 @@ public:
 	virtual void bulk_body_scatter(int p_handle, const AABB &p_region) {}
 	virtual void bulk_body_set_multimesh(int p_handle, RID p_multimesh) {}
 	virtual void bulk_body_free(int p_handle) {}
+	virtual void bulk_body_set_tracked(int p_handle, bool p_tracked) {}
+	virtual void bulk_body_set_velocity(int p_handle, int p_index, const Vector3 &p_velocity) {}
+	virtual void bulk_body_set_position(int p_handle, int p_index, const Vector3 &p_position) {}
+	virtual Transform3D bulk_body_get_transform(int p_handle, int p_index) const { return Transform3D(); }
+	// Batched readback: returns the transforms of all bodies in the handle, indexed
+	// the same as bulk_body_set_position/velocity (0..count-1). One cross-thread sync
+	// instead of one per body - use this instead of looping bulk_body_get_transform
+	// when reading many/all bodies each frame. Empty if unsupported or handle invalid.
+	virtual Vector<Transform3D> bulk_body_get_transforms(int p_handle) const { return Vector<Transform3D>(); }
 	// Enables GPU body-body + ground collision for bulk bodies (radius, ground height,
 	// PBD solve iterations). No-op on servers that don't support it.
 	virtual void bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) {}

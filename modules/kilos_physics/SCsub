@@ -5,6 +5,7 @@ Import("env")
 
 env_kilos = env.Clone()
 env_kilos.add_source_files(env.modules_sources, "*.cpp")
+env_kilos.Append(CPPPATH=["#thirdparty/entt"])
 
 env_kilos.GLSL_HEADER("shaders/integration.glsl")
 env_kilos.GLSL_HEADER("shaders/body_to_multimesh.glsl")

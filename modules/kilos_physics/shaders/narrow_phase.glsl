@@ -107,7 +107,7 @@ void main() {
 	MeshletDescriptorGPU meshlet = meshlets.data[pair.meshlet_index];
 
 	vec3 sphere_center = body.position.xyz;
-	float sphere_radius = 1.0; // TODO: read from shape
+	float sphere_radius = max(body.center_of_mass.w, 0.001); // Read from shape radius encoded in w component
 
 	// Perform SAT against every triangle in the meshlet
 	uint num_triangles = meshlet.index_count / 3;
@@ -176,9 +176,17 @@ void main() {
 		vec3 dir = sphere_center - closest_point;
 		float len = length(dir);
 		
-		if (len < sphere_radius && len > 0.0001) {
+		if (len < sphere_radius) {
+			vec3 collision_normal = dir;
+			if (len > 0.0001) {
+				collision_normal /= len;
+				if (dot(collision_normal, tri_normal) < 0.0) {
+					collision_normal = -collision_normal; // Ensure it points out of the face
+				}
+			} else {
+				collision_normal = tri_normal;
+			}
 			float penetration_depth = sphere_radius - len;
-			vec3 collision_normal = dir / len;
 			
 			uint out_idx = atomicAdd(contact_counter.count, 1);
 			if (out_idx < params.max_contacts) {

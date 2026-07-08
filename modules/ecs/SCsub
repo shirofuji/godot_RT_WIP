@@ -1,0 +1,8 @@
+# SCsub
+
+Import("env")
+
+env.add_source_files(env.modules_sources, "*.cpp")
+
+# Add the thirdparty/entt include path
+env.Append(CPPPATH=["#thirdparty/entt"])

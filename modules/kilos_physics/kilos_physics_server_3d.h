@@ -207,6 +207,7 @@ private:
 	// CPU ray cast against all shapes of one body; updates the closest hit.
 	bool _body_raycast(const KilosBody *p_body, RID p_body_rid, const Vector3 &p_from, const Vector3 &p_to, bool p_hit_back, real_t &r_closest_t, PhysicsDirectSpaceState3D::RayResult &r_result) const;
 	AABB _body_world_aabb(const KilosBody *p_body) const;
+	void _update_body_radius(KilosBody *p_body);
 	void _build_space_bvh(KilosSpace *p_space);
 	void _mark_space_dirty(RID p_space);
 	bool _intersect_ray_unlocked(RID p_space, const PhysicsDirectSpaceState3D::RayParameters &p_parameters, PhysicsDirectSpaceState3D::RayResult &r_result);
@@ -230,6 +231,15 @@ private:
 	// path in P2 replaces this for the visual majority.
 	LocalVector<RigidBodyData> body_data;
 	uint32_t body_high_water = 0; // slots [0, body_high_water) may be live => dispatch size
+
+	// CPU-owned velocity INPUT (SoA, vec4 per slot: xyz = desired velocity, w = 1 to
+	// override the body's velocity this step, 0 = leave it to the GPU integrator).
+	// Bulk (AI-driven) bodies write here every frame; the whole dirty span uploads in
+	// ONE buffer_update, so per-body velocity writes never re-upload position (which
+	// would clobber the GPU-owned position). See bulk_body_set_velocity.
+	LocalVector<float> velocity_shadow;
+	uint32_t vel_dirty_min = 0xffffffffu;
+	uint32_t vel_dirty_max = 0;
 	Vector<uint32_t> free_slots;
 	Vector<uint32_t> dirty_slots; // slots written since the last step
 	Vector<uint32_t> tracked_slots; // slots whose GPU state we read back
@@ -275,6 +285,10 @@ private:
 		uint32_t base = 0;
 		LocalVector<RigidBodyData> data;
 	};
+	struct VelUpload {
+		uint32_t base = 0; // first slot; data is packed vec4 (4 floats) per slot
+		LocalVector<float> data;
+	};
 	struct BulkBind {
 		uint32_t base = 0;
 		uint32_t count = 0;
@@ -287,6 +301,7 @@ private:
 		LocalVector<BodyUpload> uploads;
 		LocalVector<uint32_t> tracked;
 		LocalVector<RangeUpload> range_uploads; // one-shot contiguous uploads (bulk spawn)
+		LocalVector<VelUpload> vel_uploads; // per-frame velocity-input span (bulk AI steering)
 		LocalVector<BulkBind> bulk_binds; // ranges to convert into their MultiMesh this frame
 		// collision snapshot (P3)
 		bool collision_enabled = false;
@@ -312,6 +327,8 @@ private:
 	RID integrate_pipeline;
 	RID body_buffer;
 	RID body_uniform_set;
+	RID vel_input_buffer; // SoA velocity input (vec4/slot), bound at set 1 for integrate
+	RID vel_input_uniform_set;
 	uint32_t gpu_capacity = 0;
 	LocalVector<RID> buffers_to_free; // old pool buffers, freed one step after growth
 
@@ -356,6 +373,7 @@ private:
 	void _rt_dispatch_integrate(const StepJob &p_job);
 	void _rt_readback(const LocalVector<uint32_t> &p_tracked);
 	void _rt_on_readback(const PackedByteArray &p_data, uint32_t p_slot);
+	void _rt_on_readback_range(const PackedByteArray &p_data, uint32_t p_base);
 	void _rt_ensure_convert_pipeline();
 	void _rt_convert_to_multimesh(const BulkBind &p_bind);
 	void _rt_ensure_solve_pipeline();
@@ -521,11 +539,15 @@ public:
 	virtual void meshlet_collider_set_data(RID p_collider, RID p_mesh, const Transform3D &p_transform) override;
 	virtual void meshlet_collider_set_transform(RID p_collider, const Transform3D &p_transform) override;
 	virtual void meshlet_collider_clear(RID p_collider) override;
-	/* BULK BODY API */
 	virtual int bulk_body_create(int p_count) override;
 	virtual void bulk_body_scatter(int p_handle, const AABB &p_region) override;
 	virtual void bulk_body_set_multimesh(int p_handle, RID p_multimesh) override;
 	virtual void bulk_body_free(int p_handle) override;
+	virtual void bulk_body_set_tracked(int p_handle, bool p_tracked) override;
+	virtual void bulk_body_set_velocity(int p_handle, int p_index, const Vector3 &p_velocity) override;
+	virtual void bulk_body_set_position(int p_handle, int p_index, const Vector3 &p_position) override;
+	virtual Transform3D bulk_body_get_transform(int p_handle, int p_index) const override;
+	virtual Vector<Transform3D> bulk_body_get_transforms(int p_handle) const override;
 	/* COLLISION CONFIG (P3/P4) */
 	virtual void bulk_set_collision(bool p_enabled, real_t p_radius, real_t p_ground_y, int p_iterations) override;
 	virtual void bulk_set_sdf(RID p_sdf_texture, const AABB &p_bounds) override;

@@ -16,6 +16,13 @@ layout(set = 0, binding = 0, std430) restrict buffer RigidBodyBuffer {
     RigidBodyData data[];
 } rigid_bodies;
 
+// CPU-owned velocity input (SoA). xyz = desired velocity, w = override flag.
+// w != 0 overrides the body's velocity this step (AI-driven bulk bodies); w == 0
+// leaves the GPU-integrated velocity untouched (regular rigid bodies).
+layout(set = 1, binding = 0, std430) restrict readonly buffer VelInputBuffer {
+    vec4 v[];
+} vel_input;
+
 layout(push_constant, std430) uniform Params {
     vec4 gravity;
     float delta_time;
@@ -47,6 +54,13 @@ void main() {
     // solve corrects .position in place, then the finalize pass recovers velocity
     // as (position - center_of_mass) / dt. Harmless when collision is disabled.
     body.center_of_mass.xyz = body.position.xyz;
+
+    // Apply CPU-supplied steering velocity (bulk AI bodies) before gravity. This is
+    // an INPUT buffer, so it never touches .position - the GPU keeps ownership of it.
+    vec4 vin = vel_input.v[global_id];
+    if (vin.w != 0.0) {
+        body.linear_velocity.xyz = vin.xyz;
+    }
 
     // Apply Gravity
     body.linear_velocity.xyz += params.gravity.xyz * params.delta_time;

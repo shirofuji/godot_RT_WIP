@@ -350,6 +350,11 @@ public:
 	FUNC2(bulk_body_scatter, int, const AABB &)
 	FUNC2(bulk_body_set_multimesh, int, RID)
 	FUNC1(bulk_body_free, int)
+	FUNC2(bulk_body_set_tracked, int, bool)
+	FUNC3(bulk_body_set_velocity, int, int, const Vector3 &)
+	FUNC3(bulk_body_set_position, int, int, const Vector3 &)
+	FUNC2RC(Transform3D, bulk_body_get_transform, int, int)
+	FUNC1RC(Vector<Transform3D>, bulk_body_get_transforms, int)
 	FUNC4(bulk_set_collision, bool, real_t, real_t, int)
 	FUNC2(bulk_set_sdf, RID, const AABB &)
 
