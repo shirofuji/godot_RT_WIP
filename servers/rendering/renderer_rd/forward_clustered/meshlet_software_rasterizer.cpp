@@ -127,6 +127,17 @@ MeshletSoftwareRasterizer::MeshletSoftwareRasterizer() {
 	resolve_raster_versions.push_back("\n#define MESHLET_VISBUFFER_FALLBACK\n"); // 1: fallback.
 	resolve_raster_shader.initialize(resolve_raster_versions);
 	resolve_raster_shader_version = resolve_raster_shader.version_create();
+
+	// Half-res SVOGI GI trace (denoiser Phase 1). Variants mirror the visbuffer layout.
+	Vector<String> gi_trace_versions;
+	gi_trace_versions.push_back(""); // 0: int64.
+	gi_trace_versions.push_back("\n#define MESHLET_VISBUFFER_FALLBACK\n"); // 1: fallback.
+	gi_trace_shader.initialize(gi_trace_versions);
+	gi_trace_shader_version = gi_trace_shader.version_create();
+	gi_trace_pipeline_fallback = RD::get_singleton()->compute_pipeline_create(gi_trace_shader.version_get_shader(gi_trace_shader_version, 1));
+	if (int64_supported) {
+		gi_trace_pipeline_int64 = RD::get_singleton()->compute_pipeline_create(gi_trace_shader.version_get_shader(gi_trace_shader_version, 0));
+	}
 }
 
 MeshletSoftwareRasterizer::~MeshletSoftwareRasterizer() {
@@ -181,6 +192,22 @@ MeshletSoftwareRasterizer::~MeshletSoftwareRasterizer() {
 		RD::get_singleton()->free_rid(resolve_raster_pipeline_fallback);
 	}
 	resolve_raster_shader.version_free(resolve_raster_shader_version);
+	if (gi_trace_pipeline_int64.is_valid()) {
+		RD::get_singleton()->free_rid(gi_trace_pipeline_int64);
+	}
+	if (gi_trace_pipeline_fallback.is_valid()) {
+		RD::get_singleton()->free_rid(gi_trace_pipeline_fallback);
+	}
+	gi_trace_shader.version_free(gi_trace_shader_version);
+	if (gi_color.is_valid()) {
+		RD::get_singleton()->free_rid(gi_color);
+	}
+	if (gi_normal.is_valid()) {
+		RD::get_singleton()->free_rid(gi_normal);
+	}
+	if (gi_depth.is_valid()) {
+		RD::get_singleton()->free_rid(gi_depth);
+	}
 	if (out_color.is_valid()) {
 		RD::get_singleton()->free_rid(out_color);
 	}
@@ -491,6 +518,134 @@ void MeshletSoftwareRasterizer::_ensure_out_color(const Size2i &p_screen_size) {
 	tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 	out_color = RD::get_singleton()->texture_create(tf, RD::TextureView());
 	out_color_dims = p_screen_size;
+}
+
+void MeshletSoftwareRasterizer::_ensure_gi_buffers(const Size2i &p_half_size) {
+	if (gi_color.is_valid() && gi_dims == p_half_size) {
+		return;
+	}
+	if (gi_color.is_valid()) {
+		RD::get_singleton()->free_rid(gi_color);
+		gi_color = RID();
+	}
+	if (gi_normal.is_valid()) {
+		RD::get_singleton()->free_rid(gi_normal);
+		gi_normal = RID();
+	}
+	if (gi_depth.is_valid()) {
+		RD::get_singleton()->free_rid(gi_depth);
+		gi_depth = RID();
+	}
+
+	RD::TextureFormat tf;
+	tf.width = (uint32_t)p_half_size.x;
+	tf.height = (uint32_t)p_half_size.y;
+	// STORAGE for the trace's imageStore; SAMPLING so the fragment resolve can texelFetch for the
+	// bilateral upsample (Phase 1b); CAN_COPY_FROM for the optional debug blit.
+	tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+
+	tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	gi_color = RD::get_singleton()->texture_create(tf, RD::TextureView());
+	gi_normal = RD::get_singleton()->texture_create(tf, RD::TextureView());
+	tf.format = RD::DATA_FORMAT_R32_SFLOAT;
+	gi_depth = RD::get_singleton()->texture_create(tf, RD::TextureView());
+	gi_dims = p_half_size;
+}
+
+void MeshletSoftwareRasterizer::trace_svogi_gi(const RendererRD::MeshletCuller::CullResult &p_sw_list, const RendererRD::MeshletCuller::CullResult &p_hw_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_svogi_octree, const Vector3 &p_svogi_center, float p_svogi_half, float p_svogi_energy) {
+	RendererRD::MeshletStorage *ms = RendererRD::MeshletStorage::get_singleton();
+	if (!ms || p_screen_size.x <= 0 || p_screen_size.y <= 0) {
+		return;
+	}
+	// Nothing to trace if the octree isn't populated - the fragment resolve then falls back to the
+	// inline cone trace (gi_valid = 0), so skipping here is safe.
+	if (!p_svogi_octree.is_valid() || p_svogi_half <= 0.0f) {
+		return;
+	}
+	bool use_int64 = visbuffer_is_int64;
+	RID pipeline = use_int64 ? gi_trace_pipeline_int64 : gi_trace_pipeline_fallback;
+	if (pipeline.is_null()) {
+		return;
+	}
+	if (use_int64 ? visbuffer_u64.is_null() : (vis_depth_u32.is_null() || vis_payload_u32.is_null())) {
+		return;
+	}
+
+	Size2i half_size((p_screen_size.x + 1) / 2, (p_screen_size.y + 1) / 2);
+	_ensure_gi_buffers(half_size);
+
+	RID standin = ms->get_meshlet_material_buffer_rid();
+	RID sw_buf = p_sw_list.is_valid() ? p_sw_list.visible_buffer : standin;
+	RID hw_buf = p_hw_list.is_valid() ? p_hw_list.visible_buffer : standin;
+
+	LocalVector<RD::Uniform> uniforms;
+	auto add_ssbo = [&](uint32_t p_binding, RID p_buffer) {
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = p_binding;
+		u.append_id(p_buffer);
+		uniforms.push_back(u);
+	};
+	auto add_image = [&](uint32_t p_binding, RID p_image) {
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.binding = p_binding;
+		u.append_id(p_image);
+		uniforms.push_back(u);
+	};
+	if (use_int64) {
+		add_ssbo(0, visbuffer_u64);
+	} else {
+		add_ssbo(0, vis_depth_u32);
+		add_ssbo(1, vis_payload_u32);
+	}
+	add_ssbo(2, sw_buf);
+	add_ssbo(3, hw_buf);
+	add_ssbo(4, p_transforms_buffer);
+	add_ssbo(5, ms->get_meshlet_descriptor_buffer_rid());
+	add_ssbo(6, ms->get_meshlet_vertex_buffer_rid());
+	add_ssbo(7, ms->get_meshlet_triangle_buffer_rid());
+	add_ssbo(8, ms->get_vertex_position_buffer_rid());
+	add_ssbo(9, ms->get_vertex_attribute_buffer_rid());
+	add_ssbo(10, p_material_ids_buffer);
+	add_ssbo(11, p_svogi_octree);
+	add_image(12, gi_color);
+	add_image(13, gi_normal);
+	add_image(14, gi_depth);
+
+	RID shader_rid = gi_trace_shader.version_get_shader(gi_trace_shader_version, use_int64 ? 0 : 1);
+	RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
+
+	Projection view_projection = _meshlet_camera_relative_vp(p_projection, p_camera_transform);
+	GiTracePushConstant pc;
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			pc.view_projection_matrix[col * 4 + row] = view_projection.columns[col][row];
+		}
+	}
+	pc.camera_position[0] = p_camera_transform.origin.x;
+	pc.camera_position[1] = p_camera_transform.origin.y;
+	pc.camera_position[2] = p_camera_transform.origin.z;
+	pc.full_width = (uint32_t)p_screen_size.x;
+	pc.svogi_bounds[0] = (float)p_svogi_center.x;
+	pc.svogi_bounds[1] = (float)p_svogi_center.y;
+	pc.svogi_bounds[2] = (float)p_svogi_center.z;
+	pc.svogi_bounds[3] = p_svogi_half;
+	pc.svogi_params[0] = p_svogi_energy;
+	pc.svogi_params[1] = 0.0f;
+	pc.svogi_params[2] = 0.0f;
+	pc.svogi_params[3] = 0.0f;
+	pc.full_height = (uint32_t)p_screen_size.y;
+	pc.pad0 = 0;
+	pc.pad1 = 0;
+	pc.pad2 = 0;
+
+	RD::ComputeListID cl = RD::get_singleton()->compute_list_begin();
+	RD::get_singleton()->compute_list_bind_compute_pipeline(cl, pipeline);
+	RD::get_singleton()->compute_list_bind_uniform_set(cl, set, 0);
+	RD::get_singleton()->compute_list_set_push_constant(cl, &pc, sizeof(GiTracePushConstant));
+	RD::get_singleton()->compute_list_dispatch_threads(cl, (uint32_t)half_size.x, (uint32_t)half_size.y, 1);
+	RD::get_singleton()->compute_list_end();
 }
 
 void MeshletSoftwareRasterizer::resolve(const RendererRD::MeshletCuller::CullResult &p_sw_list, const RendererRD::MeshletCuller::CullResult &p_hw_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, const Color &p_ambient_color, float p_sky_mix, RID p_svogi_octree, const Vector3 &p_svogi_center, float p_svogi_half, float p_svogi_energy, RID p_radiance_texture, float p_radiance_exposure, float p_max_roughness_lod) {

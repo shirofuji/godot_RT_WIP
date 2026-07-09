@@ -71,6 +71,22 @@ uint pack_normal(vec3 p_normal) {
 	return (c.r << 16u) | (c.g << 8u) | c.b;
 }
 
+// Emission is stored as a 24-bit RGB in the low bits ((r<<16)|(g<<8)|b), matching
+// svogi_voxelize.glsl's emission packing exactly - NOT the rgba8 (r<<24...) layout used for albedo.
+// Using unpack_rgba8/pack_rgba8 here would rotate the channels by one byte on every mip level.
+vec3 unpack_rgb24(uint p_packed) {
+	return vec3(
+			float((p_packed >> 16u) & 0xFFu),
+			float((p_packed >> 8u) & 0xFFu),
+			float(p_packed & 0xFFu)) /
+			255.0;
+}
+
+uint pack_rgb24(vec3 p_color) {
+	uvec3 c = uvec3(clamp(p_color, vec3(0.0), vec3(1.0)) * 255.0 + 0.5);
+	return (c.r << 16u) | (c.g << 8u) | c.b;
+}
+
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
 	// alloc_counter only ever grows monotonically within one clear-to-clear cycle (see
@@ -93,7 +109,7 @@ void main() {
 
 	vec4 albedo_accum = vec4(0.0);
 	vec3 normal_accum = vec3(0.0);
-	vec4 emission_accum = vec4(0.0);
+	vec3 emission_accum = vec3(0.0);
 	uint count = 0u;
 	for (uint c = 0u; c < 8u; c++) {
 		if ((mask & (1u << c)) == 0u) {
@@ -102,7 +118,7 @@ void main() {
 		uint child_idx = base + c;
 		albedo_accum += unpack_rgba8(nodes[child_idx].albedo);
 		normal_accum += unpack_normal(nodes[child_idx].normal);
-		emission_accum += unpack_rgba8(nodes[child_idx].emission);
+		emission_accum += unpack_rgb24(nodes[child_idx].emission);
 		count++;
 	}
 	if (count == 0u) {
@@ -112,6 +128,6 @@ void main() {
 	nodes[idx].albedo = pack_rgba8(albedo_accum / float(count));
 	float normal_len = length(normal_accum);
 	nodes[idx].normal = pack_normal(normal_len > 0.0001 ? (normal_accum / normal_len) : vec3(0.0, 0.0, 1.0));
-	nodes[idx].emission = pack_rgba8(emission_accum / float(count));
+	nodes[idx].emission = pack_rgb24(emission_accum / float(count));
 }
 #endif

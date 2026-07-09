@@ -31,10 +31,12 @@ vec3 pc_bary(vec2 s0, vec2 s1, vec2 s2, float iw0, float iw1, float iw2, vec2 p,
 	return vec3(b0, b1, b2) / s;
 }
 
-// Resolve pixel `pix` (in a `dims`-sized target). Returns true and fills r_color (lit rgb) + r_depth
-// (the winning reverse-Z NDC depth, for gl_FragDepth) when the visbuffer has a fragment there;
-// returns false for empty pixels and alpha-scissor discards.
-bool resolve_visbuffer_pixel(ivec2 pix, ivec2 dims, out vec3 r_color, out float r_depth) {
+// Geometry-only resolve: reads the visbuffer at `pix` and reconstructs the winning triangle's
+// interpolated world position / normal / UV / material + analytic screen-space gradients + the winning
+// reverse-Z NDC depth. No shading, no octree access - so it can be reused by the standalone half-res
+// SVOGI trace pass (which needs world_pos + world_normal + depth but not the material shade). Returns
+// false for empty / degenerate pixels.
+bool resolve_visbuffer_geometry(ivec2 pix, ivec2 dims, out vec3 world_pos, out vec3 world_normal, out vec2 tex_uv, out uint material_id, out float r_depth, out vec3 dpdx, out vec3 dpdy, out vec2 duvdx, out vec2 duvdy, out uint slot) {
 	int idx = pix.y * dims.x + pix.x;
 
 #ifndef MESHLET_VISBUFFER_FALLBACK
@@ -53,7 +55,7 @@ bool resolve_visbuffer_pixel(ivec2 pix, ivec2 dims, out vec3 r_color, out float 
 #endif
 
 	uint is_sw = (payload >> 31) & 0x1u;
-	uint slot = (payload >> 7) & 0xFFFFFFu;
+	slot = (payload >> 7) & 0xFFFFFFu;
 	uint tri = payload & 0x7Fu;
 
 	VisibleMeshlet vm = (is_sw == 1u) ? sw_visible.data[slot] : hw_visible.data[slot];
@@ -97,21 +99,43 @@ bool resolve_visbuffer_pixel(ivec2 pix, ivec2 dims, out vec3 r_color, out float 
 
 	vec2 p = vec2(pix) + 0.5;
 	vec3 bc = pc_bary(screen[0], screen[1], screen[2], invw[0], invw[1], invw[2], p, area);
-	vec3 world_pos = bc.x * wpos[0] + bc.y * wpos[1] + bc.z * wpos[2];
-	vec3 world_normal = normalize(bc.x * wnrm[0] + bc.y * wnrm[1] + bc.z * wnrm[2]);
-	vec2 tex_uv = bc.x * uv[0] + bc.y * uv[1] + bc.z * uv[2];
+	world_pos = bc.x * wpos[0] + bc.y * wpos[1] + bc.z * wpos[2];
+	world_normal = normalize(bc.x * wnrm[0] + bc.y * wnrm[1] + bc.z * wnrm[2]);
+	tex_uv = bc.x * uv[0] + bc.y * uv[1] + bc.z * uv[2];
 
 	// Analytic screen-space gradients: perspective-correct interpolate one pixel over in x and y.
 	vec3 bcx = pc_bary(screen[0], screen[1], screen[2], invw[0], invw[1], invw[2], p + vec2(1.0, 0.0), area);
 	vec3 bcy = pc_bary(screen[0], screen[1], screen[2], invw[0], invw[1], invw[2], p + vec2(0.0, 1.0), area);
-	vec3 dpdx = (bcx.x * wpos[0] + bcx.y * wpos[1] + bcx.z * wpos[2]) - world_pos;
-	vec3 dpdy = (bcy.x * wpos[0] + bcy.y * wpos[1] + bcy.z * wpos[2]) - world_pos;
-	vec2 duvdx = (bcx.x * uv[0] + bcx.y * uv[1] + bcx.z * uv[2]) - tex_uv;
-	vec2 duvdy = (bcy.x * uv[0] + bcy.y * uv[1] + bcy.z * uv[2]) - tex_uv;
+	dpdx = (bcx.x * wpos[0] + bcx.y * wpos[1] + bcx.z * wpos[2]) - world_pos;
+	dpdy = (bcy.x * wpos[0] + bcy.y * wpos[1] + bcy.z * wpos[2]) - world_pos;
+	duvdx = (bcx.x * uv[0] + bcx.y * uv[1] + bcx.z * uv[2]) - tex_uv;
+	duvdy = (bcy.x * uv[0] + bcy.y * uv[1] + bcy.z * uv[2]) - tex_uv;
 
-	uint material_id = instance_material_ids.data[vm.instance_index] & 0x7FFFFFFFu; // Strip owns-own-depth flag.
+	material_id = instance_material_ids.data[vm.instance_index] & 0x7FFFFFFFu; // Strip owns-own-depth flag.
 
 	r_depth = uintBitsToFloat(z_bits);
+	return true;
+}
+
+// The shading half (resolve_visbuffer_pixel -> meshlet_shade) is skipped for MESHLET_GEOMETRY_ONLY
+// includers - the standalone half-res SVOGI trace pass wants resolve_visbuffer_geometry() but has no
+// material/light/texture buffers bound, so it must not pull in meshlet_shade().
+#ifndef MESHLET_GEOMETRY_ONLY
+
+// Resolve pixel `pix` (in a `dims`-sized target). Returns true and fills r_color (lit rgb) + r_depth
+// (the winning reverse-Z NDC depth, for gl_FragDepth) when the visbuffer has a fragment there;
+// returns false for empty pixels and alpha-scissor discards.
+bool resolve_visbuffer_pixel(ivec2 pix, ivec2 dims, out vec3 r_color, out float r_depth) {
+	vec3 world_pos;
+	vec3 world_normal;
+	vec2 tex_uv;
+	uint material_id;
+	vec3 dpdx, dpdy;
+	vec2 duvdx, duvdy;
+	uint slot;
+	if (!resolve_visbuffer_geometry(pix, dims, world_pos, world_normal, tex_uv, material_id, r_depth, dpdx, dpdy, duvdx, duvdy, slot)) {
+		return false;
+	}
 
 	// Debug visualization modes packed into the top 4 bits of light_count (0 = normal shading):
 	//   1 = coverage (white where the visbuffer has a fragment) - isolates coverage vs shading.
@@ -134,7 +158,7 @@ bool resolve_visbuffer_pixel(ivec2 pix, ivec2 dims, out vec3 r_color, out float 
 	if (dbg == 4u) {
 		// Depth as grayscale (reverse-Z: near = bright, far = dark). Shows if the winning surface's
 		// depth looks right, and reveals depth banding.
-		r_color = vec3(uintBitsToFloat(z_bits));
+		r_color = vec3(r_depth);
 		return true;
 	}
 	if (dbg == 5u) {
@@ -146,10 +170,22 @@ bool resolve_visbuffer_pixel(ivec2 pix, ivec2 dims, out vec3 r_color, out float 
 	}
 
 	bool do_discard = false;
-	vec4 shaded = meshlet_shade(material_id, world_normal, world_pos, tex_uv, params.camera_position, params.ambient_color, params.svogi_bounds, params.svogi_params, params.light_count & 0x0FFFFFFFu, dpdx, dpdy, duvdx, duvdy, do_discard);
+	// SVOGI indirect diffuse: the live fragment resolve defines MESHLET_GI_PRECOMPUTED and provides
+	// sample_filtered_gi() (bilateral upsample of the denoised half-res GI at this pixel's depth +
+	// normal). The compute resolve (tests) leaves it undefined and cone-traces inline in meshlet_shade.
+#ifdef MESHLET_GI_PRECOMPUTED
+	vec3 gi_diffuse_in = sample_filtered_gi(pix, dims, world_pos, world_normal, r_depth);
+	bool gi_precomputed = true;
+#else
+	vec3 gi_diffuse_in = vec3(0.0);
+	bool gi_precomputed = false;
+#endif
+	vec4 shaded = meshlet_shade(material_id, world_normal, world_pos, tex_uv, params.camera_position, params.ambient_color, params.svogi_bounds, params.svogi_params, params.light_count & 0x0FFFFFFFu, dpdx, dpdy, duvdx, duvdy, gi_precomputed, gi_diffuse_in, do_discard);
 	if (do_discard) {
 		return false; // Alpha-scissor cutout.
 	}
 	r_color = shaded.rgb;
 	return true;
 }
+
+#endif // !MESHLET_GEOMETRY_ONLY

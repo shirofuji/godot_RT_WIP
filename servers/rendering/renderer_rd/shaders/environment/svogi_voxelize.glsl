@@ -17,11 +17,15 @@ struct Node {
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, std430) restrict buffer OctreeNodes {
+// coherent: the octree is built lock-free across workgroups within a single dispatch (atomicAdd to
+// grow the pool, atomicCompSwap to publish a node's children pointer). Without coherent, a thread
+// that observes another workgroup's published children_base_index has no guarantee it also sees that
+// workgroup's zeroed child slots, so it could traverse into stale garbage from a previous build.
+layout(set = 0, binding = 0, std430) restrict coherent buffer OctreeNodes {
 	Node nodes[];
 };
 
-layout(set = 0, binding = 1, std430) restrict buffer AtomicCounter {
+layout(set = 0, binding = 1, std430) restrict coherent buffer AtomicCounter {
 	uint alloc_counter;
 	uint alloc_pad[3];
 };
@@ -239,7 +243,9 @@ void main() {
 			current_half_size *= 0.5;
 			current_center += offset * current_half_size;
 			
-			uint base_idx = nodes[node_idx].children_base_index;
+			// Atomic read (not a plain load): another workgroup may be publishing this pointer via
+			// atomicCompSwap concurrently, and a plain load racing an atomic store is undefined.
+			uint base_idx = atomicOr(nodes[node_idx].children_base_index, 0u);
 			if (base_idx == 0u) {
 				uint new_base = atomicAdd(alloc_counter, 8u);
 				if (new_base >= params.max_nodes - 8u) {
@@ -262,6 +268,10 @@ void main() {
 					nodes[new_base + c].emission = 0u;
 					nodes[new_base + c].pad[0] = depth + 1u;
 				}
+				// Release the zeroed child slots before publishing the pointer to them: guarantees any
+				// other workgroup that later observes new_base via children_base_index also observes
+				// the zeroed contents (paired with the coherent buffer qualifier + atomic read above).
+				memoryBarrierBuffer();
 				uint old_val = atomicCompSwap(nodes[node_idx].children_base_index, 0u, new_base);
 				if (old_val != 0u) {
 					// Another thread allocated first, use theirs - our own new_base allocation
@@ -310,9 +320,31 @@ void main() {
 			radiance *= FOLIAGE_COVERAGE;
 		}
 
-		uvec3 radiance_bytes = uvec3(clamp(radiance, vec3(0.0), vec3(1.0)) * 255.0 + 0.5);
+		vec3 radiance_clamped = clamp(radiance, vec3(0.0), vec3(1.0));
+		uvec3 radiance_bytes = uvec3(radiance_clamped * 255.0 + 0.5);
 		uint packed_color = (radiance_bytes.r << 24u) | (radiance_bytes.g << 16u) | (radiance_bytes.b << 8u) | 255u;
-		atomicMax(nodes[node_idx].albedo, packed_color); // Use atomicMax to ensure it writes if 0
+		// "Brightest contributor wins" keyed on LUMINANCE, not the raw packed word. A plain atomicMax
+		// on the packed uint compares the red byte first, so a dim red voxel would beat a bright green
+		// one regardless of actual brightness (the wrong-bounce-color artifact). CAS loop keeps the
+		// higher-luminance sample; the initial value is 0 (luminance 0) so any real sample writes.
+		const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+		float new_luma = dot(radiance_clamped, LUMA);
+		uint prev = nodes[node_idx].albedo;
+		while (true) {
+			vec3 old_rgb = vec3(
+					float((prev >> 24u) & 0xFFu),
+					float((prev >> 16u) & 0xFFu),
+					float((prev >> 8u) & 0xFFu)) /
+					255.0;
+			if (dot(old_rgb, LUMA) >= new_luma) {
+				break; // Existing sample is at least as bright - keep it.
+			}
+			uint got = atomicCompSwap(nodes[node_idx].albedo, prev, packed_color);
+			if (got == prev) {
+				break; // We won the swap.
+			}
+			prev = got; // Someone else wrote; re-evaluate against their value.
+		}
 
 		// Raw emission kept in the emission field too (unused by the current cone trace, which reads
 		// the radiance in the albedo field - retained for potential future multi-bounce/emissive GI).

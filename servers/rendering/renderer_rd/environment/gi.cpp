@@ -1227,6 +1227,107 @@ GI::SVOGI::~SVOGI() {
 
 	RD::get_singleton()->free_rid(octree_nodes_buffer);
 	RD::get_singleton()->free_rid(atomic_counter_buffer);
+
+	if (screen_gi_texture.is_valid()) {
+		RD::get_singleton()->free_rid(screen_gi_texture);
+	}
+}
+
+// Half-res screen-space SVOGI resolve (denoiser FA): cone-trace the octree off the Forward+ gbuffer
+// into screen_gi_texture, which scene_forward_gi_inc.glsl's svogi_process() then samples.
+void GI::SVOGI::resolve_screen_gi(RID p_depth_texture, RID p_normal_roughness_texture, const Size2i &p_internal_size, const Projection &p_projection, const Transform3D &p_cam_transform) {
+	if (!octree_has_data || octree_nodes_buffer.is_null() || octree_bounds_half_size <= 0.0f) {
+		return;
+	}
+	if (p_depth_texture.is_null() || p_normal_roughness_texture.is_null() || p_internal_size.x <= 0 || p_internal_size.y <= 0) {
+		return;
+	}
+
+	Size2i half_size((p_internal_size.x + 1) / 2, (p_internal_size.y + 1) / 2);
+	if (screen_gi_texture.is_null() || screen_gi_size != half_size) {
+		if (screen_gi_texture.is_valid()) {
+			RD::get_singleton()->free_rid(screen_gi_texture);
+		}
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+		tf.width = (uint32_t)half_size.x;
+		tf.height = (uint32_t)half_size.y;
+		tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		screen_gi_texture = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		screen_gi_size = half_size;
+	}
+
+	RID nearest_sampler = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+
+	LocalVector<RD::Uniform> uniforms;
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 0;
+		u.append_id(p_depth_texture);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 1;
+		u.append_id(p_normal_roughness_texture);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+		u.binding = 2;
+		u.append_id(nearest_sampler);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = 3;
+		u.append_id(octree_nodes_buffer);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.binding = 4;
+		u.append_id(screen_gi_texture);
+		uniforms.push_back(u);
+	}
+
+	RID shader_rid = gi->svogi_shader.gi_resolve.version_get_shader(gi->svogi_shader.gi_resolve_shader, 0);
+	RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
+
+	SvogiGiResolvePushConstant pc;
+	// p_projection here is the full VIEW-PROJECTION (world->clip), so its inverse maps clip -> absolute
+	// world directly (perspective divide shader-side after). Do NOT multiply by cam_transform again -
+	// that was a double transform that collapsed every reconstructed position near the octree center.
+	Projection clip_to_world = p_projection.inverse();
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			pc.clip_to_world[col * 4 + row] = clip_to_world.columns[col][row];
+		}
+	}
+	// Camera basis columns (mat3(cam_transform)) for the view->world normal rotation; octree center
+	// packed in the .w lanes.
+	Vector3 bx = p_cam_transform.basis.get_column(0);
+	Vector3 by = p_cam_transform.basis.get_column(1);
+	Vector3 bz = p_cam_transform.basis.get_column(2);
+	pc.cam_basis_0[0] = bx.x; pc.cam_basis_0[1] = bx.y; pc.cam_basis_0[2] = bx.z; pc.cam_basis_0[3] = (float)octree_bounds_center.x;
+	pc.cam_basis_1[0] = by.x; pc.cam_basis_1[1] = by.y; pc.cam_basis_1[2] = by.z; pc.cam_basis_1[3] = (float)octree_bounds_center.y;
+	pc.cam_basis_2[0] = bz.x; pc.cam_basis_2[1] = bz.y; pc.cam_basis_2[2] = bz.z; pc.cam_basis_2[3] = (float)octree_bounds_center.z;
+	pc.misc[0] = octree_bounds_half_size;
+	pc.misc[1] = energy;
+	pc.misc[2] = (float)p_internal_size.x;
+	pc.misc[3] = (float)p_internal_size.y;
+
+	RD::ComputeListID cl = RD::get_singleton()->compute_list_begin();
+	RD::get_singleton()->compute_list_bind_compute_pipeline(cl, gi->svogi_shader.gi_resolve_pipeline.get_rid());
+	RD::get_singleton()->compute_list_bind_uniform_set(cl, set, 0);
+	RD::get_singleton()->compute_list_set_push_constant(cl, &pc, sizeof(SvogiGiResolvePushConstant));
+	RD::get_singleton()->compute_list_dispatch_threads(cl, (uint32_t)half_size.x, (uint32_t)half_size.y, 1);
+	RD::get_singleton()->compute_list_end();
 }
 
 void GI::SVOGI::update(RID p_env, const Vector3 &p_world_position) {
@@ -2274,8 +2375,11 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(SVOGIShader::VoxelizePushConstant));
 		
-		uint32_t dispatch_x = (max_visible + 63) / 64;
-		RD::get_singleton()->compute_list_dispatch_threads(compute_list, dispatch_x, 1, 1);
+		// compute_list_dispatch_threads() takes a THREAD count and divides by the shader's
+		// local_size_x (64) itself - pass max_visible directly (one thread per visible meshlet).
+		// Passing a pre-divided workgroup count here double-divides and silently drops ~63/64 of the
+		// meshlets, leaving the octree almost empty.
+		RD::get_singleton()->compute_list_dispatch_threads(compute_list, max_visible, 1, 1);
 		
 		RD::get_singleton()->compute_list_end();
 
@@ -2316,8 +2420,10 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 
 			RD::get_singleton()->compute_list_set_push_constant(mipmap_compute_list, &mipmap_push_constant, sizeof(SVOGIShader::MipmapPushConstant));
 
-			uint32_t mipmap_dispatch_x = (mipmap_dispatch_node_cap + 63) / 64;
-			RD::get_singleton()->compute_list_dispatch_threads(mipmap_compute_list, mipmap_dispatch_x, 1, 1);
+			// dispatch_threads() divides by local_size_x (64) internally - pass the node cap as a
+			// THREAD count so it actually covers mipmap_dispatch_node_cap slots (the shader early-outs
+			// past the real alloc_counter). A pre-divided count would only reach 1/64 of the cap.
+			RD::get_singleton()->compute_list_dispatch_threads(mipmap_compute_list, mipmap_dispatch_node_cap, 1, 1);
 
 			RD::get_singleton()->compute_list_end();
 		}
@@ -4070,6 +4176,12 @@ void GI::init(SkyRD *p_sky) {
 		svogi_shader.mipmap.initialize(mipmap_modes);
 		svogi_shader.mipmap_shader = svogi_shader.mipmap.version_create();
 		svogi_shader.mipmap_pipeline.create_compute_pipeline(svogi_shader.mipmap.version_get_shader(svogi_shader.mipmap_shader, 0));
+
+		Vector<String> gi_resolve_modes;
+		gi_resolve_modes.push_back("");
+		svogi_shader.gi_resolve.initialize(gi_resolve_modes);
+		svogi_shader.gi_resolve_shader = svogi_shader.gi_resolve.version_create();
+		svogi_shader.gi_resolve_pipeline.create_compute_pipeline(svogi_shader.gi_resolve.version_get_shader(svogi_shader.gi_resolve_shader, 0));
 	}
 	default_voxel_gi_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(VoxelGIData) * MAX_VOXEL_GI_INSTANCES);
 	half_resolution = GLOBAL_GET("rendering/global_illumination/gi/use_half_resolution");

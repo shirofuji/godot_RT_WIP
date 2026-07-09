@@ -45,6 +45,7 @@
 #include "servers/rendering/renderer_rd/shaders/environment/svogi_voxelize.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/svogi_build.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/svogi_mipmap.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_gi_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/voxel_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/voxel_gi_debug.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
@@ -477,6 +478,11 @@ private:
 		RID mipmap_shader;
 		PipelineDeferredRD mipmap_pipeline;
 
+		// Screen-space SVOGI GI resolve (denoiser FA): half-res cone trace off the Forward+ gbuffer.
+		SvogiGiResolveShaderRD gi_resolve;
+		RID gi_resolve_shader;
+		PipelineDeferredRD gi_resolve_pipeline;
+
 	} svogi_shader;
 
 public:
@@ -747,6 +753,17 @@ public:
 		RID svogi_build_uniform_set;
 		RID svogi_mipmap_uniform_set;
 
+		// Screen-space GI denoiser (FA): half-res buffer holding the resolved (cone-traced) indirect
+		// diffuse for the Forward+ path, sampled by scene_forward_gi_inc.glsl's svogi_process() instead
+		// of the inline per-fragment trace. Allocated lazily to half the internal render size.
+		RID screen_gi_texture;
+		Size2i screen_gi_size;
+		// Cone-traces the octree at half res off the given Forward+ depth + normal-roughness gbuffer,
+		// writing the raw indirect diffuse into screen_gi_texture (allocated to half of p_internal_size).
+		// No-op unless the octree has data. Caller supplies the textures (avoids reaching into
+		// render_forward_clustered's private buffer scopes from here).
+		void resolve_screen_gi(RID p_depth_texture, RID p_normal_roughness_texture, const Size2i &p_internal_size, const Projection &p_projection, const Transform3D &p_cam_transform);
+
 		virtual void configure(RenderSceneBuffersRD *p_render_buffers) override {}
 		virtual void free_data() override;
 		~SVOGI();
@@ -843,6 +860,15 @@ public:
 		int32_t screen_size[2];
 		float pad1;
 		float pad2;
+	};
+
+	// Must match svogi_gi_resolve.glsl's Params block (std430, 128 bytes = RD's MAX_PUSH_CONSTANT_SIZE).
+	struct SvogiGiResolvePushConstant {
+		float clip_to_world[16]; // cam_transform * inv_projection (clip -> absolute world, w preserved).
+		float cam_basis_0[4]; // xyz = camera x-axis, w = octree center x.
+		float cam_basis_1[4]; // xyz = camera y-axis, w = octree center y.
+		float cam_basis_2[4]; // xyz = camera z-axis, w = octree center z.
+		float misc[4]; // x = octree half-size, y = energy, z = full_width, w = full_height.
 	};
 
 	struct PushConstant {

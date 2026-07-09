@@ -493,6 +493,11 @@ layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
 #endif // USE_MULTIVIEW
 
+// Binding 37: half-res screen-space SVOGI indirect diffuse (denoiser FA). Always a plain texture2D
+// (view 0 only for now, even under multiview). scene_forward_gi_inc.glsl's svogi_process() bilaterally
+// upsamples this instead of cone-tracing the octree inline per fragment.
+layout(set = 1, binding = 37) uniform texture2D svogi_screen_gi_buffer;
+
 #endif
 
 vec4 normal_roughness_compatibility(vec4 p_normal_roughness) {
