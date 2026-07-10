@@ -1758,7 +1758,13 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 		if (rb->has_custom_data(RB_SCOPE_SVOGI)) {
 			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
 			if (svogi.is_valid()) {
-				svogi->resolve_screen_gi(rb->get_depth_texture(0), p_normal_roughness_slices[0], rb->get_internal_size(), p_render_data->scene_data->view_projection[0], p_render_data->scene_data->cam_transform);
+				// Pass the CORRECTED projection (get_view_projection applies the reverse-Z/flip depth
+				// correction + TAA jitter that the depth buffer was rendered with) and the absolute
+				// cam_transform. scene_data.view_projection[] is only the projection (view is applied
+				// separately), so the resolve must fold cam_transform in to reach absolute world space -
+				// otherwise it reconstructs VIEW-space positions and traces the absolute octree near the
+				// world origin, pinning GI to one spot regardless of camera position.
+				svogi->resolve_screen_gi(rb->get_depth_texture(0), p_normal_roughness_slices[0], rb->get_internal_size(), p_render_data->scene_data->get_view_projection(0), p_render_data->scene_data->cam_transform);
 			}
 		}
 	}
@@ -4246,18 +4252,6 @@ void RenderForwardClustered::_render_svogi(Ref<RenderSceneBuffersRD> p_render_bu
 	// Scan the instances and collect meshlets in the SVOGI bounds.
 	_meshlet_scan_render_list(&render_data, RENDER_LIST_SECONDARY);
 
-	// --svogi-vox-debug: is any meshlet geometry reaching the voxelizer? instances = geometry handed to
-	// SVOGI for this region; meshlet_scan_ranges = how many are meshlet-eligible (voxelizable). If
-	// ranges=0, the octree gets nothing -> empty.
-	static const bool svogi_vox_dbg = OS::get_singleton()->get_cmdline_args().find("--svogi-vox-debug") != nullptr;
-	static int svogi_vox_dbg_n = 0;
-	if (svogi_vox_dbg && svogi_vox_dbg_n < 16) {
-		svogi_vox_dbg_n++;
-		Vector3 c = p_bounds.get_center();
-		print_line(vformat("SVOGI-VOX-DEBUG: instances=%d, flora_ranges=%d, terrain_ranges=%d, bounds_center=(%.1f,%.1f,%.1f) half=%.2f",
-				(int)p_instances.size(), (int)meshlet_scan_ranges.size(), (int)meshlet_terrain_scan_ranges.size(), c.x, c.y, c.z, p_bounds.size.x * 0.5));
-	}
-
 	// SVOGI-only: also voxelize the meshletized TERRAIN. Terrain is meshletized but diverted to its own
 	// stream at scan time (meshlet_terrain_scan_*) so the flora late pass doesn't draw it; the SVOGI
 	// voxelizer, however, MUST include it - the ground is the dominant GI bounce surface and without it
@@ -4905,7 +4899,9 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		RID svogi_gi;
 		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SVOGI)) {
 			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
-			svogi_gi = svogi->screen_gi_texture;
+			// Prefer the a-trous-filtered output (FC); fall back to the raw accumulated buffer if the
+			// spatial pass hasn't produced one yet (e.g. before the first resolve).
+			svogi_gi = svogi->screen_gi_filtered.is_valid() ? svogi->screen_gi_filtered : svogi->screen_gi_texture;
 		}
 		u.append_id(svogi_gi.is_valid() ? svogi_gi : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK));
 		uniforms.push_back(u);

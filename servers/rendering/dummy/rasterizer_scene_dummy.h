@@ -170,6 +170,7 @@ public:
 
 	Ref<RenderSceneBuffers> render_buffers_create() override { return Ref<RenderSceneBuffers>(); }
 	void gi_set_use_half_resolution(bool p_enable) override {}
+	void gi_set_svogi_terrain_voxels(const Vector<uint8_t> &p_voxels) override {}
 
 	void screen_space_roughness_limiter_set_active(bool p_enable, float p_amount, float p_curve) override {}
 	bool screen_space_roughness_limiter_is_active() const override { return false; }

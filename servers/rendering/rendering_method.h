@@ -338,6 +338,7 @@ public:
 	virtual Ref<RenderSceneBuffers> render_buffers_create() = 0;
 
 	virtual void gi_set_use_half_resolution(bool p_enable) = 0;
+	virtual void gi_set_svogi_terrain_voxels(const Vector<uint8_t> &p_voxels) = 0;
 
 	virtual void set_debug_draw_mode(RSE::ViewportDebugDraw p_debug_draw) = 0;
 

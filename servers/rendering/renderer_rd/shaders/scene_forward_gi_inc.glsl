@@ -293,9 +293,15 @@ void svogi_process(uint cascade, vec3 cascade_pos, vec3 cam_pos, vec3 cam_normal
 			float svogi_dd = abs(svogi_tap_depth - svogi_ref_depth) / max(svogi_ref_depth, 1e-5);
 			float svogi_dw = exp(-svogi_dd * 96.0);
 			vec3 svogi_tap_n = normalize(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), svogi_fp, 0).xyz * 2.0 - 1.0);
-			float svogi_nw = pow(max(dot(svogi_tap_n, svogi_ref_n), 0.0), 16.0);
-			float svogi_w = svogi_bw * svogi_dw * svogi_nw + 1e-6;
-			svogi_gi_acc += texelFetch(sampler2D(svogi_screen_gi_buffer, SAMPLER_NEAREST_CLAMP), svogi_ht, 0).rgb * svogi_w;
+			float svogi_nw = pow(max(dot(svogi_tap_n, svogi_ref_n), 0.0), 4.0); // gentle: gbuffer normal has bump detail, a peaky weight re-injects per-pixel speckle at full res (depth term still handles silhouettes).
+			// CRITICAL: the resolve writes rgb=0, ALPHA=0 for half-res texels with no valid static GI (sky,
+			// dynamic objects, foliage pixels it rejected), and the a-trous SKIPS those (leaves them zero).
+			// Fold the tap's alpha into its weight so those zero-holes are NOT averaged in - otherwise a
+			// terrain pixel whose 2x2 half-res neighbourhood clips one of them gets a 0 blended in = a dark
+			// dot, densest exactly where the scene is complex/foliage-heavy (the material-variation pattern).
+			vec4 svogi_tap = texelFetch(sampler2D(svogi_screen_gi_buffer, SAMPLER_NEAREST_CLAMP), svogi_ht, 0);
+			float svogi_w = svogi_bw * svogi_dw * svogi_nw * svogi_tap.a + 1e-6;
+			svogi_gi_acc += svogi_tap.rgb * svogi_w;
 			svogi_w_acc += svogi_w;
 		}
 	}

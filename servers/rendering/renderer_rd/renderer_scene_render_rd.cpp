@@ -1169,6 +1169,15 @@ void RendererSceneRenderRD::gi_set_use_half_resolution(bool p_enable) {
 	gi.half_resolution = p_enable;
 }
 
+void RendererSceneRenderRD::gi_set_svogi_terrain_voxels(const Vector<uint8_t> &p_voxels) {
+	// Stashed on the GI instance; consumed by GI::SVOGI::render_region() as terrain point-injection into
+	// the octree (see svogi_voxelize_points.glsl). Layout: { uint count; uint pad[3]; GIVoxelPoint[] }.
+	gi.svogi_terrain_voxel_data = p_voxels;
+	// Advance the version so a stationary octree still re-voxelizes with the new data (see
+	// GI::svogi_terrain_data_version) - otherwise terrain GI only appears once the camera drags.
+	gi.svogi_terrain_data_version++;
+}
+
 void RendererSceneRenderRD::positional_soft_shadow_filter_set_quality(RSE::ShadowQuality p_quality) {
 	ERR_FAIL_INDEX_MSG(p_quality, RSE::SHADOW_QUALITY_MAX, "Shadow quality too high, please see RenderingServer's ShadowQuality enum");
 

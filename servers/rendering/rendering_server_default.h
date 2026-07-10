@@ -983,6 +983,7 @@ public:
 	FUNC4R(PackedByteArray, bake_render_area_light_atlas, const TypedArray<RID> &, const TypedArray<Rect2> &, const Size2i &, int)
 
 	FUNC1(gi_set_use_half_resolution, bool)
+	FUNC1(gi_set_svogi_terrain_voxels, const Vector<uint8_t> &)
 
 #undef server_name
 #undef ServerName

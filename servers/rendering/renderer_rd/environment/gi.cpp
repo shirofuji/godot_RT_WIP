@@ -1231,6 +1231,18 @@ GI::SVOGI::~SVOGI() {
 	if (screen_gi_texture.is_valid()) {
 		RD::get_singleton()->free_rid(screen_gi_texture);
 	}
+	if (screen_gi_history.is_valid()) {
+		RD::get_singleton()->free_rid(screen_gi_history);
+	}
+	if (screen_gi_filtered.is_valid()) {
+		RD::get_singleton()->free_rid(screen_gi_filtered);
+	}
+	if (screen_gi_atrous_temp.is_valid()) {
+		RD::get_singleton()->free_rid(screen_gi_atrous_temp);
+	}
+	if (svogi_temporal_ubo.is_valid()) {
+		RD::get_singleton()->free_rid(svogi_temporal_ubo);
+	}
 }
 
 // Half-res screen-space SVOGI resolve (denoiser FA): cone-trace the octree off the Forward+ gbuffer
@@ -1248,16 +1260,41 @@ void GI::SVOGI::resolve_screen_gi(RID p_depth_texture, RID p_normal_roughness_te
 		if (screen_gi_texture.is_valid()) {
 			RD::get_singleton()->free_rid(screen_gi_texture);
 		}
+		if (screen_gi_history.is_valid()) {
+			RD::get_singleton()->free_rid(screen_gi_history);
+		}
+		if (screen_gi_filtered.is_valid()) {
+			RD::get_singleton()->free_rid(screen_gi_filtered);
+		}
+		if (screen_gi_atrous_temp.is_valid()) {
+			RD::get_singleton()->free_rid(screen_gi_atrous_temp);
+		}
 		RD::TextureFormat tf;
 		tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
 		tf.width = (uint32_t)half_size.x;
 		tf.height = (uint32_t)half_size.y;
+		// screen_gi_texture is the blend output: sampled by the forward pass + copied into the history.
 		tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 		screen_gi_texture = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		// History is sampled (reprojected) by the resolve and is the copy destination.
+		RD::TextureFormat htf = tf;
+		htf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+		screen_gi_history = RD::get_singleton()->texture_create(htf, RD::TextureView());
+		// A-trous ping-pong buffers: both read (sampled) and written (storage) across iterations.
+		RD::TextureFormat atf = tf;
+		atf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
+		screen_gi_filtered = RD::get_singleton()->texture_create(atf, RD::TextureView());
+		screen_gi_atrous_temp = RD::get_singleton()->texture_create(atf, RD::TextureView());
 		screen_gi_size = half_size;
+		svogi_history_valid = false; // fresh (uninitialized) history - don't blend against it this frame.
+	}
+
+	if (svogi_temporal_ubo.is_null()) {
+		svogi_temporal_ubo = RD::get_singleton()->uniform_buffer_create(sizeof(SvogiTemporalUBO));
 	}
 
 	RID nearest_sampler = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID linear_sampler = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	LocalVector<RD::Uniform> uniforms;
 	{
@@ -1295,15 +1332,40 @@ void GI::SVOGI::resolve_screen_gi(RID p_depth_texture, RID p_normal_roughness_te
 		u.append_id(screen_gi_texture);
 		uniforms.push_back(u);
 	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 5;
+		u.append_id(screen_gi_history);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+		u.binding = 6;
+		u.append_id(linear_sampler);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
+		u.binding = 7;
+		u.append_id(svogi_temporal_ubo);
+		uniforms.push_back(u);
+	}
 
 	RID shader_rid = gi->svogi_shader.gi_resolve.version_get_shader(gi->svogi_shader.gi_resolve_shader, 0);
 	RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rid, 0, uniforms);
 
 	SvogiGiResolvePushConstant pc;
-	// p_projection here is the full VIEW-PROJECTION (world->clip), so its inverse maps clip -> absolute
-	// world directly (perspective divide shader-side after). Do NOT multiply by cam_transform again -
-	// that was a double transform that collapsed every reconstructed position near the octree center.
-	Projection clip_to_world = p_projection.inverse();
+	// p_projection is only the (corrected) PROJECTION - view->clip - not the full world->clip VP, because
+	// scene_data.view_projection[] stores just the projection and applies the view (cam_transform)
+	// separately. So clip -> absolute world = cam_transform * projection.inverse(): projection.inverse()
+	// maps clip -> VIEW space, then cam_transform (full affine: rotation + camera origin) lifts view ->
+	// absolute world. cam_transform is affine (preserves w), so the perspective divide still happens
+	// correctly shader-side. Omitting cam_transform leaves positions in view space and pins the octree
+	// trace near the world origin (GI stuck on one spot as the camera moves).
+	Projection clip_to_world = Projection(p_cam_transform) * p_projection.inverse();
 	for (int col = 0; col < 4; col++) {
 		for (int row = 0; row < 4; row++) {
 			pc.clip_to_world[col * 4 + row] = clip_to_world.columns[col][row];
@@ -1322,12 +1384,129 @@ void GI::SVOGI::resolve_screen_gi(RID p_depth_texture, RID p_normal_roughness_te
 	pc.misc[2] = (float)p_internal_size.x;
 	pc.misc[3] = (float)p_internal_size.y;
 
+	// Temporal (FB): fill the UBO with LAST frame's world->clip so the shader can reproject this frame's
+	// reconstructed world position into the history buffer. world_to_clip is just clip_to_world inverted
+	// (guaranteed consistent with the reconstruction above). On the first valid frame (or after a resize)
+	// history is invalid, so the shader falls back to the raw current sample.
+	SvogiTemporalUBO tubo;
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			tubo.prev_world_to_clip[col * 4 + row] = svogi_reproj_prev.columns[col][row];
+		}
+	}
+	// New-sample weight = 1/converge_frames (history_size is the env "frames to converge", 5..30). Clamp so
+	// a degenerate 0 can't divide-by-zero and a huge value can't freeze the image. This is a CONSTANT
+	// weight (not motion-adaptive): an earlier motion-scaled version shifted the display between the smooth
+	// history and the noisier current sample as the camera started/stopped, which read as the GI brightness
+	// fading in and out with movement. A fixed weight keeps the exposure stable; the FC a-trous pass below
+	// plus the coarser-mip cone trace handle the noise instead. The cost is a mild ghost/blur while moving.
+	uint32_t converge = MAX(1u, history_size);
+	float new_weight = CLAMP(1.0f / (float)converge, 0.02f, 1.0f);
+
+	tubo.params[0] = svogi_history_valid ? 1.0f : 0.0f;
+	tubo.params[1] = new_weight;
+	tubo.params[2] = 0.0f;
+	tubo.params[3] = 0.0f;
+	RD::get_singleton()->buffer_update(svogi_temporal_ubo, 0, sizeof(SvogiTemporalUBO), &tubo);
+
 	RD::ComputeListID cl = RD::get_singleton()->compute_list_begin();
 	RD::get_singleton()->compute_list_bind_compute_pipeline(cl, gi->svogi_shader.gi_resolve_pipeline.get_rid());
 	RD::get_singleton()->compute_list_bind_uniform_set(cl, set, 0);
 	RD::get_singleton()->compute_list_set_push_constant(cl, &pc, sizeof(SvogiGiResolvePushConstant));
 	RD::get_singleton()->compute_list_dispatch_threads(cl, (uint32_t)half_size.x, (uint32_t)half_size.y, 1);
 	RD::get_singleton()->compute_list_end();
+
+	// Copy the freshly-blended result into the history for next frame's reprojection, and remember this
+	// frame's world->clip as next frame's "previous". After the first copy the history is always valid.
+	// NB: the history stores the temporally-accumulated (pre-spatial-blur) GI, so the a-trous below only
+	// affects the displayed result and never feeds back into the accumulation (no over-blurring drift).
+	RD::get_singleton()->texture_copy(screen_gi_texture, screen_gi_history, Vector3(0, 0, 0), Vector3(0, 0, 0), Vector3(half_size.x, half_size.y, 1), 0, 0, 0, 0);
+	svogi_reproj_prev = clip_to_world.inverse();
+	svogi_prev_cam = p_cam_transform;
+	svogi_history_valid = true;
+
+	// Spatial denoise (FC): edge-aware a-trous. Ping-pong with increasing hole size for a wide blur at low
+	// cost. Input is the accumulated GI (screen_gi_texture); the final iteration must land in
+	// screen_gi_filtered (what the forward pass samples). With 3 iterations: tex->filtered, filtered->temp,
+	// temp->filtered.
+	{
+		Projection clip_to_view = p_projection.inverse();
+		SvogiGiAtrousPushConstant apc;
+		for (int col = 0; col < 4; col++) {
+			for (int row = 0; row < 4; row++) {
+				apc.clip_to_view[col * 4 + row] = clip_to_view.columns[col][row];
+			}
+		}
+		apc.misc[1] = (float)p_internal_size.x;
+		apc.misc[2] = (float)p_internal_size.y;
+		// Deliberately gentle edge-stopping: indirect diffuse is low-frequency, and the gbuffer normal
+		// carries normal-MAP detail (bumpy sand/ground), so a peaky normal weight would treat that texture
+		// detail as edges and refuse to blur - leaving the per-pixel GI speckle. A low power tolerates the
+		// bump while still stopping at real silhouettes (where the plane-distance term does the heavy work).
+		apc.misc[3] = 3.0f; // normal-similarity power (low: tolerate normal-map bump, don't edge-stop on it).
+		apc.misc2[0] = 0.6f; // plane-distance sigma (view-space metres).
+		apc.misc2[1] = 0.0f;
+		apc.misc2[2] = 0.0f;
+		apc.misc2[3] = 0.0f;
+
+		RID atrous_shader_rid = gi->svogi_shader.gi_atrous.version_get_shader(gi->svogi_shader.gi_atrous_shader, 0);
+		// 5 iterations (steps 1,2,4,8,16) for a wide blur that actually crushes the frozen half-res speckle;
+		// odd count lands the final result in screen_gi_filtered. The plane-distance term keeps it from
+		// leaking across real depth edges even at the widest step.
+		const int atrous_iterations = 5;
+		for (int it = 0; it < atrous_iterations; it++) {
+			RID in_tex = (it == 0) ? screen_gi_texture : ((it % 2) ? screen_gi_filtered : screen_gi_atrous_temp);
+			RID out_tex = (it % 2) ? screen_gi_atrous_temp : screen_gi_filtered;
+
+			LocalVector<RD::Uniform> au;
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+				u.binding = 0;
+				u.append_id(in_tex);
+				au.push_back(u);
+			}
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+				u.binding = 1;
+				u.append_id(p_depth_texture);
+				au.push_back(u);
+			}
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+				u.binding = 2;
+				u.append_id(p_normal_roughness_texture);
+				au.push_back(u);
+			}
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+				u.binding = 3;
+				u.append_id(nearest_sampler);
+				au.push_back(u);
+			}
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+				u.binding = 4;
+				u.append_id(out_tex);
+				au.push_back(u);
+			}
+			RID aset = UniformSetCacheRD::get_singleton()->get_cache_vec(atrous_shader_rid, 0, au);
+
+			apc.misc[0] = (float)(1 << it); // step = 1, 2, 4.
+			apc.misc2[1] = (it == 0) ? 1.0f : 0.0f; // firefly clamp on the first (step-1) pass only.
+
+			RD::ComputeListID acl = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(acl, gi->svogi_shader.gi_atrous_pipeline.get_rid());
+			RD::get_singleton()->compute_list_bind_uniform_set(acl, aset, 0);
+			RD::get_singleton()->compute_list_set_push_constant(acl, &apc, sizeof(SvogiGiAtrousPushConstant));
+			RD::get_singleton()->compute_list_dispatch_threads(acl, (uint32_t)half_size.x, (uint32_t)half_size.y, 1);
+			RD::get_singleton()->compute_list_end();
+		}
+	}
 }
 
 void GI::SVOGI::update(RID p_env, const Vector3 &p_world_position) {
@@ -1407,6 +1586,14 @@ void GI::SVOGI::update(RID p_env, const Vector3 &p_world_position) {
 			// fires only when you cross a chunk boundary, not every frame; between crossings the octree
 			// is untouched. A true toroidally-addressed sparse octree (SDFGI-style) that could survive
 			// a scroll and keep genuine incremental updates is the larger future win.
+			cascade.dirty_regions = SVOGI::Cascade::DIRTY_ALL;
+		}
+
+		// Fresh terrain voxels were pushed since the last voxelize: force a full rebuild even if the camera
+		// is stationary (the drag logic above only dirties on movement). Without this, terrain GI stays off
+		// until the player moves - most visibly right after spawning/landing while standing still. Cascade 0
+		// only (the traced one); render_region() writes last_terrain_data_version back after it injects.
+		if (gi != nullptr && gi->svogi_terrain_data_version != last_terrain_data_version) {
 			cascade.dirty_regions = SVOGI::Cascade::DIRTY_ALL;
 		}
 	}
@@ -2371,6 +2558,11 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 			octree_bounds_center = center;
 			octree_bounds_half_size = bounds.size.x * 0.5;
 			octree_has_data = true;
+			// Sync to the terrain data version we're about to inject below, so update() doesn't keep
+			// forcing a rebuild every frame once the octree is caught up (see last_terrain_data_version).
+			if (gi != nullptr) {
+				last_terrain_data_version = gi->svogi_terrain_data_version;
+			}
 		}
 
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(SVOGIShader::VoxelizePushConstant));
@@ -2391,6 +2583,66 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 		RD::get_singleton()->free_rid(uniform_set_1);
 
 		RD::get_singleton()->draw_command_end_label();
+
+		// TEMP VALIDATION (point-injection pass): inject a synthetic grid of bright warm voxels on a
+		// horizontal plane through the octree center (cascade 0 only - the traced one), right after the
+		// meshlet voxelize, into the SAME octree. If the ground/nearby surfaces then pick up warm GI, the
+		// svogi_voxelize_points pass + octree injection work. Replaced by the real terrain voxel buffer
+		// (from the terrain_generator extension) once wired.
+		// Point-injection voxelize: fold non-meshletized surface voxels (the runtime terrain) into the
+		// same octree, right after the meshlet (flora) voxelize. Uses ONLY the game-supplied terrain voxel
+		// buffer (RS::gi_set_svogi_terrain_voxels). If the game supplied nothing this frame, inject nothing
+		// - no synthetic fallback (that old validation crutch showed up as a warm GI blob stuck under the
+		// camera whenever the real feed was absent). Cascade 0 only (the traced one).
+		if (cascade == 0 && p_lights_buffer.is_valid() && p_light_count > 0 && gi->svogi_terrain_voxel_data.size() > 16) {
+			RD::get_singleton()->draw_command_begin_label("SVOGI Voxelize Points");
+			// Buffer layout mirrors svogi_voxelize_points.glsl Points{ uint count; uint pad[3]; GIVoxelPoint data[]; }
+			// GIVoxelPoint = vec4 pos_albedo (xyz=pos, w=uintBitsToFloat(rgba8)) + vec4 normal.
+			Vector<uint8_t> point_data = gi->svogi_terrain_voxel_data;
+			uint32_t point_count = ((const uint32_t *)point_data.ptr())[0];
+			if (point_count > 0 && point_data.size() >= (int)(16 + (uint64_t)point_count * 32)) {
+			RID point_buffer = RD::get_singleton()->storage_buffer_create(point_data.size(), point_data);
+
+			Vector<RD::Uniform> p_uniforms;
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+				u.binding = 0;
+				u.append_id(point_buffer);
+				p_uniforms.push_back(u);
+			}
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+				u.binding = 1;
+				u.append_id(p_lights_buffer);
+				p_uniforms.push_back(u);
+			}
+			RID p_set1 = RD::get_singleton()->uniform_set_create(p_uniforms, gi->svogi_shader.voxelize_points.version_get_shader(gi->svogi_shader.voxelize_points_shader, 0), 1);
+
+			SVOGIShader::VoxelizePushConstant ppc;
+			ppc.bounds_center[0] = center.x;
+			ppc.bounds_center[1] = center.y;
+			ppc.bounds_center[2] = center.z;
+			ppc.bounds_half_size = bounds.size.x * 0.5;
+			ppc.max_nodes = MAX_NODES;
+			ppc.light_count = p_light_count;
+			ppc.pad[0] = 0;
+			ppc.pad[1] = 0;
+
+			RD::ComputeListID pcl = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(pcl, gi->svogi_shader.voxelize_points_pipeline.get_rid());
+			RD::get_singleton()->compute_list_bind_uniform_set(pcl, octree_uniform_set, 0);
+			RD::get_singleton()->compute_list_bind_uniform_set(pcl, p_set1, 1);
+			RD::get_singleton()->compute_list_set_push_constant(pcl, &ppc, sizeof(SVOGIShader::VoxelizePushConstant));
+			RD::get_singleton()->compute_list_dispatch_threads(pcl, point_count, 1, 1);
+			RD::get_singleton()->compute_list_end();
+
+			RD::get_singleton()->free_rid(p_set1);
+			RD::get_singleton()->free_rid(point_buffer);
+			}
+			RD::get_singleton()->draw_command_end_label();
+		}
 
 		// Mipmap (aggregation) pass: walk the octree from the deepest leaf level up to the root,
 		// one dispatch per level, averaging each internal node's existing children into itself.
@@ -4165,6 +4417,12 @@ void GI::init(SkyRD *p_sky) {
 		svogi_shader.voxelize_pipeline_clear.create_compute_pipeline(svogi_shader.voxelize.version_get_shader(svogi_shader.voxelize_shader, 0));
 		svogi_shader.voxelize_pipeline.create_compute_pipeline(svogi_shader.voxelize.version_get_shader(svogi_shader.voxelize_shader, 1));
 
+		Vector<String> voxelize_points_modes;
+		voxelize_points_modes.push_back("");
+		svogi_shader.voxelize_points.initialize(voxelize_points_modes);
+		svogi_shader.voxelize_points_shader = svogi_shader.voxelize_points.version_create();
+		svogi_shader.voxelize_points_pipeline.create_compute_pipeline(svogi_shader.voxelize_points.version_get_shader(svogi_shader.voxelize_points_shader, 0));
+
 		Vector<String> build_modes;
 		build_modes.push_back("\n#define MODE_ALLOCATE\n");
 		svogi_shader.build.initialize(build_modes);
@@ -4182,6 +4440,12 @@ void GI::init(SkyRD *p_sky) {
 		svogi_shader.gi_resolve.initialize(gi_resolve_modes);
 		svogi_shader.gi_resolve_shader = svogi_shader.gi_resolve.version_create();
 		svogi_shader.gi_resolve_pipeline.create_compute_pipeline(svogi_shader.gi_resolve.version_get_shader(svogi_shader.gi_resolve_shader, 0));
+
+		Vector<String> gi_atrous_modes;
+		gi_atrous_modes.push_back("");
+		svogi_shader.gi_atrous.initialize(gi_atrous_modes);
+		svogi_shader.gi_atrous_shader = svogi_shader.gi_atrous.version_create();
+		svogi_shader.gi_atrous_pipeline.create_compute_pipeline(svogi_shader.gi_atrous.version_get_shader(svogi_shader.gi_atrous_shader, 0));
 	}
 	default_voxel_gi_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(VoxelGIData) * MAX_VOXEL_GI_INSTANCES);
 	half_resolution = GLOBAL_GET("rendering/global_illumination/gi/use_half_resolution");
