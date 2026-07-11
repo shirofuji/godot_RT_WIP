@@ -9,6 +9,8 @@
 #include "core/os/os.h"
 #include "core/string/print_string.h"
 #include "servers/rendering/rendering_device.h"
+#include "servers/rendering/shader_language.h"
+#include "servers/rendering/shader_types.h"
 
 typedef RenderingDevice RD;
 
@@ -211,6 +213,100 @@ void run_tess_selftest_if_requested() {
 
 	if (g_failures == 0) {
 		print_line("TESS_SELFTEST: all checks passed - RD tessellation stack works end-to-end");
+	} else {
+		print_line(vformat("TESS_SELFTEST: %d check(s) FAILED", g_failures));
+	}
+}
+
+// --- P1 language-hook parser check ------------------------------------------------------------------
+
+namespace {
+
+// Compiles a spatial shader through the ShaderLanguage parser using the real ShaderTypes tables (the
+// same info ShaderCompiler feeds it), with no RenderingDevice. Returns OK / error just like production.
+Error compile_spatial(const String &p_code, String &r_error) {
+	ShaderLanguage::ShaderCompileInfo info;
+	info.functions = ShaderTypes::get_singleton()->get_functions(RSE::SHADER_SPATIAL);
+	info.render_modes = ShaderTypes::get_singleton()->get_modes(RSE::SHADER_SPATIAL);
+	info.stencil_modes = ShaderTypes::get_singleton()->get_stencil_modes(RSE::SHADER_SPATIAL);
+	info.shader_types = ShaderTypes::get_singleton()->get_types();
+	info.global_shader_uniform_type_func = nullptr; // test shaders use no global uniforms.
+
+	ShaderLanguage parser;
+	Error err = parser.compile(p_code, info);
+	if (err != OK) {
+		r_error = vformat("line %d: %s", parser.get_error_line(), parser.get_error_text());
+	}
+	return err;
+}
+
+void check_compiles(const char *p_what, const String &p_code) {
+	String err;
+	Error e = compile_spatial(p_code, err);
+	check(e == OK, vformat("%s (%s)", p_what, e == OK ? String("compiled") : err));
+}
+
+void check_rejects(const char *p_what, const String &p_code) {
+	String err;
+	Error e = compile_spatial(p_code, err);
+	check(e != OK, vformat("%s (%s)", p_what, e != OK ? String("rejected as expected") : String("UNEXPECTEDLY COMPILED")));
+}
+
+} // namespace
+
+void run_tess_shader_selftest_if_requested() {
+	if (!OS::get_singleton()->get_cmdline_args().find("--tess-shader-selftest")) {
+		return;
+	}
+
+	print_line("TESS_SELFTEST: starting (P1: gdshader language-hook parser check)");
+	g_failures = 0;
+
+	if (ShaderTypes::get_singleton() == nullptr) {
+		print_line("TESS_SELFTEST: ShaderTypes singleton unavailable - run after server init");
+		return;
+	}
+
+	// A regression guard: an ordinary spatial shader with no tessellation still compiles.
+	check_compiles("baseline spatial shader unaffected",
+			"shader_type spatial;\n"
+			"void fragment() { ALBEDO = vec3(0.5); }\n");
+
+	// The opt-in render_mode is recognized.
+	check_compiles("render_mode tessellation_adaptive accepted",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void fragment() { ALBEDO = vec3(0.5); }\n");
+
+	// The displacement() processor and its built-ins parse: read const NORMAL/UV/TIME, write VERTEX/DISPLACEMENT.
+	check_compiles("displacement() with built-ins compiles",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"uniform float height_scale = 1.0;\n"
+			"void displacement() {\n"
+			"	DISPLACEMENT = sin(UV.x * 10.0 + TIME) * height_scale;\n"
+			"	VERTEX += NORMAL * DISPLACEMENT;\n"
+			"}\n"
+			"void fragment() { ALBEDO = vec3(0.5); }\n");
+
+	// Negative controls prove the built-in metadata is real, not permissive.
+	check_rejects("writing to const built-in NORMAL is rejected",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void displacement() { NORMAL = vec3(1.0); }\n");
+
+	check_rejects("unknown render_mode is still rejected",
+			"shader_type spatial;\n"
+			"render_mode tessellation_bogus;\n"
+			"void fragment() { ALBEDO = vec3(0.5); }\n");
+
+	check_rejects("DISPLACEMENT is not visible outside displacement()",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void fragment() { ALBEDO = vec3(DISPLACEMENT); }\n");
+
+	if (g_failures == 0) {
+		print_line("TESS_SELFTEST: all checks passed - gdshader tessellation language hook works");
 	} else {
 		print_line(vformat("TESS_SELFTEST: %d check(s) FAILED", g_failures));
 	}

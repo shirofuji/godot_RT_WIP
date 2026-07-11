@@ -684,6 +684,16 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 
 			uint32_t index = p_default_actions.base_varying_index;
 
+			// Adaptive tessellation pass-through for material varyings: when the shader tessellates, the
+			// tessellation evaluation stage (not the vertex stage) feeds the fragment stage, so every
+			// vertex->fragment varying must also be carried through the TCS/TES. We emit matching in/out
+			// declarations and copy/interpolate code into dedicated code sections that the scene shader's
+			// #[tesc]/#[tese] templates inject; they stay unused for non-tessellated materials.
+			String tess_control_varyings;
+			String tess_control_copy;
+			String tess_eval_varyings;
+			String tess_eval_interp;
+
 			List<Pair<StringName, SL::ShaderNode::Varying>> var_frag_to_light;
 
 			Vector<StringName> varying_names;
@@ -729,7 +739,40 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 				r_gen_code.stage_globals[STAGE_VERTEX] += interp_mode + "out " + vcode;
 				r_gen_code.stage_globals[STAGE_FRAGMENT] += interp_mode + "in " + vcode;
 
+				// Tessellation pass-through for this varying. Array varyings would need 2D arrays across the
+				// patch, which no built-in material uses, so they are left to the (rare) authoring caveat.
+				if (!RS::get_singleton()->is_low_end() && varying.array_size == 0) {
+					const String loc = "layout(location=" + itos(index) + ") ";
+					const String type_str = _prestr(varying.precision, ShaderLanguage::is_float_type(varying.type)) + _typestr(varying.type);
+					const String id = _mkid(varying_name);
+					const bool is_flat = varying.interpolation == SL::INTERPOLATION_FLAT || !ShaderLanguage::is_float_type(varying.type);
+
+					// TCS: read the per-control-point value from the vertex stage, forward it to the TES.
+					tess_control_varyings += loc + interp_mode + "in " + type_str + " " + id + "[];\n";
+					tess_control_varyings += loc + interp_mode + "out " + type_str + " " + id + "_tc[];\n";
+					tess_control_copy += "\t" + id + "_tc[gl_InvocationID] = " + id + "[gl_InvocationID];\n";
+
+					// TES: receive the patch corners, emit the interpolated value the fragment stage reads.
+					tess_eval_varyings += loc + interp_mode + "in " + type_str + " " + id + "_tc[];\n";
+					tess_eval_varyings += loc + interp_mode + "out " + type_str + " " + id + ";\n";
+					if (is_flat) {
+						tess_eval_interp += "\t" + id + " = " + id + "_tc[0];\n";
+					} else {
+						tess_eval_interp += "\t" + id + " = TESS_INTERP(" + id + "_tc);\n";
+					}
+				}
+
 				index += inc;
+			}
+
+			// Expose the generated tessellation pass-through as code sections consumed by #[tesc]/#[tese].
+			// Only when the shader actually has vertex->fragment varyings, to avoid emitting unused code
+			// sections (and their *_CODE_USED defines) into shaders that never tessellate.
+			if (!tess_control_varyings.is_empty()) {
+				r_gen_code.code["tess_control_varyings"] = tess_control_varyings;
+				r_gen_code.code["tess_control_copy"] = tess_control_copy;
+				r_gen_code.code["tess_eval_varyings"] = tess_eval_varyings;
+				r_gen_code.code["tess_eval_interp"] = tess_eval_interp;
 			}
 
 			if (var_frag_to_light.size() > 0) {

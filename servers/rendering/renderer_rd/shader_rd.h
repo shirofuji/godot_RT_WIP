@@ -91,6 +91,9 @@ private:
 		bool dirty;
 		bool initialize_needed;
 		bool embedded;
+		// When set, this version's rasterization variants also compile the tessellation control/evaluation
+		// stages (the shader must declare #[tesc]/#[tese]); the material is then drawn with a patch pipeline.
+		bool tessellation = false;
 	};
 
 	struct CompileData {
@@ -161,6 +164,8 @@ private:
 		STAGE_TYPE_VERTEX,
 		STAGE_TYPE_FRAGMENT,
 		STAGE_TYPE_COMPUTE,
+		STAGE_TYPE_TESSELATION_CONTROL,
+		STAGE_TYPE_TESSELATION_EVALUATION,
 		STAGE_TYPE_RAYGEN,
 		STAGE_TYPE_ANY_HIT,
 		STAGE_TYPE_CLOSEST_HIT,
@@ -188,12 +193,18 @@ private:
 protected:
 	ShaderRD();
 	void setup(const char *p_vertex_code, const char *p_fragment_code, const char *p_compute_code, const char *p_name);
+	// Opt-in tessellation control/evaluation stages for a rasterization shader. Called from the generated
+	// constructor only when the .glsl declares #[tesc]/#[tese]; folds the code into the shader-cache hash.
+	void set_tessellation_stages(const char *p_tesc_code, const char *p_tese_code);
 	void setup_raytracing(const char *p_raygen_code, const char *p_any_hit_code, const char *p_closest_hit_code, const char *p_miss_code, const char *p_intersection_code, const char *p_name);
 
 public:
 	RID version_create(bool p_embedded = true);
 
 	void version_set_code(RID p_version, const HashMap<String, String> &p_code, const String &p_uniforms, const String &p_vertex_globals, const String &p_fragment_globals, const Vector<String> &p_custom_defines);
+	// Enable/disable the tessellation stages for a specific material version (from ShaderData::uses_tessellation).
+	// Must be called before version_set_code so the recompile picks it up. No-op unless the shader has #[tesc]/#[tese].
+	void version_set_tessellation_enabled(RID p_version, bool p_enabled);
 	void version_set_compute_code(RID p_version, const HashMap<String, String> &p_code, const String &p_uniforms, const String &p_compute_globals, const Vector<String> &p_custom_defines);
 	void version_set_raytracing_code(RID p_version, const HashMap<String, String> &p_code, const String &p_uniforms, const String &p_raygen_globals, const String &p_any_hit_globals, const String &p_closest_hit_globals, const String &p_miss_globals, const String &p_intersection_globals, const Vector<String> &p_custom_defines);
 

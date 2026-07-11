@@ -177,6 +177,14 @@ layout(location = 9) out float dp_clip;
 
 layout(location = 10) out flat uint instance_index_interp;
 
+#ifdef USE_TESSELLATION
+// When tessellating, the vertex stage feeds the tessellation control shader instead of the rasterizer,
+// so redeclare the output gl_PerVertex block explicitly to match the TCS input interface.
+out gl_PerVertex {
+	vec4 gl_Position;
+};
+#endif
+
 #ifdef USE_MULTIVIEW
 #extension GL_EXT_multiview : enable
 #define ViewIndex gl_ViewIndex
@@ -3265,4 +3273,281 @@ void main() {
 #endif
 
 	fragment_shader(scene_data_block.data);
+}
+
+#[tesc]
+
+#version 450
+
+#VERSION_DEFINES
+
+// Adaptive tessellation - control shader.
+//
+// P2 pass-through: this stage forwards the vertex stage's clip-space position and every VS->FS varying
+// unchanged (per control point) and sets a uniform tessellation level. At level 1.0 the evaluation shader
+// reproduces the three original corners exactly, so a tessellated material renders pixel-identical to the
+// non-tessellated path (parity). Screen-space adaptive levels (P3) and displacement (P4) build on this.
+
+layout(vertices = 3) out;
+
+in gl_PerVertex {
+	vec4 gl_Position;
+} gl_in[gl_MaxPatchVertices];
+
+out gl_PerVertex {
+	vec4 gl_Position;
+} gl_out[];
+
+// Varyings in from the vertex stage (must mirror the vertex-stage output block exactly).
+layout(location = 0) in vec3 in_vertex_interp[];
+#ifdef NORMAL_USED
+layout(location = 1) in vec3 in_normal_interp[];
+#endif
+#if defined(COLOR_USED)
+layout(location = 2) in vec4 in_color_interp[];
+#endif
+#ifdef UV_USED
+layout(location = 3) in vec2 in_uv_interp[];
+#endif
+#if defined(UV2_USED) || defined(USE_LIGHTMAP)
+layout(location = 4) in vec2 in_uv2_interp[];
+#endif
+#ifdef TANGENT_USED
+layout(location = 5) in vec3 in_tangent_interp[];
+layout(location = 6) in vec3 in_binormal_interp[];
+#endif
+#ifdef MOTION_VECTORS
+layout(location = 7) in vec4 in_screen_position[];
+layout(location = 8) in vec4 in_prev_screen_position[];
+#endif
+#ifdef MODE_DUAL_PARABOLOID
+layout(location = 9) in float in_dp_clip[];
+#endif
+layout(location = 10) in flat uint in_instance_index_interp[];
+#ifdef USE_MULTIVIEW
+layout(location = 11) in vec4 in_combined_projected[];
+#endif
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && defined(USE_VERTEX_LIGHTING)
+layout(location = 12) in vec4 in_diffuse_light_interp[];
+layout(location = 13) in vec4 in_specular_light_interp[];
+#endif
+
+// Varyings out to the evaluation stage.
+layout(location = 0) out vec3 tc_vertex_interp[];
+#ifdef NORMAL_USED
+layout(location = 1) out vec3 tc_normal_interp[];
+#endif
+#if defined(COLOR_USED)
+layout(location = 2) out vec4 tc_color_interp[];
+#endif
+#ifdef UV_USED
+layout(location = 3) out vec2 tc_uv_interp[];
+#endif
+#if defined(UV2_USED) || defined(USE_LIGHTMAP)
+layout(location = 4) out vec2 tc_uv2_interp[];
+#endif
+#ifdef TANGENT_USED
+layout(location = 5) out vec3 tc_tangent_interp[];
+layout(location = 6) out vec3 tc_binormal_interp[];
+#endif
+#ifdef MOTION_VECTORS
+layout(location = 7) out vec4 tc_screen_position[];
+layout(location = 8) out vec4 tc_prev_screen_position[];
+#endif
+#ifdef MODE_DUAL_PARABOLOID
+layout(location = 9) out float tc_dp_clip[];
+#endif
+layout(location = 10) out flat uint tc_instance_index_interp[];
+#ifdef USE_MULTIVIEW
+layout(location = 11) out vec4 tc_combined_projected[];
+#endif
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && defined(USE_VERTEX_LIGHTING)
+layout(location = 12) out vec4 tc_diffuse_light_interp[];
+layout(location = 13) out vec4 tc_specular_light_interp[];
+#endif
+
+// Material (user) varyings pass-through, generated per shader (locations >= 15). Empty for materials
+// with no varyings.
+#CODE : TESS_CONTROL_VARYINGS
+
+void main() {
+	// Per-vertex tessellation-control outputs may only be indexed with gl_InvocationID (GLSL rule).
+	gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
+
+	tc_vertex_interp[gl_InvocationID] = in_vertex_interp[gl_InvocationID];
+#ifdef NORMAL_USED
+	tc_normal_interp[gl_InvocationID] = in_normal_interp[gl_InvocationID];
+#endif
+#if defined(COLOR_USED)
+	tc_color_interp[gl_InvocationID] = in_color_interp[gl_InvocationID];
+#endif
+#ifdef UV_USED
+	tc_uv_interp[gl_InvocationID] = in_uv_interp[gl_InvocationID];
+#endif
+#if defined(UV2_USED) || defined(USE_LIGHTMAP)
+	tc_uv2_interp[gl_InvocationID] = in_uv2_interp[gl_InvocationID];
+#endif
+#ifdef TANGENT_USED
+	tc_tangent_interp[gl_InvocationID] = in_tangent_interp[gl_InvocationID];
+	tc_binormal_interp[gl_InvocationID] = in_binormal_interp[gl_InvocationID];
+#endif
+#ifdef MOTION_VECTORS
+	tc_screen_position[gl_InvocationID] = in_screen_position[gl_InvocationID];
+	tc_prev_screen_position[gl_InvocationID] = in_prev_screen_position[gl_InvocationID];
+#endif
+#ifdef MODE_DUAL_PARABOLOID
+	tc_dp_clip[gl_InvocationID] = in_dp_clip[gl_InvocationID];
+#endif
+	tc_instance_index_interp[gl_InvocationID] = in_instance_index_interp[gl_InvocationID];
+#ifdef USE_MULTIVIEW
+	tc_combined_projected[gl_InvocationID] = in_combined_projected[gl_InvocationID];
+#endif
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && defined(USE_VERTEX_LIGHTING)
+	tc_diffuse_light_interp[gl_InvocationID] = in_diffuse_light_interp[gl_InvocationID];
+	tc_specular_light_interp[gl_InvocationID] = in_specular_light_interp[gl_InvocationID];
+#endif
+
+	// Forward the material's own varyings (generated).
+#CODE : TESS_CONTROL_COPY
+
+	if (gl_InvocationID == 0) {
+		// Pass-through: uniform subdivision level 1 (P3 replaces this with a screen-space adaptive factor).
+		gl_TessLevelOuter[0] = 1.0;
+		gl_TessLevelOuter[1] = 1.0;
+		gl_TessLevelOuter[2] = 1.0;
+		gl_TessLevelInner[0] = 1.0;
+	}
+}
+
+#[tese]
+
+#version 450
+
+#VERSION_DEFINES
+
+// Adaptive tessellation - evaluation shader (pass-through). Barycentrically interpolates the clip-space
+// position and every varying from the patch corners. At level 1 this reproduces the original triangle.
+
+layout(triangles, equal_spacing, cw) in;
+
+in gl_PerVertex {
+	vec4 gl_Position;
+} gl_in[gl_MaxPatchVertices];
+
+out gl_PerVertex {
+	vec4 gl_Position;
+};
+
+// Varyings in from the control stage.
+layout(location = 0) in vec3 tc_vertex_interp[];
+#ifdef NORMAL_USED
+layout(location = 1) in vec3 tc_normal_interp[];
+#endif
+#if defined(COLOR_USED)
+layout(location = 2) in vec4 tc_color_interp[];
+#endif
+#ifdef UV_USED
+layout(location = 3) in vec2 tc_uv_interp[];
+#endif
+#if defined(UV2_USED) || defined(USE_LIGHTMAP)
+layout(location = 4) in vec2 tc_uv2_interp[];
+#endif
+#ifdef TANGENT_USED
+layout(location = 5) in vec3 tc_tangent_interp[];
+layout(location = 6) in vec3 tc_binormal_interp[];
+#endif
+#ifdef MOTION_VECTORS
+layout(location = 7) in vec4 tc_screen_position[];
+layout(location = 8) in vec4 tc_prev_screen_position[];
+#endif
+#ifdef MODE_DUAL_PARABOLOID
+layout(location = 9) in float tc_dp_clip[];
+#endif
+layout(location = 10) in flat uint tc_instance_index_interp[];
+#ifdef USE_MULTIVIEW
+layout(location = 11) in vec4 tc_combined_projected[];
+#endif
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && defined(USE_VERTEX_LIGHTING)
+layout(location = 12) in vec4 tc_diffuse_light_interp[];
+layout(location = 13) in vec4 tc_specular_light_interp[];
+#endif
+
+// Varyings out to the fragment stage (locations match the fragment-stage input block).
+layout(location = 0) out vec3 vertex_interp;
+#ifdef NORMAL_USED
+layout(location = 1) out vec3 normal_interp;
+#endif
+#if defined(COLOR_USED)
+layout(location = 2) out vec4 color_interp;
+#endif
+#ifdef UV_USED
+layout(location = 3) out vec2 uv_interp;
+#endif
+#if defined(UV2_USED) || defined(USE_LIGHTMAP)
+layout(location = 4) out vec2 uv2_interp;
+#endif
+#ifdef TANGENT_USED
+layout(location = 5) out vec3 tangent_interp;
+layout(location = 6) out vec3 binormal_interp;
+#endif
+#ifdef MOTION_VECTORS
+layout(location = 7) out vec4 screen_position;
+layout(location = 8) out vec4 prev_screen_position;
+#endif
+#ifdef MODE_DUAL_PARABOLOID
+layout(location = 9) out float dp_clip;
+#endif
+layout(location = 10) out flat uint instance_index_interp;
+#ifdef USE_MULTIVIEW
+layout(location = 11) out vec4 combined_projected;
+#endif
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && defined(USE_VERTEX_LIGHTING)
+layout(location = 12) out vec4 diffuse_light_interp;
+layout(location = 13) out vec4 specular_light_interp;
+#endif
+
+// Material (user) varyings pass-through (in from TCS, out to fragment), generated per shader.
+#CODE : TESS_EVAL_VARYINGS
+
+#define TESS_INTERP(a) (gl_TessCoord.x * (a)[0] + gl_TessCoord.y * (a)[1] + gl_TessCoord.z * (a)[2])
+
+void main() {
+	gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position + gl_TessCoord.z * gl_in[2].gl_Position;
+
+	vertex_interp = TESS_INTERP(tc_vertex_interp);
+#ifdef NORMAL_USED
+	normal_interp = TESS_INTERP(tc_normal_interp);
+#endif
+#if defined(COLOR_USED)
+	color_interp = TESS_INTERP(tc_color_interp);
+#endif
+#ifdef UV_USED
+	uv_interp = TESS_INTERP(tc_uv_interp);
+#endif
+#if defined(UV2_USED) || defined(USE_LIGHTMAP)
+	uv2_interp = TESS_INTERP(tc_uv2_interp);
+#endif
+#ifdef TANGENT_USED
+	tangent_interp = TESS_INTERP(tc_tangent_interp);
+	binormal_interp = TESS_INTERP(tc_binormal_interp);
+#endif
+#ifdef MOTION_VECTORS
+	screen_position = TESS_INTERP(tc_screen_position);
+	prev_screen_position = TESS_INTERP(tc_prev_screen_position);
+#endif
+#ifdef MODE_DUAL_PARABOLOID
+	dp_clip = TESS_INTERP(tc_dp_clip);
+#endif
+	// Flat integer varying: take the provoking control point (all three share the instance index).
+	instance_index_interp = tc_instance_index_interp[0];
+#ifdef USE_MULTIVIEW
+	combined_projected = TESS_INTERP(tc_combined_projected);
+#endif
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && defined(USE_VERTEX_LIGHTING)
+	diffuse_light_interp = TESS_INTERP(tc_diffuse_light_interp);
+	specular_light_interp = TESS_INTERP(tc_specular_light_interp);
+#endif
+
+	// Interpolate the material's own varyings (generated).
+#CODE : TESS_EVAL_INTERP
 }

@@ -4887,6 +4887,7 @@ int Main::start() {
 
 	run_meshlet_selftest_if_requested();
 	run_tess_selftest_if_requested();
+	run_tess_shader_selftest_if_requested();
 
 #ifdef MODULE_KILOS_PHYSICS_ENABLED
 	run_kilos_selftest_if_requested();

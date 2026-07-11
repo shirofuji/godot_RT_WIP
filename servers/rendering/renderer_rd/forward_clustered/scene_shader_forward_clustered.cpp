@@ -83,6 +83,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	uses_world_coordinates = false;
 	uses_particle_trails = false;
 	uses_z_clip_scale = false;
+	uses_tessellation = false;
 
 	int depth_drawi = DEPTH_DRAW_OPAQUE;
 
@@ -96,6 +97,9 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	actions.entry_point_stages["vertex"] = ShaderCompiler::STAGE_VERTEX;
 	actions.entry_point_stages["fragment"] = ShaderCompiler::STAGE_FRAGMENT;
 	actions.entry_point_stages["light"] = ShaderCompiler::STAGE_FRAGMENT;
+	// Adaptive tessellation displacement runs in the TES; for globals/time bookkeeping it shares the
+	// vertex stage. Its code lands in gen_code.code["displacement"] for the patch pipeline (P2+) to consume.
+	actions.entry_point_stages["displacement"] = ShaderCompiler::STAGE_VERTEX;
 
 	actions.render_mode_values["blend_add"] = Pair<int *, int>(&blend_mode, BLEND_MODE_ADD);
 	actions.render_mode_values["blend_mix"] = Pair<int *, int>(&blend_mode, BLEND_MODE_MIX);
@@ -121,6 +125,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	actions.render_mode_flags["wireframe"] = &wireframe;
 	actions.render_mode_flags["particle_trails"] = &uses_particle_trails;
 	actions.render_mode_flags["world_vertex_coords"] = &uses_world_coordinates;
+	actions.render_mode_flags["tessellation_adaptive"] = &uses_tessellation;
 
 	actions.usage_flag_pointers["ALPHA"] = &uses_alpha;
 	actions.usage_flag_pointers["ALPHA_SCISSOR_THRESHOLD"] = &uses_alpha_clip;
@@ -231,6 +236,10 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	print_line("\n**vertex_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX]);
 	print_line("\n**fragment_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]);
 #endif
+	// Adaptive tessellation: flag this material version so its variants also compile the TCS/TES stages
+	// (declared as #[tesc]/#[tese] in scene_forward_clustered.glsl) and get drawn with a patch pipeline.
+	// Must precede version_set_code so the (re)compile picks it up.
+	SceneShaderForwardClustered::singleton->shader.version_set_tessellation_enabled(version, uses_tessellation);
 	SceneShaderForwardClustered::singleton->shader.version_set_code(version, gen_code.code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX], gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
 
 	ubo_size = gen_code.uniform_total_size;
@@ -430,6 +439,13 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 	RD::PipelineRasterizationState raster_state;
 	raster_state.cull_mode = p_pipeline_key.cull_mode;
 	raster_state.wireframe = wireframe || p_pipeline_key.wireframe;
+
+	// Adaptive tessellation: the version compiled TCS/TES stages, so this pipeline must consume triangle
+	// patches (3 control points) instead of triangles. Only meaningful for triangle-topology geometry.
+	if (uses_tessellation && primitive_rd == RD::RENDER_PRIMITIVE_TRIANGLES) {
+		primitive_rd = RD::RENDER_PRIMITIVE_TESSELATION_PATCH;
+		raster_state.patch_control_points = 3;
+	}
 
 	RD::PipelineMultisampleState multisample_state;
 	multisample_state.sample_count = RD::get_singleton()->framebuffer_format_get_texture_samples(p_pipeline_key.framebuffer_format_id, 0);
@@ -729,6 +745,7 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.renames["INSTANCE_ID"] = "INSTANCE_INDEX";
 		actions.renames["VERTEX_ID"] = "VERTEX_INDEX";
 		actions.renames["Z_CLIP_SCALE"] = "z_clip_scale";
+		actions.renames["DISPLACEMENT"] = "displacement_amount";
 
 		actions.renames["ALPHA_SCISSOR_THRESHOLD"] = "alpha_scissor_threshold";
 		actions.renames["ALPHA_HASH_SCALE"] = "alpha_hash_scale";

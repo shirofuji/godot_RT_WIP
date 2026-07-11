@@ -181,6 +181,24 @@ void ShaderRD::setup(const char *p_vertex_code, const char *p_fragment_code, con
 	base_sha256 = tohash.as_string().sha256_text();
 }
 
+void ShaderRD::set_tessellation_stages(const char *p_tesc_code, const char *p_tese_code) {
+	if (p_tesc_code) {
+		_add_stage(p_tesc_code, STAGE_TYPE_TESSELATION_CONTROL);
+	}
+	if (p_tese_code) {
+		_add_stage(p_tese_code, STAGE_TYPE_TESSELATION_EVALUATION);
+	}
+
+	// Fold the tessellation sources into the cache hash so tess and non-tess builds don't alias.
+	StringBuilder tohash;
+	tohash.append(base_sha256);
+	tohash.append("[TessControl]");
+	tohash.append(p_tesc_code ? p_tesc_code : "");
+	tohash.append("[TessEvaluation]");
+	tohash.append(p_tese_code ? p_tese_code : "");
+	base_sha256 = tohash.as_string().sha256_text();
+}
+
 void ShaderRD::setup_raytracing(const char *p_raygen_code, const char *p_any_hit_code, const char *p_closest_hit_code, const char *p_miss_code, const char *p_intersection_code, const char *p_name) {
 	name = p_name;
 
@@ -297,6 +315,11 @@ void ShaderRD::_build_variant_code(StringBuilder &builder, uint32_t p_variant, c
 				builder.append(String("#define RENDER_DRIVER_") + OS::get_singleton()->get_current_rendering_driver_name().to_upper() + "\n");
 				builder.append("#define samplerExternalOES sampler2D\n");
 				builder.append("#define textureExternalOES texture2D\n");
+				if (p_version->tessellation) {
+					// Lets every stage of a tessellated version gate its tess-specific code (e.g. the
+					// vertex stage redeclares gl_PerVertex for the TCS interface).
+					builder.append("#define USE_TESSELLATION\n");
+				}
 			} break;
 			case StageTemplate::Chunk::TYPE_MATERIAL_UNIFORMS: {
 				builder.append(p_version->uniforms.get_data()); //uniforms (same for vertex and fragment)
@@ -398,6 +421,22 @@ Vector<String> ShaderRD::_build_variant_stage_sources(uint32_t p_variant, Compil
 			StringBuilder builder;
 			_build_variant_code(builder, p_variant, p_data.version, stage_templates[STAGE_TYPE_FRAGMENT]);
 			stage_sources.write[RD::SHADER_STAGE_FRAGMENT] = builder.as_string();
+		}
+
+		// Tessellation control/evaluation stages are only emitted for versions that opted in AND for
+		// shaders that actually declare #[tesc]/#[tese]. Otherwise their sources stay empty and
+		// compile_stages() skips them, so the program remains a plain vertex+fragment triangle pipeline.
+		if (p_data.version->tessellation && !stage_templates[STAGE_TYPE_TESSELATION_CONTROL].chunks.is_empty()) {
+			{
+				StringBuilder builder;
+				_build_variant_code(builder, p_variant, p_data.version, stage_templates[STAGE_TYPE_TESSELATION_CONTROL]);
+				stage_sources.write[RD::SHADER_STAGE_TESSELATION_CONTROL] = builder.as_string();
+			}
+			{
+				StringBuilder builder;
+				_build_variant_code(builder, p_variant, p_data.version, stage_templates[STAGE_TYPE_TESSELATION_EVALUATION]);
+				stage_sources.write[RD::SHADER_STAGE_TESSELATION_EVALUATION] = builder.as_string();
+			}
 		}
 	}
 
@@ -828,6 +867,21 @@ void ShaderRD::version_set_code(RID p_version, const HashMap<String, String> &p_
 	_version_set(version, p_code, p_custom_defines);
 }
 
+void ShaderRD::version_set_tessellation_enabled(RID p_version, bool p_enabled) {
+	Version *version = version_owner.get_or_null(p_version);
+	ERR_FAIL_NULL(version);
+
+	MutexLock lock(*version->mutex);
+
+	if (version->tessellation == p_enabled) {
+		return;
+	}
+
+	_compile_ensure_finished(version);
+	version->tessellation = p_enabled;
+	version->dirty = true;
+}
+
 void ShaderRD::version_set_compute_code(RID p_version, const HashMap<String, String> &p_code, const String &p_uniforms, const String &p_compute_globals, const Vector<String> &p_custom_defines) {
 	ERR_FAIL_COND(pipeline_type != RD::PIPELINE_TYPE_COMPUTE);
 
@@ -1175,7 +1229,27 @@ Vector<RD::ShaderStageSPIRVData> ShaderRD::compile_stages(const Vector<String> &
 	}
 
 	if (compilation_failed) {
-		ERR_PRINT("Error compiling " + String(compilation_failed_stage == RD::SHADER_STAGE_COMPUTE ? "Compute " : (compilation_failed_stage == RD::SHADER_STAGE_VERTEX ? "Vertex" : "Fragment")) + " shader.");
+		const char *stage_name = "Fragment";
+		switch (compilation_failed_stage) {
+			case RD::SHADER_STAGE_VERTEX:
+				stage_name = "Vertex";
+				break;
+			case RD::SHADER_STAGE_FRAGMENT:
+				stage_name = "Fragment";
+				break;
+			case RD::SHADER_STAGE_COMPUTE:
+				stage_name = "Compute";
+				break;
+			case RD::SHADER_STAGE_TESSELATION_CONTROL:
+				stage_name = "TessellationControl";
+				break;
+			case RD::SHADER_STAGE_TESSELATION_EVALUATION:
+				stage_name = "TessellationEvaluation";
+				break;
+			default:
+				break;
+		}
+		ERR_PRINT("Error compiling " + String(stage_name) + " shader.");
 		ERR_PRINT(error);
 
 #ifdef DEBUG_ENABLED

@@ -13,4 +13,9 @@
 // Runs only when `--tess-selftest` is on the command line; otherwise returns immediately.
 void run_tess_selftest_if_requested();
 
+// P1 language-hook check (parser-level, no RenderingDevice needed): verifies the gdshader front-end
+// accepts `render_mode tessellation_adaptive;` and the `displacement()` processor with its built-ins,
+// and rejects the expected error cases. Runs only when `--tess-shader-selftest` is on the command line.
+void run_tess_shader_selftest_if_requested();
+
 #endif // TESS_SELFTEST_H
