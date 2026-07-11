@@ -183,6 +183,11 @@ layout(location = 10) out flat uint instance_index_interp;
 out gl_PerVertex {
 	vec4 gl_Position;
 };
+// Displacement helpers consumed by the evaluation stage (reserved locations 14/15, material varyings
+// start at 16): world position for a camera-stable displacement, and projection*vec4(view_normal,0) so
+// the evaluation stage can re-project a displaced vertex without touching any descriptor set.
+layout(location = 14) out vec4 tess_clip_normal;
+layout(location = 15) out vec3 tess_world_pos;
 #endif
 
 #ifdef USE_MULTIVIEW
@@ -595,6 +600,17 @@ void vertex_shader(vec3 vertex_input,
 	// See: http://www.mikktspace.com/
 #ifdef NORMAL_USED
 	normal_interp = normalize(normal);
+#endif
+
+#ifdef USE_TESSELLATION
+	// Feed the tessellation evaluation stage: world position (for camera-stable displacement) and the
+	// clip-space image of the view-space normal (for exact re-projection of the displaced vertex).
+	tess_world_pos = (inv_view_matrix * vec4(vertex, 1.0)).xyz;
+#ifdef NORMAL_USED
+	tess_clip_normal = projection_matrix * vec4(normalize(normal), 0.0);
+#else
+	tess_clip_normal = vec4(0.0);
+#endif
 #endif
 
 #ifdef TANGENT_USED
@@ -3331,6 +3347,9 @@ layout(location = 11) in vec4 in_combined_projected[];
 layout(location = 12) in vec4 in_diffuse_light_interp[];
 layout(location = 13) in vec4 in_specular_light_interp[];
 #endif
+// Tessellation displacement helpers from the vertex stage (locations 14/15).
+layout(location = 14) in vec4 in_tess_clip_normal[];
+layout(location = 15) in vec3 in_tess_world_pos[];
 
 // Varyings out to the evaluation stage.
 layout(location = 0) out vec3 tc_vertex_interp[];
@@ -3365,8 +3384,11 @@ layout(location = 11) out vec4 tc_combined_projected[];
 layout(location = 12) out vec4 tc_diffuse_light_interp[];
 layout(location = 13) out vec4 tc_specular_light_interp[];
 #endif
+// Tessellation displacement helpers forwarded to the evaluation stage (locations 14/15).
+layout(location = 14) out vec4 tc_tess_clip_normal[];
+layout(location = 15) out vec3 tc_tess_world_pos[];
 
-// Material (user) varyings pass-through, generated per shader (locations >= 15). Empty for materials
+// Material (user) varyings pass-through, generated per shader (locations >= 16). Empty for materials
 // with no varyings.
 #CODE : TESS_CONTROL_VARYINGS
 
@@ -3406,16 +3428,20 @@ void main() {
 	tc_diffuse_light_interp[gl_InvocationID] = in_diffuse_light_interp[gl_InvocationID];
 	tc_specular_light_interp[gl_InvocationID] = in_specular_light_interp[gl_InvocationID];
 #endif
+	tc_tess_clip_normal[gl_InvocationID] = in_tess_clip_normal[gl_InvocationID];
+	tc_tess_world_pos[gl_InvocationID] = in_tess_world_pos[gl_InvocationID];
 
 	// Forward the material's own varyings (generated).
 #CODE : TESS_CONTROL_COPY
 
 	if (gl_InvocationID == 0) {
-		// Pass-through: uniform subdivision level 1 (P3 replaces this with a screen-space adaptive factor).
-		gl_TessLevelOuter[0] = 1.0;
-		gl_TessLevelOuter[1] = 1.0;
-		gl_TessLevelOuter[2] = 1.0;
-		gl_TessLevelInner[0] = 1.0;
+		// Pass-through level 1 for now (parity). P4c raises this where displacement is active so there are
+		// interior vertices to displace; P3 makes it a screen-space adaptive factor clamped by max_tess_level.
+		const float tess_level = 1.0;
+		gl_TessLevelOuter[0] = tess_level;
+		gl_TessLevelOuter[1] = tess_level;
+		gl_TessLevelOuter[2] = tess_level;
+		gl_TessLevelInner[0] = tess_level;
 	}
 }
 
@@ -3425,8 +3451,16 @@ void main() {
 
 #VERSION_DEFINES
 
-// Adaptive tessellation - evaluation shader (pass-through). Barycentrically interpolates the clip-space
-// position and every varying from the patch corners. At level 1 this reproduces the original triangle.
+// Adaptive tessellation - evaluation shader. Barycentrically interpolates the clip-space position and
+// every varying from the patch corners (at level 1 this reproduces the original triangle), then applies
+// vertex displacement and re-projects.
+//
+// It deliberately touches NO descriptor sets: a tessellation stage that reads scene set-0/set-1 bindings
+// adds its stage flags to those bindings, which makes the pipeline's descriptor-set layout incompatible
+// with the shared per-frame uniform sets (built for vertex+fragment) and floods every draw with mismatch
+// errors. Instead the vertex stage (which already has matrix access) passes the world position and a
+// clip-space re-projection helper `projection * vec4(view_normal, 0)` as varyings (locations 14/15).
+// Because projection is linear, clip_new = clip_old + displacement * clip_normal is exact.
 
 layout(triangles, equal_spacing, cw) in;
 
@@ -3471,6 +3505,11 @@ layout(location = 11) in vec4 tc_combined_projected[];
 layout(location = 12) in vec4 tc_diffuse_light_interp[];
 layout(location = 13) in vec4 tc_specular_light_interp[];
 #endif
+
+// Tessellation displacement helpers from the vertex stage (see header): world position and the
+// clip-space re-projection normal. Reserved locations 14/15 (material varyings start at 16).
+layout(location = 14) in vec4 tc_tess_clip_normal[];
+layout(location = 15) in vec3 tc_tess_world_pos[];
 
 // Varyings out to the fragment stage (locations match the fragment-stage input block).
 layout(location = 0) out vec3 vertex_interp;
@@ -3550,4 +3589,22 @@ void main() {
 
 	// Interpolate the material's own varyings (generated).
 #CODE : TESS_EVAL_INTERP
+
+	// --- Adaptive tessellation displacement (P4) ---
+	// Dual-paraboloid (point-light shadows) warps position non-linearly in the vertex stage, and multiview
+	// needs a per-view projection, so both are left undisplaced for now. The displacement amount comes
+	// from the material's displacement() function (P4c wires code["displacement"] in here); until then
+	// this is a no-op and the geometry passes through unchanged.
+#if defined(NORMAL_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW) && defined(DISPLACEMENT_CODE_USED)
+	{
+		vec3 te_world_pos = TESS_INTERP(tc_tess_world_pos);
+		float te_disp = 0.0;
+		// P4c: run displacement() here (world pos in te_world_pos, writes te_disp).
+
+		// Re-project via the vertex stage's clip-space normal helper (exact, since projection is linear),
+		// and keep the view-space position the fragment stage reads consistent with the moved geometry.
+		gl_Position += TESS_INTERP(tc_tess_clip_normal) * te_disp;
+		vertex_interp += normalize(normal_interp) * te_disp;
+	}
+#endif
 }
