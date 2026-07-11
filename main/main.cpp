@@ -78,6 +78,7 @@
 #include "servers/movie_writer/movie_writer.h"
 #include "servers/register_server_types.h"
 #include "servers/rendering/renderer_rd/meshlet_selftest.h"
+#include "servers/rendering/renderer_rd/tess_selftest.h"
 #include "modules/kilos_physics/kilos_selftest.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server.h"
@@ -4885,6 +4886,7 @@ int Main::start() {
 	OS::get_singleton()->benchmark_dump();
 
 	run_meshlet_selftest_if_requested();
+	run_tess_selftest_if_requested();
 
 #ifdef MODULE_KILOS_PHYSICS_ENABLED
 	run_kilos_selftest_if_requested();
