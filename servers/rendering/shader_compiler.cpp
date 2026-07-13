@@ -30,6 +30,8 @@
 
 #include "shader_compiler.h"
 
+#include "core/os/os.h"
+#include "core/io/file_access.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/shader_types.h"
@@ -1614,6 +1616,16 @@ Error ShaderCompiler::compile(RSE::ShaderMode p_mode, const String &p_code, Iden
 	info.shader_types = ShaderTypes::get_singleton()->get_types();
 	info.global_shader_uniform_type_func = _get_global_shader_uniform_type;
 	info.base_varying_index = actions.base_varying_index;
+
+	{
+		static int dump_id = 0;
+		String file_name = "d:\\godot_RT_WIP\\.selftest_project\\shader_dump_" + itos(dump_id++) + ".txt";
+		Ref<FileAccess> f = FileAccess::open(file_name, FileAccess::WRITE);
+		if (f.is_valid()) {
+			f->store_string(p_code);
+			f->close();
+		}
+	}
 
 	Error err = parser.compile(p_code, info);
 

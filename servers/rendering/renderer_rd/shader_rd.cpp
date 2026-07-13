@@ -1216,6 +1216,16 @@ Vector<RD::ShaderStageSPIRVData> ShaderRD::compile_stages(const Vector<String> &
 			continue;
 		}
 
+		{
+			static int dump_id = 0;
+			String file_name = "d:\\godot_RT_WIP\\.selftest_project\\glsl_dump_" + itos(dump_id++) + "_stage_" + itos(i) + ".txt";
+			Ref<FileAccess> f = FileAccess::open(file_name, FileAccess::WRITE);
+			if (f.is_valid()) {
+				f->store_string(p_stage_sources[i]);
+				f->close();
+			}
+		}
+
 		stage.spirv = RD::get_singleton()->shader_compile_spirv_from_source(RD::ShaderStage(i), p_stage_sources[i], RD::SHADER_LANGUAGE_GLSL, &error);
 		stage.dynamic_buffers = p_dynamic_buffers;
 		stage.shader_stage = RD::ShaderStage(i);

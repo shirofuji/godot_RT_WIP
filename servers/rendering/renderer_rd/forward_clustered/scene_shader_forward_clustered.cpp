@@ -924,7 +924,7 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.base_uniform_string = "material.";
 		// Locations 0-13 are the built-in varyings; 11 and 14 are borrowed for the adaptive-tessellation
 		// displacement helpers (tess_clip_normal / tess_displacement) since they don't overlap with patches.
-		actions.base_varying_index = 15;
+		actions.base_varying_index = 16;
 
 		actions.default_filter = ShaderLanguage::FILTER_LINEAR_MIPMAP;
 		actions.default_repeat = ShaderLanguage::REPEAT_ENABLE;
