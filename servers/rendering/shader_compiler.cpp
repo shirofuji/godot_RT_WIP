@@ -829,6 +829,11 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 
 			HashSet<StringName> added_funcs_per_stage[STAGE_MAX];
 
+			// Adaptive tessellation: the displacement() entry point runs in the evaluation stage, which is a
+			// separate compilation unit that cannot pull in the full vertex globals (those include the
+			// material-varying out-declarations, which collide with the TES's own varying pass-through). So
+			// collect just displacement()'s helper-function dependencies into a dedicated code section that
+			// the #[tese] template injects on its own.
 			for (int i = 0; i < pnode->vfunctions.size(); i++) {
 				SL::FunctionNode *fnode = pnode->vfunctions[i].function;
 

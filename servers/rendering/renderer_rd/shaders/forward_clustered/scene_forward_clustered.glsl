@@ -183,11 +183,14 @@ layout(location = 10) out flat uint instance_index_interp;
 out gl_PerVertex {
 	vec4 gl_Position;
 };
-// Displacement helpers consumed by the evaluation stage (reserved locations 14/15, material varyings
-// start at 16): world position for a camera-stable displacement, and projection*vec4(view_normal,0) so
-// the evaluation stage can re-project a displaced vertex without touching any descriptor set.
-layout(location = 14) out vec4 tess_clip_normal;
-layout(location = 15) out vec3 tess_world_pos;
+// Displacement helpers consumed by the evaluation stage. We borrow unused built-in locations to avoid
+// exceeding the 16-location (64 component) Vulkan limit, which breaks StandardMaterial3D (user varyings
+// start at 15). Location 11 is unused because multiview displacement is disabled. Location 14 is unused
+// because point coordinates don't apply to tessellated patches.
+#if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
+layout(location = 11) out vec4 tess_clip_normal;
+layout(location = 14) out float tess_displacement;
+#endif
 #endif
 
 #ifdef USE_MULTIVIEW
@@ -559,6 +562,21 @@ void vertex_shader(vec3 vertex_input,
 #CODE : VERTEX
 	}
 
+	// Capture a STABLE world-space position/normal for displacement() here, while `vertex` is still object
+	// space — computed the SAME way the fragment path builds v_world_pos (model_matrix * object vertex). The
+	// displacement block below otherwise reconstructs world from the view-space vertex via inv_view_matrix,
+	// which drifts under camera-relative rendering: the surface swims and cracks as the camera moves even
+	// though the world point is fixed. Building it from model_matrix matches the fragment exactly → rock solid.
+#if defined(USE_TESSELLATION) && defined(DISPLACEMENT_CODE_USED) && defined(NORMAL_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
+#ifdef VERTEX_WORLD_COORDS_USED
+	vec3 tess_world_vertex = vertex;
+	vec3 tess_world_normal = normal_highp;
+#else
+	vec3 tess_world_vertex = (model_matrix * vec4(vertex, 1.0)).xyz;
+	vec3 tess_world_normal = model_normal_matrix * normal_highp;
+#endif
+#endif
+
 	float roughness = roughness_highp;
 #ifdef NORMAL_USED
 	vec3 normal = normal_highp;
@@ -603,13 +621,29 @@ void vertex_shader(vec3 vertex_input,
 #endif
 
 #ifdef USE_TESSELLATION
-	// Feed the tessellation evaluation stage: world position (for camera-stable displacement) and the
-	// clip-space image of the view-space normal (for exact re-projection of the displaced vertex).
-	tess_world_pos = (inv_view_matrix * vec4(vertex, 1.0)).xyz;
-#ifdef NORMAL_USED
-	tess_clip_normal = projection_matrix * vec4(normalize(normal), 0.0);
-#else
-	tess_clip_normal = vec4(0.0);
+	// Run the material's displacement() here in the vertex stage. Unlike the evaluation stage it can freely
+	// sample material textures (e.g. an ORM height map), read scene data / TIME, and use the matrices — so
+	// the built-ins resolve to world space exactly as the fragment path expects. The result is carried to
+	// the evaluation stage as a scalar and interpolated across the tessellated patch.
+#if defined(DISPLACEMENT_CODE_USED) && defined(NORMAL_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
+	{
+		// Built-in locals the generated displacement() code reads/writes (VERTEX -> vertex world position,
+		// NORMAL -> normal_highp world normal, DISPLACEMENT -> displacement_amount). UV/UV2/COLOR resolve to
+		// the interpolated built-in varyings already assigned above; TIME -> global_time is set for the VS.
+		// Use the STABLE world position captured above (model_matrix * object vertex) rather than an
+		// inv_view_matrix reconstruction, so the sampled height doesn't drift as the camera moves.
+		vec3 vertex = tess_world_vertex;
+		vec3 normal_highp = tess_world_normal;
+		float displacement_amount = 0.0;
+		{
+#CODE : DISPLACEMENT
+		}
+		tess_displacement = displacement_amount;
+
+		// Clip-space image of the view-space normal, so the evaluation stage can re-project a vertex displaced
+		// along the normal without any descriptor access (projection is linear, so this is exact).
+		tess_clip_normal = projection_matrix * vec4(normalize(normal), 0.0);
+	}
 #endif
 #endif
 
@@ -3347,9 +3381,11 @@ layout(location = 11) in vec4 in_combined_projected[];
 layout(location = 12) in vec4 in_diffuse_light_interp[];
 layout(location = 13) in vec4 in_specular_light_interp[];
 #endif
-// Tessellation displacement helpers from the vertex stage (locations 14/15).
-layout(location = 14) in vec4 in_tess_clip_normal[];
-layout(location = 15) in vec3 in_tess_world_pos[];
+// Tessellation displacement helpers from the vertex stage (locations 11/14).
+#if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
+layout(location = 11) in vec4 in_tess_clip_normal[];
+layout(location = 14) in float in_tess_displacement[];
+#endif
 
 // Varyings out to the evaluation stage.
 layout(location = 0) out vec3 tc_vertex_interp[];
@@ -3384,11 +3420,13 @@ layout(location = 11) out vec4 tc_combined_projected[];
 layout(location = 12) out vec4 tc_diffuse_light_interp[];
 layout(location = 13) out vec4 tc_specular_light_interp[];
 #endif
-// Tessellation displacement helpers forwarded to the evaluation stage (locations 14/15).
-layout(location = 14) out vec4 tc_tess_clip_normal[];
-layout(location = 15) out vec3 tc_tess_world_pos[];
+// Tessellation displacement helpers forwarded to the evaluation stage (locations 11/14).
+#if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
+layout(location = 11) out vec4 tc_tess_clip_normal[];
+layout(location = 14) out float tc_tess_displacement[];
+#endif
 
-// Material (user) varyings pass-through, generated per shader (locations >= 16). Empty for materials
+// Material (user) varyings pass-through, generated per shader (locations >= 15). Empty for materials
 // with no varyings.
 #CODE : TESS_CONTROL_VARYINGS
 
@@ -3428,16 +3466,23 @@ void main() {
 	tc_diffuse_light_interp[gl_InvocationID] = in_diffuse_light_interp[gl_InvocationID];
 	tc_specular_light_interp[gl_InvocationID] = in_specular_light_interp[gl_InvocationID];
 #endif
+#if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
 	tc_tess_clip_normal[gl_InvocationID] = in_tess_clip_normal[gl_InvocationID];
-	tc_tess_world_pos[gl_InvocationID] = in_tess_world_pos[gl_InvocationID];
+	tc_tess_displacement[gl_InvocationID] = in_tess_displacement[gl_InvocationID];
+#endif
 
 	// Forward the material's own varyings (generated).
 #CODE : TESS_CONTROL_COPY
 
 	if (gl_InvocationID == 0) {
-		// Pass-through level 1 for now (parity). P4c raises this where displacement is active so there are
-		// interior vertices to displace; P3 makes it a screen-space adaptive factor clamped by max_tess_level.
+		// Level 1 = parity (no subdivision). Where the material has a displacement() function we raise it so
+		// there are interior vertices to displace and the noise detail is actually visible. This is a fixed
+		// value for P4c; P3 replaces it with a screen-space adaptive factor clamped by max_tess_level.
+#if defined(DISPLACEMENT_CODE_USED)
+		const float tess_level = 4.0;
+#else
 		const float tess_level = 1.0;
+#endif
 		gl_TessLevelOuter[0] = tess_level;
 		gl_TessLevelOuter[1] = tess_level;
 		gl_TessLevelOuter[2] = tess_level;
@@ -3506,10 +3551,12 @@ layout(location = 12) in vec4 tc_diffuse_light_interp[];
 layout(location = 13) in vec4 tc_specular_light_interp[];
 #endif
 
-// Tessellation displacement helpers from the vertex stage (see header): world position and the
-// clip-space re-projection normal. Reserved locations 14/15 (material varyings start at 16).
-layout(location = 14) in vec4 tc_tess_clip_normal[];
-layout(location = 15) in vec3 tc_tess_world_pos[];
+// Tessellation displacement helpers from the vertex stage (see header): scalar displacement and the
+// clip-space re-projection normal. Reserved locations 11/14 (material varyings start at 15).
+#if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
+layout(location = 11) in vec4 tc_tess_clip_normal[];
+layout(location = 14) in float tc_tess_displacement[];
+#endif
 
 // Varyings out to the fragment stage (locations match the fragment-stage input block).
 layout(location = 0) out vec3 vertex_interp;
@@ -3591,19 +3638,16 @@ void main() {
 #CODE : TESS_EVAL_INTERP
 
 	// --- Adaptive tessellation displacement (P4) ---
-	// Dual-paraboloid (point-light shadows) warps position non-linearly in the vertex stage, and multiview
-	// needs a per-view projection, so both are left undisplaced for now. The displacement amount comes
-	// from the material's displacement() function (P4c wires code["displacement"] in here); until then
-	// this is a no-op and the geometry passes through unchanged.
+	// The vertex stage already ran the material's displacement() (where it can sample textures / read scene
+	// data) and handed us the scalar amount per control point. Interpolate it across the patch and offset
+	// the geometry along the surface normal, re-projecting via the vertex stage's clip-space normal helper
+	// (exact, since projection is linear). Dual-paraboloid (point-light shadows) warps position non-linearly
+	// and multiview needs a per-view projection, so both are left undisplaced.
 #if defined(NORMAL_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW) && defined(DISPLACEMENT_CODE_USED)
 	{
-		vec3 te_world_pos = TESS_INTERP(tc_tess_world_pos);
-		float te_disp = 0.0;
-		// P4c: run displacement() here (world pos in te_world_pos, writes te_disp).
-
-		// Re-project via the vertex stage's clip-space normal helper (exact, since projection is linear),
-		// and keep the view-space position the fragment stage reads consistent with the moved geometry.
+		float te_disp = TESS_INTERP(tc_tess_displacement);
 		gl_Position += TESS_INTERP(tc_tess_clip_normal) * te_disp;
+		// Keep the view-space position the fragment stage reads consistent with the moved geometry.
 		vertex_interp += normalize(normal_interp) * te_disp;
 	}
 #endif
