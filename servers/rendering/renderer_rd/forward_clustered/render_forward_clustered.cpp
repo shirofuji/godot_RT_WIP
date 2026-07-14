@@ -3243,27 +3243,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		bool finish_depth = using_ssao || using_ssil || using_svogi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
 
 		// When the early meshlet pass engaged this frame, it already cleared+wrote depth_framebuffer
-		// for meshlet-replaceable instances - skip them here (same meshlet_replace_skip_set filtering
-		// the opaque color pass already applies below) and don't clear what it just wrote.
-		GeometryInstanceSurfaceDataCache **depth_elements_ptr = render_list[RENDER_LIST_OPAQUE].elements.ptr();
-		RenderElementInfo *depth_element_info_ptr = render_list[RENDER_LIST_OPAQUE].element_info.ptr();
-		int depth_elements_count = render_list[RENDER_LIST_OPAQUE].elements.size();
-		LocalVector<GeometryInstanceSurfaceDataCache *> meshlet_depth_filtered_elements;
-		LocalVector<RenderElementInfo> meshlet_depth_filtered_element_info;
-		if (meshlet_early_pass_engaged && !meshlet_replace_skip_set.is_empty()) {
-			for (uint32_t i = 0; i < render_list[RENDER_LIST_OPAQUE].elements.size(); i++) {
-				if (meshlet_replace_skip_set.has(render_list[RENDER_LIST_OPAQUE].elements[i])) {
-					continue;
-				}
-				meshlet_depth_filtered_elements.push_back(render_list[RENDER_LIST_OPAQUE].elements[i]);
-				meshlet_depth_filtered_element_info.push_back(render_list[RENDER_LIST_OPAQUE].element_info[i]);
-			}
-			depth_elements_ptr = meshlet_depth_filtered_elements.ptr();
-			depth_element_info_ptr = meshlet_depth_filtered_element_info.ptr();
-			depth_elements_count = meshlet_depth_filtered_elements.size();
-		}
-
-		RenderListParameters render_list_params(depth_elements_ptr, depth_element_info_ptr, depth_elements_count, reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+		// for meshlet-replaceable INSTANCE_MESH instances. They're skipped here IN PLACE inside
+		// _render_list (see its PASS_MODE_DEPTH skip) - NOT by rebuilding the element list. The old
+		// rebuild dropped the skipped elements but copied the survivors' `repeat` group counts verbatim,
+		// desyncing the draw loop's `i += repeat - 1` group indexing so unrelated opaque geometry read
+		// the wrong elements and never got depth written - a terrain chunk vanished as a black hole
+		// whenever any meshlet-replaceable mesh (e.g. a StandardMaterial3D capsule) engaged the early
+		// pass. Pass the FULL list; the in-place skip keeps every survivor at its original index so the
+		// grouping stays valid (the opaque color pass below already does exactly this).
+		RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 		RD::DrawFlags depth_pre_pass_draw_flags = (needs_pre_resolve || meshlet_early_pass_engaged) ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL;
 		_render_list_with_draw_list(&render_list_params, depth_framebuffer, depth_pre_pass_draw_flags, depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
 
