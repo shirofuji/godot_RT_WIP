@@ -833,11 +833,18 @@ void MeshletSoftwareRasterizer::_ensure_resolve_raster_pipeline(RD::FramebufferF
 	ds.depth_compare_operator = RD::COMPARE_OP_GREATER_OR_EQUAL; // Reverse-Z: write when nearer-or-equal.
 	RD::PipelineColorBlendState blend = RD::PipelineColorBlendState::create_disabled(); // One opaque color attachment.
 
+	// The pipeline's sample count must match the target framebuffer's (an MSAA color/depth fb when the
+	// project runs msaa_3d > 0). A default TEXTURE_SAMPLES_1 state against a 4x MSAA fb is a sample
+	// mismatch that crushed all resolved geometry into the top-left quadrant on the driver measured
+	// here (same root cause as the HW meshlet path - see MeshletRenderer::_ensure_pipeline).
+	RD::PipelineMultisampleState multisample_state;
+	multisample_state.sample_count = RD::get_singleton()->framebuffer_format_get_texture_samples(p_fb_format, 0);
+
 	// INVALID_FORMAT_ID vertex format: this is a procedural fullscreen draw (gl_VertexIndex only, no
 	// vertex array bound), so the pipeline must declare no vertex input.
-	resolve_raster_pipeline_fallback = RD::get_singleton()->render_pipeline_create(resolve_raster_shader.version_get_shader(resolve_raster_shader_version, 1), p_fb_format, RD::INVALID_FORMAT_ID, RD::RENDER_PRIMITIVE_TRIANGLES, rs, RD::PipelineMultisampleState(), ds, blend);
+	resolve_raster_pipeline_fallback = RD::get_singleton()->render_pipeline_create(resolve_raster_shader.version_get_shader(resolve_raster_shader_version, 1), p_fb_format, RD::INVALID_FORMAT_ID, RD::RENDER_PRIMITIVE_TRIANGLES, rs, multisample_state, ds, blend);
 	if (int64_supported) {
-		resolve_raster_pipeline_int64 = RD::get_singleton()->render_pipeline_create(resolve_raster_shader.version_get_shader(resolve_raster_shader_version, 0), p_fb_format, RD::INVALID_FORMAT_ID, RD::RENDER_PRIMITIVE_TRIANGLES, rs, RD::PipelineMultisampleState(), ds, blend);
+		resolve_raster_pipeline_int64 = RD::get_singleton()->render_pipeline_create(resolve_raster_shader.version_get_shader(resolve_raster_shader_version, 0), p_fb_format, RD::INVALID_FORMAT_ID, RD::RENDER_PRIMITIVE_TRIANGLES, rs, multisample_state, ds, blend);
 	}
 	resolve_raster_pipeline_format = p_fb_format;
 }

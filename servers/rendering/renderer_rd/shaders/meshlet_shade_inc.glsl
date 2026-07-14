@@ -124,9 +124,12 @@ void light_compute(vec3 N, vec3 L, vec3 V, vec3 light_color, bool is_directional
 }
 
 void light_process_directional(uint idx, vec3 N, vec3 V, MeshletMaterial mat, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
-	// L is the direction TO the light; lights.data[].direction already points toward the source for
-	// this path, so it's used directly - NOT negated.
-	vec3 L = normalize(lights.data[idx].direction);
+	// L is the direction TO the light. lights.data[].direction is filled CPU-side with the light's
+	// TRAVEL direction (basis * (0,0,-1), pointing away from the source - see
+	// RenderForwardClustered::_meshlet_collect_lights), so it must be NEGATED to get the to-light
+	// vector. (The old code used it un-negated, inverting N.L: faces toward the light rendered dark
+	// and faces away rendered lit - the meshlet "inverted lighting / dark primitives" bug.)
+	vec3 L = -normalize(lights.data[idx].direction);
 	light_compute(N, L, V, lights.data[idx].color, true, 1.0, mat, albedo, diffuse_light, specular_light);
 }
 

@@ -174,7 +174,14 @@ void main() {
 	vec3 cone_cofactor0 = cross(cone_m[1], cone_m[2]);
 	mat3 cone_normal_matrix = mat3(cone_cofactor0, cross(cone_m[2], cone_m[0]), cross(cone_m[0], cone_m[1]));
 	float cone_det_sign = sign(dot(cone_m[0], cone_cofactor0));
-	vec3 world_cone_axis = normalize(cone_normal_matrix * d.cone_axis) * cone_det_sign;
+	// NEGATED: meshopt_computeMeshletBounds derives cone_axis from right-hand-rule triangle normals
+	// (cross of the winding's edges), which for Godot's CLOCKWISE-front-face meshes points INWARD
+	// (into the solid). The backface test below wants the OUTWARD facing direction, so flip it -
+	// otherwise the test is inverted and culls FRONT-facing clusters while keeping back ones. This
+	// only became visible at close range: at distance the LOD cut selects coarse clusters (wide/
+	// degenerate cones that never cull), but up close it selects leaf clusters whose tight cones then
+	// got wrongly culled - the distance-dependent "holes in the capsule when the camera is near" bug.
+	vec3 world_cone_axis = -normalize(cone_normal_matrix * d.cone_axis) * cone_det_sign;
 	vec3 to_meshlet = world_center - params.camera_position;
 	float dist = length(to_meshlet);
 	if (dist > 0.0001) {
