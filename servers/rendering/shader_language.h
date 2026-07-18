@@ -960,6 +960,11 @@ public:
 	struct FunctionInfo {
 		HashMap<StringName, BuiltInInfo> built_ins;
 		HashMap<StringName, StageFunctionInfo> stage_functions;
+		// Global built-ins (those declared under the "global" pseudo-function, e.g. TIME) that this function
+		// specifically must NOT see. Needed where a processor runs in a stage that cannot reach the data a
+		// global built-in is sourced from, so accepting it would either silently produce a wrong value or fail
+		// deep inside the generated GLSL. Empty for every function that does not opt out.
+		HashSet<StringName> excluded_built_ins;
 
 		bool can_discard = false;
 		bool main_function = false;

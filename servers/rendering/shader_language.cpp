@@ -10775,6 +10775,10 @@ Error ShaderLanguage::_parse_shader(const HashMap<StringName, FunctionInfo> &p_f
 
 				if (p_functions.has("global")) { // Adds global variables: 'TIME'
 					for (const KeyValue<StringName, BuiltInInfo> &E : p_functions["global"].built_ins) {
+						// A function may opt out of a global built-in it cannot honour (see FunctionInfo).
+						if (builtins.excluded_built_ins.has(E.key)) {
+							continue;
+						}
 						builtins.built_ins.insert(E.key, E.value);
 					}
 				}
