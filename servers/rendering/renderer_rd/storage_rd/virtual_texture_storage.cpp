@@ -422,7 +422,11 @@ uint32_t VirtualTextureStorage::register_virtual_texture(const RID &p_source_rd_
 
 	// Keep a CPU shadow of the page table + the floor so update_streaming() can patch individual page
 	// texels (resident on stream-in, not-resident on eviction) and re-upload just the change
-	vt.resident_mip_floor = 0; // S0a: 0 = everything resident.
+	// S0c: mips >= always_resident_from are the coarse always-resident base; finer mips stream on
+	// demand. Must match meta.resident_mip_floor (above) so update_streaming() streams the fine mips
+	// instead of skipping them as "base". (Was hardcoded 0 - a stale S0a leftover that made the guard
+	// `req.mip >= 0` skip every stream-in, so source-registered VTs never paged in past the base.)
+	vt.resident_mip_floor = always_resident_from;
 	vt.indirection_cpu = indirection_data;
 	vt.siblings.clear();
 
