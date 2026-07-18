@@ -344,17 +344,40 @@ vec4 _tess_bilinear_lod(texture2DArray t, vec3 uvw, int lod) {
 }
 // Trilinear: bilinear within each of the two bracketing mips, then blend. Displacement MUST be continuous,
 // so snapping to one mip would step the geometry as the level changes.
+//
+// The early-out is not a micro-optimization. Each bilinear costs 4 texelFetch, and an integral lod weights the
+// second mip by exactly zero - mix(a, b, 0.0) IS a, but GLSL still evaluates b, so a plain mix() throws away
+// half of every fetch. That is the COMMON case: any shader dialling in a constant mip_bias hits it on every
+// single sample. The result is identical either way; only the wasted fetches go.
+//
+// MEASURED (terrain doing ~24 height fetches per vertex, GTX 1660 Super): integral lod 36.3 -> 27.7 ms, i.e.
+// a quarter of the whole frame. But note the trade: a FRACTIONAL lod went 35.4 -> 42.9 ms, because the branch
+// stops the compiler scheduling the two mip taps together and serializes them. That is the right bargain while
+// lod is a constant, and the wrong one if lod ever becomes per-vertex (e.g. deriving the mip from tessellated
+// vertex spacing) - if that lands, re-measure and consider going back to the unconditional mix(). A branchless
+// select of l1=l0 was also tried and is a wash (37.0 / 35.7): sampling the same mip twice costs as much as
+// sampling two.
 vec4 tessTextureLod(texture2D t, vec2 uv, float lod) {
-	float ml = clamp(lod, 0.0, float(textureQueryLevels(t) - 1));
+	int levels = textureQueryLevels(t);
+	float ml = clamp(lod, 0.0, float(levels - 1));
 	int l0 = int(floor(ml));
-	int l1 = min(l0 + 1, textureQueryLevels(t) - 1);
-	return mix(_tess_bilinear_lod(t, uv, l0), _tess_bilinear_lod(t, uv, l1), fract(ml));
+	float f = ml - float(l0);
+	vec4 c0 = _tess_bilinear_lod(t, uv, l0);
+	if (f <= 0.0) {
+		return c0;
+	}
+	return mix(c0, _tess_bilinear_lod(t, uv, min(l0 + 1, levels - 1)), f);
 }
 vec4 tessTextureLod(texture2DArray t, vec3 uvw, float lod) {
-	float ml = clamp(lod, 0.0, float(textureQueryLevels(t) - 1));
+	int levels = textureQueryLevels(t);
+	float ml = clamp(lod, 0.0, float(levels - 1));
 	int l0 = int(floor(ml));
-	int l1 = min(l0 + 1, textureQueryLevels(t) - 1);
-	return mix(_tess_bilinear_lod(t, uvw, l0), _tess_bilinear_lod(t, uvw, l1), fract(ml));
+	float f = ml - float(l0);
+	vec4 c0 = _tess_bilinear_lod(t, uvw, l0);
+	if (f <= 0.0) {
+		return c0;
+	}
+	return mix(c0, _tess_bilinear_lod(t, uvw, min(l0 + 1, levels - 1)), f);
 }
 )";
 }

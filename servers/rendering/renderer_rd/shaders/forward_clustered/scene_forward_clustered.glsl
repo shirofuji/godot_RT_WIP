@@ -195,10 +195,14 @@ out gl_PerVertex {
 // defined - tessellation would subdivide the surface without changing its shape at all (measured: level 4 vs
 // level 1 differed by <0.08% of subpixels, max delta 4/255). Handing the evaluation stage the world position
 // lets it run displacement() per GENERATED vertex, which is what actually adds sub-triangle detail.
+// The w lanes of 14/15 carry the viewport size (see the control shader): a varying location holds four
+// components whether or not you use them, so a vec3 wastes its fourth. The control shader needs the viewport
+// to size patches in pixels and cannot read scene_data itself, and locations 12-15 are the last ones free -
+// material varyings start at base_varying_index = 16 and moving that boundary breaks StandardMaterial3D.
 #if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
 layout(location = 11) out vec4 tess_clip_normal;
-layout(location = 14) out vec3 tess_world_vertex_interp;
-layout(location = 15) out vec3 tess_world_normal_interp;
+layout(location = 14) out vec4 tess_world_vertex_interp;
+layout(location = 15) out vec4 tess_world_normal_interp;
 #endif
 #endif
 
@@ -637,8 +641,13 @@ void vertex_shader(vec3 vertex_input,
 	// vertex instead would drift under camera-relative rendering, making the surface swim as the camera moves.
 #if defined(DISPLACEMENT_CODE_USED) && defined(NORMAL_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
 	{
-		tess_world_vertex_interp = tess_world_vertex;
-		tess_world_normal_interp = tess_world_normal;
+		// The w lanes carry the viewport size to the control shader, which sizes patches in pixels but cannot
+		// read scene_data. It is the same value for every vertex; this just rides along in space that a vec3
+		// would otherwise waste. Note this function runs twice when MOTION_VECTORS is on (once with the
+		// previous frame's scene_data, then with the current), and the second call overwrites the first, so
+		// these always end up holding current-frame values.
+		tess_world_vertex_interp = vec4(tess_world_vertex, read_viewport_size.x);
+		tess_world_normal_interp = vec4(tess_world_normal, read_viewport_size.y);
 
 		// Clip-space image of the view-space normal, so the evaluation stage can re-project a vertex displaced
 		// along the normal without any descriptor access (projection is linear, so this is exact).
@@ -3384,8 +3393,8 @@ layout(location = 13) in vec4 in_specular_light_interp[];
 // Tessellation displacement helpers from the vertex stage (locations 11/14/15).
 #if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
 layout(location = 11) in vec4 in_tess_clip_normal[];
-layout(location = 14) in vec3 in_tess_world_vertex[];
-layout(location = 15) in vec3 in_tess_world_normal[];
+layout(location = 14) in vec4 in_tess_world_vertex[];
+layout(location = 15) in vec4 in_tess_world_normal[];
 #endif
 
 // Varyings out to the evaluation stage.
@@ -3424,13 +3433,48 @@ layout(location = 13) out vec4 tc_specular_light_interp[];
 // Tessellation displacement helpers forwarded to the evaluation stage (locations 11/14/15).
 #if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
 layout(location = 11) out vec4 tc_tess_clip_normal[];
-layout(location = 14) out vec3 tc_tess_world_vertex[];
-layout(location = 15) out vec3 tc_tess_world_normal[];
+layout(location = 14) out vec4 tc_tess_world_vertex[];
+layout(location = 15) out vec4 tc_tess_world_normal[];
 #endif
 
 // Material (user) varyings pass-through, generated per shader (locations >= 15). Empty for materials
 // with no varyings.
 #CODE : TESS_CONTROL_VARYINGS
+
+#if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
+
+// Screen-space length, in pixels, that each edge produced by subdivision aims for. An edge this long is left
+// alone (level 1); one four times as long is split four ways. Lower = finer relief and more triangles.
+#define TESS_TARGET_EDGE_PX 16.0
+// Ceiling on subdivision. 4.0 is the fixed level this replaces, so no patch can come out of this costing more
+// than it did before the level became adaptive - the only thing adaptivity can do here is remove work.
+#define TESS_MAX_LEVEL 2.0
+
+// Screen-space length in pixels of the patch edge between control points a and b.
+//
+// This MUST be symmetric in (a, b) and depend on NOTHING but those two control points. The patch on the far
+// side of this edge is a different invocation that reaches the same two vertices through different local
+// indices; if the two disagree about the edge's level by even one ULP they subdivide it differently and the
+// surface tears open along the seam. distance() is symmetric, and both patches see bit-identical gl_Position
+// for a shared vertex because it is the same vertex stage output, so they always agree.
+float tess_edge_pixels(int a, int b, vec2 viewport) {
+	// A control point at or behind the eye has w <= 0, where the perspective divide is meaningless (it flips
+	// the point through the origin). Clamping w to a small positive value throws it far off screen, so the
+	// edge measures as very long and saturates at TESS_MAX_LEVEL - which is the right answer regardless, since
+	// a patch crossing the near plane is right on top of the camera. Clamping per control point rather than
+	// rejecting the edge keeps this symmetric, so it stays crack-free.
+	float wa = max(gl_in[a].gl_Position.w, 0.0001);
+	float wb = max(gl_in[b].gl_Position.w, 0.0001);
+	vec2 sa = gl_in[a].gl_Position.xy / wa * viewport * 0.5;
+	vec2 sb = gl_in[b].gl_Position.xy / wb * viewport * 0.5;
+	return distance(sa, sb);
+}
+
+float tess_edge_level(int a, int b, vec2 viewport) {
+	return clamp(tess_edge_pixels(a, b, viewport) / TESS_TARGET_EDGE_PX, 1.0, TESS_MAX_LEVEL);
+}
+
+#endif
 
 void main() {
 	// Per-vertex tessellation-control outputs may only be indexed with gl_InvocationID (GLSL rule).
@@ -3478,18 +3522,37 @@ void main() {
 #CODE : TESS_CONTROL_COPY
 
 	if (gl_InvocationID == 0) {
-		// Level 1 = parity (no subdivision). Where the material has a displacement() function we raise it so
-		// there are interior vertices to displace and the noise detail is actually visible. This is a fixed
-		// value for P4c; P3 replaces it with a screen-space adaptive factor clamped by max_tess_level.
-#if defined(DISPLACEMENT_CODE_USED)
-		const float tess_level = 4.0;
+#if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
+		// Size each edge by how big it actually is on screen, so a patch on the horizon is left as one
+		// triangle while one under the camera gets the full budget. A fixed level cost the same either way and
+		// spent nearly all of it on patches too small to show the relief.
+		//
+		// The viewport arrives in the w lanes of the world position/normal varyings: this stage cannot read
+		// scene_data (the shared descriptor sets are built for vertex+fragment only, and a tessellation stage
+		// touching them diverges the set format and fails every draw). Every control point carries the same
+		// value, so control point 0 is as good as any.
+		vec2 viewport = vec2(in_tess_world_vertex[0].w, in_tess_world_normal[0].w);
+
+		// gl_TessLevelOuter[i] is the edge OPPOSITE control point i: outer[0] is the edge along gl_TessCoord.x
+		// == 0, which joins control points 1 and 2, and so on around. Getting this mapping wrong subdivides
+		// each edge to its neighbour's level and cracks every patch boundary.
+		float outer0 = tess_edge_level(1, 2, viewport);
+		float outer1 = tess_edge_level(2, 0, viewport);
+		float outer2 = tess_edge_level(0, 1, viewport);
+		gl_TessLevelOuter[0] = outer0;
+		gl_TessLevelOuter[1] = outer1;
+		gl_TessLevelOuter[2] = outer2;
+		// The interior has to be at least as dense as the densest edge, otherwise a patch whose edges are
+		// finely split stays coarse through the middle and the relief flattens out away from its borders.
+		gl_TessLevelInner[0] = max(max(outer0, outer1), outer2);
 #else
-		const float tess_level = 1.0;
+		// No displacement (or a projection displacement is disabled under): nothing to subdivide for, and
+		// level 1 reproduces the three original corners exactly.
+		gl_TessLevelOuter[0] = 1.0;
+		gl_TessLevelOuter[1] = 1.0;
+		gl_TessLevelOuter[2] = 1.0;
+		gl_TessLevelInner[0] = 1.0;
 #endif
-		gl_TessLevelOuter[0] = tess_level;
-		gl_TessLevelOuter[1] = tess_level;
-		gl_TessLevelOuter[2] = tess_level;
-		gl_TessLevelInner[0] = tess_level;
 	}
 }
 
@@ -3562,10 +3625,11 @@ layout(location = 13) in vec4 tc_specular_light_interp[];
 // Tessellation displacement helpers from the vertex stage (see header): the world-space position/normal
 // displacement() is evaluated at, and the clip-space re-projection normal. Reserved locations 11/14/15
 // (material varyings start at base_varying_index = 16).
+// The w lanes carry the viewport size for the control shader's level maths and are unused here.
 #if defined(DISPLACEMENT_CODE_USED) && !defined(MODE_DUAL_PARABOLOID) && !defined(USE_MULTIVIEW)
 layout(location = 11) in vec4 tc_tess_clip_normal[];
-layout(location = 14) in vec3 tc_tess_world_vertex[];
-layout(location = 15) in vec3 tc_tess_world_normal[];
+layout(location = 14) in vec4 tc_tess_world_vertex[];
+layout(location = 15) in vec4 tc_tess_world_normal[];
 #endif
 
 // The material's uniform buffer. This is set 3 (MATERIAL_UNIFORM_SET), built per-material from THIS
@@ -3686,21 +3750,37 @@ void main() {
 		// NORMAL -> normal_highp (world space), DISPLACEMENT -> displacement_amount. UV/UV2/COLOR resolve to
 		// the out-varyings interpolated above, so they must stay assigned before this block.
 		//
-		// TIME is not available: global_time comes from a scene descriptor set this stage must not read. It
-		// resolves to 0.0 rather than failing to compile, so a time-animated displacement() silently goes
-		// static - the trade for descriptor-free evaluation.
-		vec3 vertex = TESS_INTERP(tc_tess_world_vertex);
-		vec3 normal_highp = normalize(TESS_INTERP(tc_tess_world_normal));
+		// Nothing sourced from scene data can be declared here (this stage must not read the shared descriptor
+		// sets), so shader_types.cpp does not offer TIME or CAMERA_POSITION_WORLD to displacement() at all -
+		// the parser rejects them by name and no local shim is needed.
+		vec3 vertex = TESS_INTERP(tc_tess_world_vertex).xyz;
+		vec3 normal_highp = normalize(TESS_INTERP(tc_tess_world_normal).xyz);
 		float displacement_amount = 0.0;
-		float global_time = 0.0;
+		// VIEW_DEPTH built-in: the distance of this vertex from the view plane, in world units. gl_Position was
+		// set above from the interpolated (pre-displacement) control-point clip positions, so its w is exactly
+		// the view-space depth here. displacement() can fade its output to zero with distance, and skip its
+		// texture sampling past a cutoff, using only this - no descriptor access. It is per generated vertex, so
+		// a fade built on it is continuous across patch boundaries and stays crack-free. NOTE this is the depth
+		// from whatever view is rendering: in a shadow/depth-from-light pass it is distance from the light, not
+		// the camera, so a distance fade there keys off light distance (harmless for gentle relief; the far
+		// shadow cascades that cover faded terrain are low-res enough that the difference is sub-texel).
+		float view_depth = gl_Position.w;
 		{
 #CODE : DISPLACEMENT
 		}
 
 		vec4 tess_clip_offset = TESS_INTERP(tc_tess_clip_normal) * displacement_amount;
 		gl_Position += tess_clip_offset;
-		// Keep the view-space position the fragment stage reads consistent with the moved geometry.
-		vertex_interp += normalize(normal_interp) * displacement_amount;
+		// Keep the view-space position the fragment stage reads consistent with the moved geometry. The offset
+		// must be normal_interp as interpolated, NOT normalized: the clip offset above is
+		// projection * (sum of w_i * n_i), so the view-space offset gl_Position actually encodes is
+		// displacement_amount * TESS_INTERP(tc_normal_interp) - and interpolating unit normals yields a vector
+		// shorter than 1 wherever the corner normals diverge. Normalizing here would move the position the
+		// fragment stage shades by up to ~7% more than the geometry the rasterizer drew (at ~60 degrees of
+		// normal spread across a patch), so lighting, the view vector and depth reconstruction would all be
+		// evaluated at a point the surface isn't. The surface is therefore displaced slightly less than
+		// displacement_amount on curved patches, which is a smooth shrink rather than a stage disagreement.
+		vertex_interp += normal_interp * displacement_amount;
 
 #ifdef MOTION_VECTORS
 		// TAA reprojects each pixel with these, but the vertex stage captured them from the UNDISPLACED

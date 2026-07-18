@@ -36,6 +36,7 @@
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
 #include "core/string/string_builder.h"
+#include "core/templates/safe_refcount.h"
 #include "core/version.h"
 #include "servers/rendering/shader_include_db.h"
 
@@ -634,6 +635,15 @@ String ShaderRD::_version_get_sha1(Version *p_version) const {
 		hash_build.append(p_version->custom_defines[i].get_data());
 	}
 
+	// Tessellation is opted into per version via a render_mode, which emits no code and no define, so without
+	// this two versions with identical source but different tessellation flags hash the same and collide in the
+	// disk cache - the non-tessellated binary gets loaded for a pipeline built with patch topology (or vice
+	// versa) and the draw silently produces nothing. Appended only when set, so the hash of every version that
+	// does not tessellate - i.e. every version of every other shader - stays byte-identical and keeps its cache.
+	if (p_version->tessellation) {
+		hash_build.append("[tessellation]");
+	}
+
 	return hash_build.as_string().sha1_text();
 }
 
@@ -1216,13 +1226,18 @@ Vector<RD::ShaderStageSPIRVData> ShaderRD::compile_stages(const Vector<String> &
 			continue;
 		}
 
-		{
-			static int dump_id = 0;
-			String file_name = "d:\\godot_RT_WIP\\.selftest_project\\glsl_dump_" + itos(dump_id++) + "_stage_" + itos(i) + ".txt";
+		// Dump the fully generated source of every compiled stage into the directory named by
+		// GODOT_SHADER_DUMP_DIR. Reading the generated tessellation stages (2 = control, 3 = evaluation) is
+		// the only practical way to check what the #CODE markers actually expanded to, but this writes a file
+		// per stage per compile, so it stays opt-in.
+		static const String shader_dump_dir = OS::get_singleton()->get_environment("GODOT_SHADER_DUMP_DIR");
+		if (!shader_dump_dir.is_empty()) {
+			// Shader compilation runs on the worker thread pool, so the counter must be atomic.
+			static SafeNumeric<uint32_t> dump_id;
+			String file_name = shader_dump_dir.path_join(vformat("glsl_dump_%d_stage_%d.txt", dump_id.postincrement(), i));
 			Ref<FileAccess> f = FileAccess::open(file_name, FileAccess::WRITE);
 			if (f.is_valid()) {
 				f->store_string(p_stage_sources[i]);
-				f->close();
 			}
 		}
 

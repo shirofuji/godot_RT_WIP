@@ -278,22 +278,63 @@ void run_tess_shader_selftest_if_requested() {
 			"render_mode tessellation_adaptive;\n"
 			"void fragment() { ALBEDO = vec3(0.5); }\n");
 
-	// The displacement() processor and its built-ins parse: read const NORMAL/UV/TIME, write VERTEX/DISPLACEMENT.
+	// The displacement() processor and its built-ins parse: read const NORMAL/UV/VIEW_DEPTH, write
+	// VERTEX/DISPLACEMENT.
 	check_compiles("displacement() with built-ins compiles",
 			"shader_type spatial;\n"
 			"render_mode tessellation_adaptive;\n"
 			"uniform float height_scale = 1.0;\n"
+			"uniform float fade_distance = 200.0;\n"
 			"void displacement() {\n"
-			"	DISPLACEMENT = sin(UV.x * 10.0 + TIME) * height_scale;\n"
-			"	VERTEX += NORMAL * DISPLACEMENT;\n"
+			"	if (VIEW_DEPTH <= fade_distance) {\n"
+			"		DISPLACEMENT = UV.x * 10.0 * height_scale;\n"
+			"		VERTEX += NORMAL * DISPLACEMENT;\n"
+			"	}\n"
 			"}\n"
 			"void fragment() { ALBEDO = vec3(0.5); }\n");
+
+	check_rejects("VIEW_DEPTH is not visible outside displacement()",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void displacement() { DISPLACEMENT = 0.0; }\n"
+			"void fragment() { ALBEDO = vec3(VIEW_DEPTH); }\n");
 
 	// Negative controls prove the built-in metadata is real, not permissive.
 	check_rejects("writing to const built-in NORMAL is rejected",
 			"shader_type spatial;\n"
 			"render_mode tessellation_adaptive;\n"
 			"void displacement() { NORMAL = vec3(1.0); }\n");
+
+	// The evaluation stage cannot read the shared scene descriptor sets, so built-ins sourced from scene data
+	// must be rejected by name rather than silently resolving to a constant (TIME) or failing to compile deep
+	// in glslang (CAMERA_POSITION_WORLD -> inv_view_matrix[3].xyz, undeclared in that stage).
+	check_rejects("TIME is not available in displacement()",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void displacement() { DISPLACEMENT = sin(TIME); }\n");
+
+	check_rejects("CAMERA_POSITION_WORLD is not available in displacement()",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void displacement() { DISPLACEMENT = CAMERA_POSITION_WORLD.y; }\n");
+
+	check_rejects("EXPOSURE is not available in displacement()",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void displacement() { DISPLACEMENT = EXPOSURE; }\n");
+
+	check_rejects("IN_SHADOW_PASS is not available in displacement()",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void displacement() { DISPLACEMENT = IN_SHADOW_PASS ? 1.0 : 0.0; }\n");
+
+	// The excluded built-ins must stay available everywhere else - the opt-out is per function, not global.
+	check_compiles("TIME still works in vertex() and fragment()",
+			"shader_type spatial;\n"
+			"render_mode tessellation_adaptive;\n"
+			"void displacement() { DISPLACEMENT = 1.0; }\n"
+			"void vertex() { VERTEX.y += sin(TIME); }\n"
+			"void fragment() { ALBEDO = vec3(EXPOSURE * sin(TIME)); NORMAL = NORMAL; }\n");
 
 	check_rejects("unknown render_mode is still rejected",
 			"shader_type spatial;\n"

@@ -219,6 +219,16 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	stencil_compare = StencilCompare(stencil_comparei);
 	stencil_reference = stencil_referencei;
 
+	// Every displacement guard in scene_forward_clustered.glsl requires NORMAL_USED, since displacement is an
+	// offset along the normal and there is nothing to offset along without one. That define is only emitted
+	// when the shader touches the NORMAL built-in - NORMAL_MAP does NOT set it - so a displacement() material
+	// that only writes NORMAL_MAP compiles its entire displacement path out and renders dead flat with no
+	// diagnostic at all. Checking gen_code.defines rather than uses_normal is deliberate: uses_normal has
+	// already had uses_normal_map folded into it above, which is exactly the case that must still be caught.
+	if (gen_code.code.has("displacement") && !gen_code.defines.has("#define NORMAL_USED\n")) {
+		ERR_PRINT(vformat("Shader '%s' has a displacement() function but never uses the NORMAL built-in, so its displacement is silently ignored. Write NORMAL (in vertex() or fragment()) to enable it; writing only NORMAL_MAP is not enough.", path));
+	}
+
 #if 0
 	print_line("**compiling shader:");
 	print_line("**defines:\n");
@@ -445,6 +455,12 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 	if (uses_tessellation && primitive_rd == RD::RENDER_PRIMITIVE_TRIANGLES) {
 		primitive_rd = RD::RENDER_PRIMITIVE_TESSELATION_PATCH;
 		raster_state.patch_control_points = 3;
+	} else if (uses_tessellation) {
+		// The shader author opts into tessellation via a render_mode, but the mesh decides the primitive, and
+		// nothing connects the two. The TCS/TES are compiled into every variant of this version regardless, and
+		// Vulkan requires patch topology whenever tessellation stages are present, so this pipeline is rejected
+		// by the driver and the geometry silently vanishes. Say so, rather than leaving it invisible.
+		ERR_PRINT_ONCE("Materials using 'render_mode tessellation_adaptive' only support triangle geometry. This mesh uses another primitive type (points, lines, or triangle strips) and will not render.");
 	}
 
 	RD::PipelineMultisampleState multisample_state;
@@ -746,6 +762,9 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.renames["VERTEX_ID"] = "VERTEX_INDEX";
 		actions.renames["Z_CLIP_SCALE"] = "z_clip_scale";
 		actions.renames["DISPLACEMENT"] = "displacement_amount";
+		// Only referenceable from displacement() (the only place it is a registered built-in), which compiles
+		// solely into the evaluation stage, where this local is defined from the pre-displacement clip w.
+		actions.renames["VIEW_DEPTH"] = "view_depth";
 
 		actions.renames["ALPHA_SCISSOR_THRESHOLD"] = "alpha_scissor_threshold";
 		actions.renames["ALPHA_HASH_SCALE"] = "alpha_hash_scale";
