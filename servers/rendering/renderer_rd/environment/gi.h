@@ -753,6 +753,14 @@ public:
 		RID atomic_counter_buffer;
 		RID octree_uniform_set;
 
+		// Persistent GPU buffer for the SVOGI point-injection (terrain voxel) pass. Grown on demand and
+		// re-uploaded only when gi->svogi_terrain_data_version advances, instead of a storage_buffer_create
+		// + free every voxelize. Its uniform set is routed through UniformSetCacheRD (the point buffer and
+		// the grow-reuse lights buffer both have stable RIDs, so the set is built once and reused).
+		RID svogi_terrain_point_buffer;
+		uint32_t svogi_terrain_point_buffer_capacity = 0;
+		uint32_t svogi_terrain_point_buffer_version = 0xFFFFFFFF;
+
 		// Absolute world-space root bounds the octree was most recently voxelized against (set in
 		// render_region() for cascade 0 - the finest cascade). The octree is built in plain
 		// absolute world space (voxelize transforms vertices by their full model matrix and

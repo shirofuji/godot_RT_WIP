@@ -66,7 +66,10 @@ void main() {
 
 
 	ivec2 full_size = ivec2(int(params.misc.z), int(params.misc.w));
-	ivec2 fp = min(hp * 2, full_size - ivec2(1));
+	// gbuffer stride = full-res / GI-buffer size (2 at half-res, 4 at quarter-res). Derived, not hardcoded,
+	// so this shader follows whatever downscale gi.cpp picks.
+	ivec2 gi_stride = max(full_size / half_dims, ivec2(1));
+	ivec2 fp = min(hp * gi_stride, full_size - ivec2(1));
 
 	// Normal-roughness gbuffer: xyz = view-space normal (0.5+0.5 packed), w = roughness (dynamic-object
 	// flag encoded as roughness > 0.5, per gi.glsl). Length ~0 => no geometry (sky / uncovered) - skip.

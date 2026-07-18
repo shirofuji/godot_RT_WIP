@@ -1228,6 +1228,10 @@ GI::SVOGI::~SVOGI() {
 	RD::get_singleton()->free_rid(octree_nodes_buffer);
 	RD::get_singleton()->free_rid(atomic_counter_buffer);
 
+	if (svogi_terrain_point_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(svogi_terrain_point_buffer);
+	}
+
 	if (screen_gi_texture.is_valid()) {
 		RD::get_singleton()->free_rid(screen_gi_texture);
 	}
@@ -1255,7 +1259,13 @@ void GI::SVOGI::resolve_screen_gi(RID p_depth_texture, RID p_normal_roughness_te
 		return;
 	}
 
-	Size2i half_size((p_internal_size.x + 1) / 2, (p_internal_size.y + 1) / 2);
+	// SVOGI indirect diffuse is low-frequency, so the resolve (cone trace) + a-trous denoise run at a
+	// downscaled resolution and are bilaterally upsampled in the forward pass. GI_DOWNSCALE is the single
+	// knob: 2 = half-res (the original), 4 = quarter-res (~4x cheaper resolve+denoise). The resolve/atrous
+	// shaders derive their gbuffer stride from full/buffer size, and the forward upsample derives its ratio
+	// the same way, so nothing else needs to change when this value changes.
+	const int GI_DOWNSCALE = 4;
+	Size2i half_size((p_internal_size.x + GI_DOWNSCALE - 1) / GI_DOWNSCALE, (p_internal_size.y + GI_DOWNSCALE - 1) / GI_DOWNSCALE);
 	if (screen_gi_texture.is_null() || screen_gi_size != half_size) {
 		if (screen_gi_texture.is_valid()) {
 			RD::get_singleton()->free_rid(screen_gi_texture);
@@ -2584,11 +2594,6 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 
 		RD::get_singleton()->draw_command_end_label();
 
-		// TEMP VALIDATION (point-injection pass): inject a synthetic grid of bright warm voxels on a
-		// horizontal plane through the octree center (cascade 0 only - the traced one), right after the
-		// meshlet voxelize, into the SAME octree. If the ground/nearby surfaces then pick up warm GI, the
-		// svogi_voxelize_points pass + octree injection work. Replaced by the real terrain voxel buffer
-		// (from the terrain_generator extension) once wired.
 		// Point-injection voxelize: fold non-meshletized surface voxels (the runtime terrain) into the
 		// same octree, right after the meshlet (flora) voxelize. Uses ONLY the game-supplied terrain voxel
 		// buffer (RS::gi_set_svogi_terrain_voxels). If the game supplied nothing this frame, inject nothing
@@ -2598,17 +2603,30 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 			RD::get_singleton()->draw_command_begin_label("SVOGI Voxelize Points");
 			// Buffer layout mirrors svogi_voxelize_points.glsl Points{ uint count; uint pad[3]; GIVoxelPoint data[]; }
 			// GIVoxelPoint = vec4 pos_albedo (xyz=pos, w=uintBitsToFloat(rgba8)) + vec4 normal.
-			Vector<uint8_t> point_data = gi->svogi_terrain_voxel_data;
+			const Vector<uint8_t> &point_data = gi->svogi_terrain_voxel_data;
 			uint32_t point_count = ((const uint32_t *)point_data.ptr())[0];
 			if (point_count > 0 && point_data.size() >= (int)(16 + (uint64_t)point_count * 32)) {
-			RID point_buffer = RD::get_singleton()->storage_buffer_create(point_data.size(), point_data);
+			// Grow-reuse the persistent point buffer instead of create+free every voxelize; re-upload only
+			// when the terrain feed actually changed (version bumped by RS::gi_set_svogi_terrain_voxels).
+			uint32_t needed = (uint32_t)point_data.size();
+			if (svogi_terrain_point_buffer.is_null() || svogi_terrain_point_buffer_capacity < needed) {
+				if (svogi_terrain_point_buffer.is_valid()) {
+					RD::get_singleton()->free_rid(svogi_terrain_point_buffer);
+				}
+				svogi_terrain_point_buffer = RD::get_singleton()->storage_buffer_create(needed, point_data);
+				svogi_terrain_point_buffer_capacity = needed;
+				svogi_terrain_point_buffer_version = gi->svogi_terrain_data_version;
+			} else if (svogi_terrain_point_buffer_version != gi->svogi_terrain_data_version) {
+				RD::get_singleton()->buffer_update(svogi_terrain_point_buffer, 0, needed, point_data.ptr());
+				svogi_terrain_point_buffer_version = gi->svogi_terrain_data_version;
+			}
 
-			Vector<RD::Uniform> p_uniforms;
+			LocalVector<RD::Uniform> p_uniforms;
 			{
 				RD::Uniform u;
 				u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 				u.binding = 0;
-				u.append_id(point_buffer);
+				u.append_id(svogi_terrain_point_buffer);
 				p_uniforms.push_back(u);
 			}
 			{
@@ -2618,7 +2636,9 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 				u.append_id(p_lights_buffer);
 				p_uniforms.push_back(u);
 			}
-			RID p_set1 = RD::get_singleton()->uniform_set_create(p_uniforms, gi->svogi_shader.voxelize_points.version_get_shader(gi->svogi_shader.voxelize_points_shader, 0), 1);
+			// UniformSetCacheRD owns the set's lifetime; the RIDs above are stable (persistent point buffer
+			// + grow-reuse lights buffer), so this resolves to the same cached set every frame.
+			RID p_set1 = UniformSetCacheRD::get_singleton()->get_cache_vec(gi->svogi_shader.voxelize_points.version_get_shader(gi->svogi_shader.voxelize_points_shader, 0), 1, p_uniforms);
 
 			SVOGIShader::VoxelizePushConstant ppc;
 			ppc.bounds_center[0] = center.x;
@@ -2637,9 +2657,6 @@ void GI::SVOGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 			RD::get_singleton()->compute_list_set_push_constant(pcl, &ppc, sizeof(SVOGIShader::VoxelizePushConstant));
 			RD::get_singleton()->compute_list_dispatch_threads(pcl, point_count, 1, 1);
 			RD::get_singleton()->compute_list_end();
-
-			RD::get_singleton()->free_rid(p_set1);
-			RD::get_singleton()->free_rid(point_buffer);
 			}
 			RD::get_singleton()->draw_command_end_label();
 		}

@@ -45,7 +45,10 @@ void main() {
 	}
 
 	ivec2 full = ivec2(int(params.misc.y), int(params.misc.z));
-	ivec2 fp = min(hp * 2, full - ivec2(1));
+	// gbuffer stride = full-res / GI-buffer size (2 half-res, 4 quarter-res); derived so this follows
+	// whatever downscale gi.cpp picks.
+	ivec2 gi_stride = max(full / half_dims, ivec2(1));
+	ivec2 fp = min(hp * gi_stride, full - ivec2(1));
 
 	vec4 c = texelFetch(sampler2D(gi_in, nearest_sampler), hp, 0);
 
@@ -88,7 +91,7 @@ void main() {
 			if (t.a <= 0.0) {
 				continue; // invalid GI sample (sky / dynamic / disoccluded) - do not average it in.
 			}
-			ivec2 tfp = min(thp * 2, full - ivec2(1));
+			ivec2 tfp = min(thp * gi_stride, full - ivec2(1));
 			vec4 nr_t = texelFetch(sampler2D(normal_roughness_buffer, nearest_sampler), tfp, 0);
 			vec3 n_t = nr_t.xyz * 2.0 - 1.0;
 			float d_t = texelFetch(sampler2D(depth_buffer, nearest_sampler), tfp, 0).r;
