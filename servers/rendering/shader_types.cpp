@@ -134,6 +134,40 @@ ShaderTypes::ShaderTypes() {
 	shader_modes[RSE::SHADER_SPATIAL].functions["vertex"].built_ins["VIEW_RIGHT"] = constt(ShaderLanguage::TYPE_INT);
 	shader_modes[RSE::SHADER_SPATIAL].functions["vertex"].built_ins["EYE_OFFSET"] = constt(ShaderLanguage::TYPE_VEC3);
 
+	// Adaptive tessellation: optional displacement() processor runs per tessellated vertex (TES).
+	// VERTEX (world space) is writable - the engine seeds it with the interpolated patch position and
+	// applies the result after the function; DISPLACEMENT is a convenience scalar offset along NORMAL.
+	//
+	// This list is deliberately narrow. The evaluation stage must not read the shared scene descriptor sets
+	// (the uniform-set format key includes the stage mask, so touching set 0/1 diverges from the sets built
+	// for vertex+fragment and every draw then fails the format check), which rules out every built-in sourced
+	// from scene data. CAMERA_POSITION_WORLD is therefore absent: it renames to inv_view_matrix[3].xyz, which
+	// does not exist in this stage. Globals like TIME need the explicit opt-out below instead, since simply
+	// leaving them out of this list does not hide them.
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].built_ins["VERTEX"] = ShaderLanguage::TYPE_VEC3;
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].built_ins["NORMAL"] = constt(ShaderLanguage::TYPE_VEC3);
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].built_ins["UV"] = constt(ShaderLanguage::TYPE_VEC2);
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].built_ins["UV2"] = constt(ShaderLanguage::TYPE_VEC2);
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].built_ins["COLOR"] = constt(ShaderLanguage::TYPE_VEC4);
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].built_ins["DISPLACEMENT"] = ShaderLanguage::TYPE_FLOAT;
+	// Read-only view depth (distance from the camera plane, world units) of this generated vertex. It comes
+	// from the vertex's clip-space w, which the stage already has, so it needs no descriptor access - unlike a
+	// real world-space camera distance, which would require the scene sets this stage cannot touch. It lets
+	// displacement() fade its output out with distance (and early-out of texture sampling past a cutoff): a
+	// per-vertex quantity, so a fade based on it stays continuous across patch edges and cannot crack. In a
+	// shadow/depth-from-light pass it is the depth from THAT view, not the camera - see the shader note.
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].built_ins["VIEW_DEPTH"] = constt(ShaderLanguage::TYPE_FLOAT);
+	// The spatial "global" built-ins are merged into every function, so they must be opted out of by name here.
+	// All three are read out of the scene descriptor sets, which this stage cannot touch: TIME would silently
+	// resolve to a constant and freeze an animated displacement, while EXPOSURE and IN_SHADOW_PASS rename to
+	// scene_data_block members that do not exist in the evaluation stage and fail deep inside the generated
+	// GLSL. Rejecting them by name reports the real constraint at the point the author wrote it.
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].excluded_built_ins.insert("TIME");
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].excluded_built_ins.insert("EXPOSURE");
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].excluded_built_ins.insert("IN_SHADOW_PASS");
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].can_discard = false;
+	shader_modes[RSE::SHADER_SPATIAL].functions["displacement"].main_function = true;
+
 	shader_modes[RSE::SHADER_SPATIAL].functions["fragment"].built_ins["VERTEX"] = constt(ShaderLanguage::TYPE_VEC3);
 	shader_modes[RSE::SHADER_SPATIAL].functions["fragment"].built_ins["LIGHT_VERTEX"] = ShaderLanguage::TYPE_VEC3;
 	shader_modes[RSE::SHADER_SPATIAL].functions["fragment"].built_ins["FRAGCOORD"] = constt(ShaderLanguage::TYPE_VEC4);
@@ -258,6 +292,7 @@ ShaderTypes::ShaderTypes() {
 		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("debug_shadow_splits") });
 		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("fog_disabled") });
 		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("specular_occlusion_disabled") });
+		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("tessellation_adaptive") });
 		shader_modes[RSE::SHADER_SPATIAL].stencil_modes.push_back({ PNAME("read") });
 		shader_modes[RSE::SHADER_SPATIAL].stencil_modes.push_back({ PNAME("write") });
 		shader_modes[RSE::SHADER_SPATIAL].stencil_modes.push_back({ PNAME("write_depth_fail") });

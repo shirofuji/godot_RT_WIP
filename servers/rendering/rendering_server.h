@@ -996,6 +996,7 @@ public:
 	virtual double get_frame_setup_time_cpu() const = 0;
 
 	virtual void gi_set_use_half_resolution(bool p_enable) = 0;
+	virtual void gi_set_svogi_terrain_voxels(const Vector<uint8_t> &p_voxels) = 0;
 
 	/* TESTING */
 

@@ -409,3 +409,16 @@ $RECYCLE.BIN/
 /test_shader.gd
 /views.txt
 /.selftest_project/stress_test.gd
+
+# Generated shader-source dumps (GODOT_SHADER_DUMP_DIR) and one-off scratch - never commit.
+glsl_dump_*.txt
+shader_dump_*.txt
+/.selftest_project/glsl_dump_*.txt
+/.selftest_project/shader_dump_*.txt
+/*.patch
+/*.diff
+/diff_output.txt
+/diff_utf8.txt
+/old_shader.glsl
+/shaderlog.txt
+/test_shader_out.txt

@@ -3281,7 +3281,13 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 						}
 					}
 				} else if ((1 << base_type) & RSE::INSTANCE_GEOMETRY_MASK) {
-					if ((idata.flags & InstanceData::FLAG_USES_BAKED_LIGHT) && (cull_data.visible_layers & idata.layer_mask)) {
+					// Gather geometry for SVOGI voxelization: baked-light (gi_mode=Static: static level +
+					// flora) OR dynamic-GI (gi_mode=Dynamic: e.g. terraformable terrain). Unlike baked
+					// SDFGI, this octree RE-VOXELIZES every frame / cascade drag, so dynamic geometry is
+					// valid here and updates as it deforms. gi_mode=Disabled (moving animals/player) stays
+					// excluded - which is what avoids moving-object light-stick / snapping in the volume.
+					bool wants_svogi = (idata.flags & InstanceData::FLAG_USES_BAKED_LIGHT) || idata.instance->dynamic_gi;
+					if (wants_svogi && (cull_data.visible_layers & idata.layer_mask)) {
 						cull_result.svogi_region_geometry_instances[j].push_back(idata.instance_geometry);
 						mesh_visible = true;
 					}

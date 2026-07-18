@@ -401,6 +401,8 @@ void main() {
 			dpdy,
 			duvdx,
 			duvdy,
+			false, // gi_precomputed: direct-raster color path has no filtered-GI texture; trace inline.
+			vec3(0.0),
 			do_discard);
 	if (do_discard) {
 		discard;

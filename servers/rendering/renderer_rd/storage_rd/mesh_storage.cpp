@@ -44,12 +44,12 @@ MeshStorage *MeshStorage::get_singleton() {
 	return singleton;
 }
 
-// Normalize meshlet triangle winding so every triangle is outward-facing (its geometric normal
-// agrees with the interpolated vertex normals). meshopt only partitions the index buffer, but the
-// source winding is not reliably uniform across the meshlets produced for a surface, so the meshlet
-// render pipeline's single static CULL_BACK correctly draws the majority yet culls the front faces
-// of the inverted minority - the "holes" bug on opaque meshlet primitives. Flipping the odd ones out
-// here (swap two of the triangle's three local indices) makes CULL_BACK correct for all of them.
+// Normalize meshlet triangle winding to Godot's CLOCKWISE-front-face convention (the geometric
+// normal of the winding points OPPOSITE the outward vertex normal), so the meshlet render pipeline's
+// static CULL_BACK + the software rasterizer's signed-area cull keep the correct (front) faces and
+// cull the back faces - matching Forward+. meshopt only partitions the index buffer, but the source
+// winding is not reliably uniform across the meshlets produced for a surface, so any triangle whose
+// winding disagrees is flipped here (swap two of its three local indices).
 // meshlet_triangles: 3 uint8 local indices per triangle; meshlet_vertices: local->global remap;
 // positions/normals indexed by the global id. No-op when normals are absent.
 static void _normalize_meshlet_winding(const PackedVector3Array &p_positions, const PackedVector3Array &p_normals, const PackedInt32Array &p_meshlet_vertices, PackedByteArray &r_meshlet_triangles, const Vector<RenderingServerTypes::MeshletInfo> &p_meshlets) {
@@ -83,7 +83,14 @@ static void _normalize_meshlet_winding(const PackedVector3Array &p_positions, co
 			}
 			Vector3 face_n = (positions[g1] - positions[g0]).cross(positions[g2] - positions[g0]);
 			Vector3 vert_n = normals[g0] + normals[g1] + normals[g2];
-			if (face_n.dot(vert_n) < 0.0f) {
+			// Godot uses CLOCKWISE front faces: for a correct front-facing triangle the geometric
+			// normal (right-hand cross of the winding) points OPPOSITE the outward vertex normal, i.e.
+			// face_n.dot(vert_n) < 0. So the triangle to REVERSE is the one whose face_n agrees with
+			// the vertex normal (> 0) - that's the CCW/flipped one the render's CULL_BACK + SW
+			// signed-area cull would wrongly cull. (This condition was previously `< 0`, which flipped
+			// exactly the correct triangles and inverted the whole convention - meshlet meshes rendered
+			// inside-out/see-through vs Forward+. See the meshlet primitive-flipped-faces fix.)
+			if (face_n.dot(vert_n) > 0.0f) {
 				// Reverse winding: swap the last two local indices.
 				uint8_t tmp = tris[off + 1];
 				tris[off + 1] = tris[off + 2];

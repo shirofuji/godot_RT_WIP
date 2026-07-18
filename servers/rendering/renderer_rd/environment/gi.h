@@ -43,8 +43,11 @@
 #include "servers/rendering/renderer_rd/shaders/environment/svogi_integrate.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/svogi_preprocess.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/svogi_voxelize.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_voxelize_points.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/svogi_build.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/svogi_mipmap.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_gi_resolve.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/environment/svogi_gi_atrous.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/voxel_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/environment/voxel_gi_debug.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
@@ -469,6 +472,11 @@ private:
 		PipelineDeferredRD voxelize_pipeline_clear;
 		PipelineDeferredRD voxelize_pipeline;
 
+		// Point-injection voxelize (terrain voxel grid -> octree). Same octree, runs after the meshlet voxelize.
+		SvogiVoxelizePointsShaderRD voxelize_points;
+		RID voxelize_points_shader;
+		PipelineDeferredRD voxelize_points_pipeline;
+
 		SvogiBuildShaderRD build;
 		RID build_shader;
 		PipelineDeferredRD build_pipeline;
@@ -476,6 +484,16 @@ private:
 		SvogiMipmapShaderRD mipmap;
 		RID mipmap_shader;
 		PipelineDeferredRD mipmap_pipeline;
+
+		// Screen-space SVOGI GI resolve (denoiser FA): half-res cone trace off the Forward+ gbuffer.
+		SvogiGiResolveShaderRD gi_resolve;
+		RID gi_resolve_shader;
+		PipelineDeferredRD gi_resolve_pipeline;
+
+		// Edge-aware a-trous spatial filter (denoiser FC): denoises the resolved+accumulated GI.
+		SvogiGiAtrousShaderRD gi_atrous;
+		RID gi_atrous_shader;
+		PipelineDeferredRD gi_atrous_pipeline;
 
 	} svogi_shader;
 
@@ -721,6 +739,10 @@ public:
 
 		uint32_t version = 0;
 		uint32_t render_pass = 0;
+		// Last gi->svogi_terrain_data_version this octree was voxelized against. When update() sees the
+		// GI's terrain data version has advanced past this, it forces a full cascade-0 rebuild even if the
+		// camera hasn't moved; render_region() writes it back after injecting the new terrain voxels.
+		uint32_t last_terrain_data_version = 0;
 
 		int32_t cascade_dynamic_light_count[SVOGI::MAX_CASCADES]; //used dynamically
 		RID integrate_sky_uniform_set;
@@ -730,6 +752,14 @@ public:
 		RID octree_bricks_buffer;
 		RID atomic_counter_buffer;
 		RID octree_uniform_set;
+
+		// Persistent GPU buffer for the SVOGI point-injection (terrain voxel) pass. Grown on demand and
+		// re-uploaded only when gi->svogi_terrain_data_version advances, instead of a storage_buffer_create
+		// + free every voxelize. Its uniform set is routed through UniformSetCacheRD (the point buffer and
+		// the grow-reuse lights buffer both have stable RIDs, so the set is built once and reused).
+		RID svogi_terrain_point_buffer;
+		uint32_t svogi_terrain_point_buffer_capacity = 0;
+		uint32_t svogi_terrain_point_buffer_version = 0xFFFFFFFF;
 
 		// Absolute world-space root bounds the octree was most recently voxelized against (set in
 		// render_region() for cascade 0 - the finest cascade). The octree is built in plain
@@ -746,6 +776,32 @@ public:
 		RID svogi_voxelize_uniform_set;
 		RID svogi_build_uniform_set;
 		RID svogi_mipmap_uniform_set;
+
+		// Screen-space GI denoiser (FA): half-res buffer holding the resolved (cone-traced) indirect
+		// diffuse for the Forward+ path, sampled by scene_forward_gi_inc.glsl's svogi_process() instead
+		// of the inline per-fragment trace. Allocated lazily to half the internal render size.
+		RID screen_gi_texture;
+		Size2i screen_gi_size;
+		// Temporal accumulation (denoiser FB): previous frame's resolved GI (a copy of screen_gi_texture
+		// after the blend) is reprojected via svogi_reproj_prev (last frame's world->clip) and blended with
+		// the current cone-trace to suppress the ray-jitter/undersampling noise. svogi_temporal_ubo carries
+		// the reprojection matrix + blend params to the resolve shader. history_valid gates the first frame
+		// (and any resize) so we don't blend against garbage.
+		RID screen_gi_history;
+		RID svogi_temporal_ubo;
+		Projection svogi_reproj_prev;
+		Transform3D svogi_prev_cam; // previous frame's camera transform, for the motion-adaptive blend.
+		bool svogi_history_valid = false;
+		// Spatial denoise (FC): the a-trous filter ping-pongs between screen_gi_filtered and
+		// screen_gi_atrous_temp; the final iteration lands in screen_gi_filtered, which the forward pass
+		// samples instead of the raw accumulated screen_gi_texture.
+		RID screen_gi_filtered;
+		RID screen_gi_atrous_temp;
+		// Cone-traces the octree at half res off the given Forward+ depth + normal-roughness gbuffer,
+		// writing the raw indirect diffuse into screen_gi_texture (allocated to half of p_internal_size).
+		// No-op unless the octree has data. Caller supplies the textures (avoids reaching into
+		// render_forward_clustered's private buffer scopes from here).
+		void resolve_screen_gi(RID p_depth_texture, RID p_normal_roughness_texture, const Size2i &p_internal_size, const Projection &p_projection, const Transform3D &p_cam_transform);
 
 		virtual void configure(RenderSceneBuffersRD *p_render_buffers) override {}
 		virtual void free_data() override;
@@ -845,6 +901,30 @@ public:
 		float pad2;
 	};
 
+	// Must match svogi_gi_resolve.glsl's Params block (std430, 128 bytes = RD's MAX_PUSH_CONSTANT_SIZE).
+	struct SvogiGiResolvePushConstant {
+		float clip_to_world[16]; // cam_transform * inv_projection (clip -> absolute world, w preserved).
+		float cam_basis_0[4]; // xyz = camera x-axis, w = octree center x.
+		float cam_basis_1[4]; // xyz = camera y-axis, w = octree center y.
+		float cam_basis_2[4]; // xyz = camera z-axis, w = octree center z.
+		float misc[4]; // x = octree half-size, y = energy, z = full_width, w = full_height.
+	};
+
+	// std140 UBO for the resolve's temporal-accumulation (FB) reprojection. A full mat4 won't fit in the
+	// 128-byte push constant alongside clip_to_world + the camera basis, so the previous-frame world->clip
+	// matrix rides here instead.
+	struct SvogiTemporalUBO {
+		float prev_world_to_clip[16]; // previous frame's world -> clip (reproject world_pos into history).
+		float params[4]; // x = history_valid (0/1), y = new-sample weight (1/converge_frames), z/w = pad.
+	};
+
+	// Must match svogi_gi_atrous.glsl's Params block (std430, 96 bytes).
+	struct SvogiGiAtrousPushConstant {
+		float clip_to_view[16]; // inv(corrected projection): clip -> view (for the plane-distance weight).
+		float misc[4]; // x = step (hole size), y = full_width, z = full_height, w = normal power.
+		float misc2[4]; // x = plane-distance sigma (view metres), y/z/w = pad.
+	};
+
 	struct PushConstant {
 		uint32_t max_voxel_gi_instances;
 		uint32_t high_quality_vct;
@@ -885,6 +965,18 @@ public:
 	RID default_voxel_gi_buffer;
 
 	bool half_resolution = false;
+
+	// Terrain (or any non-meshletized) geometry injected into the SVOGI octree as world-space surface
+	// voxels, set per-frame by the game via RS::gi_set_svogi_terrain_voxels(). Layout matches
+	// svogi_voxelize_points.glsl's Points buffer: { uint count; uint pad[3]; GIVoxelPoint data[]; }.
+	Vector<uint8_t> svogi_terrain_voxel_data;
+	// Bumped every time the game pushes a new terrain voxel buffer. The octree only re-voxelizes when it
+	// drags (camera crosses a cell boundary), so a stationary camera would never pick up freshly-fed
+	// terrain voxels - GI would only appear once the player started moving. SVOGI::update() compares this
+	// against its last-voxelized version and forces a rebuild when they differ, so terrain GI lights up
+	// as soon as the data arrives (e.g. right after the player lands, before moving).
+	uint32_t svogi_terrain_data_version = 0;
+
 	GiShaderRD shader;
 	RID shader_version;
 	PipelineDeferredRD pipelines[SHADER_SPECIALIZATION_VARIATIONS][MODE_MAX];

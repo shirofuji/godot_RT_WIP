@@ -124,9 +124,12 @@ void light_compute(vec3 N, vec3 L, vec3 V, vec3 light_color, bool is_directional
 }
 
 void light_process_directional(uint idx, vec3 N, vec3 V, MeshletMaterial mat, vec3 albedo, inout vec3 diffuse_light, inout vec3 specular_light) {
-	// L is the direction TO the light; lights.data[].direction already points toward the source for
-	// this path, so it's used directly - NOT negated.
-	vec3 L = normalize(lights.data[idx].direction);
+	// L is the direction TO the light. lights.data[].direction is filled CPU-side with the light's
+	// TRAVEL direction (basis * (0,0,-1), pointing away from the source - see
+	// RenderForwardClustered::_meshlet_collect_lights), so it must be NEGATED to get the to-light
+	// vector. (The old code used it un-negated, inverting N.L: faces toward the light rendered dark
+	// and faces away rendered lit - the meshlet "inverted lighting / dark primitives" bug.)
+	vec3 L = -normalize(lights.data[idx].direction);
 	light_compute(N, L, V, lights.data[idx].color, true, 1.0, mat, albedo, diffuse_light, specular_light);
 }
 
@@ -151,106 +154,9 @@ void light_process_spot(uint idx, vec3 vertex, vec3 N, vec3 V, MeshletMaterial m
 	light_compute(N, L, V, lights.data[idx].color, false, attenuation, mat, albedo, diffuse_light, specular_light);
 }
 
-// Diffuse cone-march of the SVOGI octree, in absolute world space. Returns rgb = accumulated
-// incident radiance, a = coverage.
-vec4 svogi_cone_trace(vec3 pos, vec3 dir, float tan_half_angle, float max_distance, float bias, vec3 bounds_center, float bounds_half, float energy) {
-	vec4 color = vec4(0.0);
-	float dist = bias;
-
-	while (dist < max_distance && color.a < 0.95) {
-		float diameter = max(1.0, 2.0 * tan_half_angle * dist);
-		vec3 sample_pos = pos + dir * dist;
-
-		vec3 d = abs(sample_pos - bounds_center);
-		if (d.x > bounds_half || d.y > bounds_half || d.z > bounds_half) {
-			break; // Left the octree's bounds.
-		}
-
-		uint node_idx = 0u;
-		vec3 current_center = bounds_center;
-		float current_half = bounds_half;
-		vec4 voxel_color = vec4(0.0);
-		float target_size = max(diameter, current_half / 64.0); // 6 levels: leaf = bounds/64.
-
-		for (uint depth = 0u; depth < 6u; depth++) {
-			bvec3 is_pos = greaterThan(sample_pos, current_center);
-			uint child_idx = (is_pos.x ? 1u : 0u) | ((is_pos.y ? 1u : 0u) << 1) | ((is_pos.z ? 1u : 0u) << 2);
-
-			if ((svogi_nodes.data[node_idx].child_mask & (1u << child_idx)) == 0u) {
-				break; // Empty space.
-			}
-			uint base_idx = svogi_nodes.data[node_idx].children_base_index;
-			if (base_idx == 0u) {
-				break; // No children allocated.
-			}
-			node_idx = base_idx + child_idx;
-
-			vec3 offset = vec3(is_pos.x ? 1.0 : -1.0, is_pos.y ? 1.0 : -1.0, is_pos.z ? 1.0 : -1.0);
-			current_half *= 0.5;
-			current_center += offset * current_half;
-
-			// Internal nodes hold mipmap-aggregated data (see svogi_mipmap.glsl), so sampling a
-			// coarser level for a wide cone is correct, not just empty.
-			if (current_half * 2.0 <= target_size || depth == 5u) {
-				// The node's "albedo" field actually holds LIT RADIANCE (surface albedo * direct
-				// light + emission), written by svogi_voxelize.glsl's direct-light-injection step.
-				uint radiance_packed = svogi_nodes.data[node_idx].albedo;
-				if (radiance_packed != 0u) {
-					vec3 vox_radiance = vec3(
-							float((radiance_packed >> 24u) & 0xFFu),
-							float((radiance_packed >> 16u) & 0xFFu),
-							float((radiance_packed >> 8u) & 0xFFu)) /
-							255.0;
-					voxel_color = vec4(vox_radiance * energy, 1.0);
-				}
-				break;
-			}
-		}
-
-		if (voxel_color.a > 0.0) {
-			float a = (1.0 - color.a);
-			color += a * voxel_color;
-		}
-		dist += max(0.5, diameter * 0.5);
-	}
-
-	return color;
-}
-
-// Branchless orthonormal basis from a unit normal (Duff et al. 2017).
-void svogi_basis(vec3 n, out vec3 t, out vec3 b) {
-	float s = n.z >= 0.0 ? 1.0 : -1.0;
-	float a = -1.0 / (s + n.z);
-	float bb = n.x * n.y * a;
-	t = vec3(1.0 + s * n.x * n.x * a, s * bb, -s * n.x);
-	b = vec3(bb, s + n.y * n.y * a, -n.y);
-}
-
-// Cosine-weighted 6-cone hemisphere gather of indirect diffuse from the octree.
-vec3 svogi_hemisphere_gather(vec3 pos, vec3 normal, float surface_offset, float max_distance, vec3 bounds_center, float bounds_half, float energy) {
-	vec3 t, b;
-	svogi_basis(normal, t, b);
-
-	const vec3 CONE_DIRS[6] = vec3[](
-			vec3(0.0, 0.0, 1.0),
-			vec3(0.0, 0.866025, 0.5),
-			vec3(0.823639, 0.267617, 0.5),
-			vec3(0.509037, -0.700629, 0.5),
-			vec3(-0.509037, -0.700629, 0.5),
-			vec3(-0.823639, 0.267617, 0.5));
-	const float CONE_WEIGHTS[6] = float[](0.25, 0.15, 0.15, 0.15, 0.15, 0.15);
-
-	// Push the shared cone origin off the surface along the normal before tracing (clears local
-	// curvature uniformly, avoiding the dark-petal/pinwheel artifact).
-	vec3 start = pos + normal * surface_offset;
-
-	vec3 acc = vec3(0.0);
-	for (int i = 0; i < 6; i++) {
-		vec3 dir = normalize(t * CONE_DIRS[i].x + b * CONE_DIRS[i].y + normal * CONE_DIRS[i].z);
-		acc += CONE_WEIGHTS[i] * svogi_cone_trace(start, dir, 0.577, max_distance, surface_offset * 0.5, bounds_center, bounds_half, energy).rgb;
-	}
-	return acc;
-}
+// SVOGI octree cone-trace (svogi_cone_trace / svogi_basis / svogi_hemisphere_gather). Shared with the
+// standalone half-res GI trace pass. References the svogi_nodes buffer the includer already declared.
+#include "meshlet_svogi_inc.glsl"
 
 // Cotangent-frame normal mapping without precomputed vertex tangents (Schueler 2011). Takes the
 // screen-space world-position and UV gradients as parameters (dp1/dp2 = d(world_pos)/dx,dy; duv1/duv2
@@ -279,7 +185,12 @@ vec3 perturb_normal_grad(vec3 N, vec3 dp1, vec3 dp2, vec2 duv1, vec2 duv2, vec3 
 // dpdx/dpdy = screen-space gradients of world_pos; duvdx/duvdy = screen-space gradients of the raw
 // (pre-transform) UV. Fragment callers pass dFdx/dFdy of the interpolated varyings; the compute
 // resolve pass passes analytic triangle gradients. Only used for normal mapping (perturb_normal_grad).
-vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 uv, vec3 camera_position, vec4 ambient_color, vec4 svogi_bounds, vec4 svogi_params, uint light_count, vec3 dpdx, vec3 dpdy, vec2 duvdx, vec2 duvdy, out bool r_discard) {
+// p_gi_precomputed: when true, p_gi_diffuse_in is used verbatim as the SVOGI indirect-diffuse term
+// (the caller already traced + temporally/spatially filtered it in a separate half-res pass and
+// bilaterally upsampled it to this pixel). When false, meshlet_shade() cone-traces the octree inline
+// exactly as before - the direct-raster color path (meshlet_render.glsl) and the compute resolve
+// (used by tests) have no filtered-GI texture to sample, so they keep the inline gather.
+vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 uv, vec3 camera_position, vec4 ambient_color, vec4 svogi_bounds, vec4 svogi_params, uint light_count, vec3 dpdx, vec3 dpdy, vec2 duvdx, vec2 duvdy, bool p_gi_precomputed, vec3 p_gi_diffuse_in, out bool r_discard) {
 	r_discard = false;
 	MeshletMaterial mat = meshlet_materials.data[material_id];
 	vec3 N = normalize(world_normal_in);
@@ -336,9 +247,12 @@ vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 
 		}
 	}
 
-	// SVOGI indirect-diffuse bounce via the cosine-weighted multi-cone hemisphere gather.
+	// SVOGI indirect-diffuse bounce. Either supplied pre-filtered by the caller (half-res trace +
+	// temporal + spatial + bilateral upsample) or cone-traced inline here for paths without it.
 	vec3 gi_diffuse = vec3(0.0);
-	if (svogi_bounds.w > 0.0) {
+	if (p_gi_precomputed) {
+		gi_diffuse = p_gi_diffuse_in;
+	} else if (svogi_bounds.w > 0.0) {
 		float voxel_size = svogi_bounds.w / 32.0; // root half-size / 32 ~= leaf diameter.
 		gi_diffuse = svogi_hemisphere_gather(world_pos, N, voxel_size * 3.0, svogi_bounds.w * 2.0, svogi_bounds.xyz, svogi_bounds.w, svogi_params.x);
 	}

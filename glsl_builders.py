@@ -10,6 +10,8 @@ class RDHeaderStruct:
         self.vertex_lines = []
         self.fragment_lines = []
         self.compute_lines = []
+        self.tesc_lines = []
+        self.tese_lines = []
         self.raygen_lines = []
         self.any_hit_lines = []
         self.closest_hit_lines = []
@@ -19,6 +21,8 @@ class RDHeaderStruct:
         self.vertex_included_files = []
         self.fragment_included_files = []
         self.compute_included_files = []
+        self.tesc_included_files = []
+        self.tese_included_files = []
         self.raygen_included_files = []
         self.any_hit_included_files = []
         self.closest_hit_included_files = []
@@ -30,6 +34,8 @@ class RDHeaderStruct:
         self.vertex_offset = 0
         self.fragment_offset = 0
         self.compute_offset = 0
+        self.tesc_offset = 0
+        self.tese_offset = 0
         self.raygen_offset = 0
         self.any_hit_offset = 0
         self.closest_hit_offset = 0
@@ -65,6 +71,20 @@ def include_file_in_rd_header(filename: str, header_data: RDHeaderStruct, depth:
                 line = fs.readline()
                 header_data.line_offset += 1
                 header_data.compute_offset = header_data.line_offset
+                continue
+
+            if line.find("#[tesc]") != -1:
+                header_data.reading = "tesc"
+                line = fs.readline()
+                header_data.line_offset += 1
+                header_data.tesc_offset = header_data.line_offset
+                continue
+
+            if line.find("#[tese]") != -1:
+                header_data.reading = "tese"
+                line = fs.readline()
+                header_data.line_offset += 1
+                header_data.tese_offset = header_data.line_offset
                 continue
 
             if line.find("#[raygen]") != -1:
@@ -123,6 +143,14 @@ def include_file_in_rd_header(filename: str, header_data: RDHeaderStruct, depth:
                     header_data.compute_included_files += [included_file]
                     if include_file_in_rd_header(included_file, header_data, depth + 1) is None:
                         print_error(f'In file "{filename}": #include "{includeline}" could not be found!"')
+                elif included_file not in header_data.tesc_included_files and header_data.reading == "tesc":
+                    header_data.tesc_included_files += [included_file]
+                    if include_file_in_rd_header(included_file, header_data, depth + 1) is None:
+                        print_error(f'In file "{filename}": #include "{includeline}" could not be found!"')
+                elif included_file not in header_data.tese_included_files and header_data.reading == "tese":
+                    header_data.tese_included_files += [included_file]
+                    if include_file_in_rd_header(included_file, header_data, depth + 1) is None:
+                        print_error(f'In file "{filename}": #include "{includeline}" could not be found!"')
                 elif included_file not in header_data.raygen_included_files and header_data.reading == "raygen":
                     header_data.raygen_included_files += [included_file]
                     if include_file_in_rd_header(included_file, header_data, depth + 1) is None:
@@ -159,6 +187,10 @@ def include_file_in_rd_header(filename: str, header_data: RDHeaderStruct, depth:
                 header_data.fragment_lines += [line]
             if header_data.reading == "compute":
                 header_data.compute_lines += [line]
+            if header_data.reading == "tesc":
+                header_data.tesc_lines += [line]
+            if header_data.reading == "tese":
+                header_data.tese_lines += [line]
             if header_data.reading == "raygen":
                 header_data.raygen_lines += [line]
             if header_data.reading == "any_hit":
@@ -236,6 +268,18 @@ public:
 		}};
 		static const char *_compute_code = nullptr;
 		setup(_vertex_code, _fragment_code, _compute_code, "{class_name}");
+""")
+            # Optional tessellation stages: only emitted when the shader declares #[tesc]/#[tese],
+            # so every non-tessellated shader's generated constructor is byte-for-byte unchanged.
+            if header_data.tesc_lines or header_data.tese_lines:
+                file.write(f"""\
+		static const char _tesc_code[] = {{
+{to_raw_cstring(header_data.tesc_lines)}
+		}};
+		static const char _tese_code[] = {{
+{to_raw_cstring(header_data.tese_lines)}
+		}};
+		set_tessellation_stages(_tesc_code, _tese_code);
 """)
 
         file.write("""\

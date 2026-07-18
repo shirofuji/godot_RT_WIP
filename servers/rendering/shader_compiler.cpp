@@ -30,6 +30,8 @@
 
 #include "shader_compiler.h"
 
+#include "core/os/os.h"
+#include "core/io/file_access.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/shader_types.h"
@@ -273,6 +275,111 @@ static String get_constant_text(SL::DataType p_type, const Vector<SL::Scalar> &p
 		default:
 			ERR_FAIL_V(String());
 	}
+}
+
+String ShaderCompiler::_get_tess_texture_helpers() {
+	// Samplerless texture sampling for displacement(), which runs in the tessellation evaluation stage.
+	//
+	// Godot's texture() normally compiles to sampler2D(tex, SAMPLER_X). Those SAMPLER_* objects live at
+	// set 1 - the SHARED scene set - and a uniform set's format key includes the stage mask
+	// (rendering_device_commons.h, ShaderUniform::operator<). Referencing them from the evaluation stage
+	// therefore adds TESS_EVALUATION to set 1's reflected format, which no longer matches the set built from
+	// the non-tessellated default_shader_rd, and every draw fails the format check (measured: 276 errors per
+	// frame with the shader otherwise compiling cleanly).
+	//
+	// texelFetch needs NO sampler, so it only ever touches the material's own set-3 texture, which is built
+	// per-material from this shader's own reflection and is safe here. Filtering is done by hand: bilinear
+	// from the base mip with repeat wrap. Explicit mip 0 is deliberate - the evaluation stage has no
+	// derivatives, so an implicit LOD would be undefined anyway.
+	return R"(
+vec4 _tess_bilinear(vec4 c00, vec4 c10, vec4 c01, vec4 c11, vec2 f) {
+	return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+vec4 tessTexture(texture2D t, vec2 uv) {
+	ivec2 sz = textureSize(t, 0);
+	vec2 c = uv * vec2(sz) - 0.5;
+	vec2 f = fract(c);
+	ivec2 i = ivec2(floor(c));
+	ivec2 i0 = ((i % sz) + sz) % sz;
+	ivec2 i1 = (((i + ivec2(1)) % sz) + sz) % sz;
+	return _tess_bilinear(
+			texelFetch(t, ivec2(i0.x, i0.y), 0), texelFetch(t, ivec2(i1.x, i0.y), 0),
+			texelFetch(t, ivec2(i0.x, i1.y), 0), texelFetch(t, ivec2(i1.x, i1.y), 0), f);
+}
+vec4 tessTexture(texture2DArray t, vec3 uvw) {
+	ivec3 sz3 = textureSize(t, 0);
+	ivec2 sz = sz3.xy;
+	int layer = int(uvw.z + 0.5);
+	vec2 c = uvw.xy * vec2(sz) - 0.5;
+	vec2 f = fract(c);
+	ivec2 i = ivec2(floor(c));
+	ivec2 i0 = ((i % sz) + sz) % sz;
+	ivec2 i1 = (((i + ivec2(1)) % sz) + sz) % sz;
+	return _tess_bilinear(
+			texelFetch(t, ivec3(i0.x, i0.y, layer), 0), texelFetch(t, ivec3(i1.x, i0.y, layer), 0),
+			texelFetch(t, ivec3(i0.x, i1.y, layer), 0), texelFetch(t, ivec3(i1.x, i1.y, layer), 0), f);
+}
+vec4 _tess_bilinear_lod(texture2D t, vec2 uv, int lod) {
+	ivec2 sz = max(textureSize(t, lod), ivec2(1));
+	vec2 c = uv * vec2(sz) - 0.5;
+	vec2 f = fract(c);
+	ivec2 i = ivec2(floor(c));
+	ivec2 i0 = ((i % sz) + sz) % sz;
+	ivec2 i1 = (((i + ivec2(1)) % sz) + sz) % sz;
+	return _tess_bilinear(
+			texelFetch(t, ivec2(i0.x, i0.y), lod), texelFetch(t, ivec2(i1.x, i0.y), lod),
+			texelFetch(t, ivec2(i0.x, i1.y), lod), texelFetch(t, ivec2(i1.x, i1.y), lod), f);
+}
+vec4 _tess_bilinear_lod(texture2DArray t, vec3 uvw, int lod) {
+	ivec2 sz = max(textureSize(t, lod).xy, ivec2(1));
+	int layer = int(uvw.z + 0.5);
+	vec2 c = uvw.xy * vec2(sz) - 0.5;
+	vec2 f = fract(c);
+	ivec2 i = ivec2(floor(c));
+	ivec2 i0 = ((i % sz) + sz) % sz;
+	ivec2 i1 = (((i + ivec2(1)) % sz) + sz) % sz;
+	return _tess_bilinear(
+			texelFetch(t, ivec3(i0.x, i0.y, layer), lod), texelFetch(t, ivec3(i1.x, i0.y, layer), lod),
+			texelFetch(t, ivec3(i0.x, i1.y, layer), lod), texelFetch(t, ivec3(i1.x, i1.y, layer), lod), f);
+}
+// Trilinear: bilinear within each of the two bracketing mips, then blend. Displacement MUST be continuous,
+// so snapping to one mip would step the geometry as the level changes.
+//
+// The early-out is not a micro-optimization. Each bilinear costs 4 texelFetch, and an integral lod weights the
+// second mip by exactly zero - mix(a, b, 0.0) IS a, but GLSL still evaluates b, so a plain mix() throws away
+// half of every fetch. That is the COMMON case: any shader dialling in a constant mip_bias hits it on every
+// single sample. The result is identical either way; only the wasted fetches go.
+//
+// MEASURED (terrain doing ~24 height fetches per vertex, GTX 1660 Super): integral lod 36.3 -> 27.7 ms, i.e.
+// a quarter of the whole frame. But note the trade: a FRACTIONAL lod went 35.4 -> 42.9 ms, because the branch
+// stops the compiler scheduling the two mip taps together and serializes them. That is the right bargain while
+// lod is a constant, and the wrong one if lod ever becomes per-vertex (e.g. deriving the mip from tessellated
+// vertex spacing) - if that lands, re-measure and consider going back to the unconditional mix(). A branchless
+// select of l1=l0 was also tried and is a wash (37.0 / 35.7): sampling the same mip twice costs as much as
+// sampling two.
+vec4 tessTextureLod(texture2D t, vec2 uv, float lod) {
+	int levels = textureQueryLevels(t);
+	float ml = clamp(lod, 0.0, float(levels - 1));
+	int l0 = int(floor(ml));
+	float f = ml - float(l0);
+	vec4 c0 = _tess_bilinear_lod(t, uv, l0);
+	if (f <= 0.0) {
+		return c0;
+	}
+	return mix(c0, _tess_bilinear_lod(t, uv, min(l0 + 1, levels - 1)), f);
+}
+vec4 tessTextureLod(texture2DArray t, vec3 uvw, float lod) {
+	int levels = textureQueryLevels(t);
+	float ml = clamp(lod, 0.0, float(levels - 1));
+	int l0 = int(floor(ml));
+	float f = ml - float(l0);
+	vec4 c0 = _tess_bilinear_lod(t, uvw, l0);
+	if (f <= 0.0) {
+		return c0;
+	}
+	return mix(c0, _tess_bilinear_lod(t, uvw, min(l0 + 1, levels - 1)), f);
+}
+)";
 }
 
 String ShaderCompiler::_get_sampler_name(ShaderLanguage::TextureFilter p_filter, ShaderLanguage::TextureRepeat p_repeat) {
@@ -557,6 +664,12 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 
 			Vector<StringName> uniform_names;
 
+			// Adaptive tessellation: the evaluation stage is its own compilation unit and is NOT one of the
+			// Stage enum's slots, so the sampler-type declarations pushed into every stage_globals[] below
+			// never reach it. Collect them here so code["tess_eval_globals"] can carry them (see the
+			// displacement() branch further down).
+			String tess_texture_decls;
+
 			for (const KeyValue<StringName, SL::ShaderNode::Uniform> &E : pnode->uniforms) {
 				uniform_names.push_back(E.key);
 			}
@@ -614,6 +727,7 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					for (int j = 0; j < STAGE_MAX; j++) {
 						r_gen_code.stage_globals[j] += ucode;
 					}
+					tess_texture_decls += ucode;
 
 					GeneratedCode::Texture texture;
 					texture.name = uniform_name;
@@ -684,6 +798,16 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 
 			uint32_t index = p_default_actions.base_varying_index;
 
+			// Adaptive tessellation pass-through for material varyings: when the shader tessellates, the
+			// tessellation evaluation stage (not the vertex stage) feeds the fragment stage, so every
+			// vertex->fragment varying must also be carried through the TCS/TES. We emit matching in/out
+			// declarations and copy/interpolate code into dedicated code sections that the scene shader's
+			// #[tesc]/#[tese] templates inject; they stay unused for non-tessellated materials.
+			String tess_control_varyings;
+			String tess_control_copy;
+			String tess_eval_varyings;
+			String tess_eval_interp;
+
 			List<Pair<StringName, SL::ShaderNode::Varying>> var_frag_to_light;
 
 			Vector<StringName> varying_names;
@@ -729,7 +853,40 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 				r_gen_code.stage_globals[STAGE_VERTEX] += interp_mode + "out " + vcode;
 				r_gen_code.stage_globals[STAGE_FRAGMENT] += interp_mode + "in " + vcode;
 
+				// Tessellation pass-through for this varying. Array varyings would need 2D arrays across the
+				// patch, which no built-in material uses, so they are left to the (rare) authoring caveat.
+				if (!RS::get_singleton()->is_low_end() && varying.array_size == 0) {
+					const String loc = "layout(location=" + itos(index) + ") ";
+					const String type_str = _prestr(varying.precision, ShaderLanguage::is_float_type(varying.type)) + _typestr(varying.type);
+					const String id = _mkid(varying_name);
+					const bool is_flat = varying.interpolation == SL::INTERPOLATION_FLAT || !ShaderLanguage::is_float_type(varying.type);
+
+					// TCS: read the per-control-point value from the vertex stage, forward it to the TES.
+					tess_control_varyings += loc + interp_mode + "in " + type_str + " " + id + "[];\n";
+					tess_control_varyings += loc + interp_mode + "out " + type_str + " " + id + "_tc[];\n";
+					tess_control_copy += "\t" + id + "_tc[gl_InvocationID] = " + id + "[gl_InvocationID];\n";
+
+					// TES: receive the patch corners, emit the interpolated value the fragment stage reads.
+					tess_eval_varyings += loc + interp_mode + "in " + type_str + " " + id + "_tc[];\n";
+					tess_eval_varyings += loc + interp_mode + "out " + type_str + " " + id + ";\n";
+					if (is_flat) {
+						tess_eval_interp += "\t" + id + " = " + id + "_tc[0];\n";
+					} else {
+						tess_eval_interp += "\t" + id + " = TESS_INTERP(" + id + "_tc);\n";
+					}
+				}
+
 				index += inc;
+			}
+
+			// Expose the generated tessellation pass-through as code sections consumed by #[tesc]/#[tese].
+			// Only when the shader actually has vertex->fragment varyings, to avoid emitting unused code
+			// sections (and their *_CODE_USED defines) into shaders that never tessellate.
+			if (!tess_control_varyings.is_empty()) {
+				r_gen_code.code["tess_control_varyings"] = tess_control_varyings;
+				r_gen_code.code["tess_control_copy"] = tess_control_copy;
+				r_gen_code.code["tess_eval_varyings"] = tess_eval_varyings;
+				r_gen_code.code["tess_eval_interp"] = tess_eval_interp;
 			}
 
 			if (var_frag_to_light.size() > 0) {
@@ -786,6 +943,11 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 
 			HashSet<StringName> added_funcs_per_stage[STAGE_MAX];
 
+			// Adaptive tessellation: the displacement() entry point runs in the evaluation stage, which is a
+			// separate compilation unit that cannot pull in the full vertex globals (those include the
+			// material-varying out-declarations, which collide with the TES's own varying pass-through). So
+			// collect just displacement()'s helper-function dependencies into a dedicated code section that
+			// the #[tese] template injects on its own.
 			for (int i = 0; i < pnode->vfunctions.size(); i++) {
 				SL::FunctionNode *fnode = pnode->vfunctions[i].function;
 
@@ -797,6 +959,26 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					Stage stage = p_actions.entry_point_stages[fnode->name];
 					_dump_function_deps(pnode, fnode->name, function_code, r_gen_code.stage_globals[stage], added_funcs_per_stage[stage]);
 					r_gen_code.code[fnode->name] = function_code[fnode->name];
+
+					if (fnode->name == "displacement") {
+						// Build the evaluation stage's self-contained global section. It is NOT a Stage enum slot,
+						// so nothing that goes into stage_globals[] reaches it - everything displacement() needs
+						// must be reproduced here:
+						//   1. The sampleVirtual() fallback. Every material texture() compiles to a virtual-texture
+						//      ternary (see OP_CALL below), and the macro is only seeded into stage_globals[].
+						//   2. The sampler-type declarations (texture2D/2DArray/...), collected above.
+						//   3. displacement()'s helper-function dependencies, dumped with a FRESH `added` set so
+						//      this section stands alone rather than deduplicating against the vertex stage.
+						// Emitted even when displacement() has no helper deps, since the marker must always exist.
+						String tess_eval_globals;
+						tess_eval_globals += "\n#ifndef VIRTUAL_TEXTURES_ENABLED\n#define sampleVirtual(id, uv) vec4(0.0)\n#endif\n";
+						tess_eval_globals += tess_texture_decls;
+						tess_eval_globals += _get_tess_texture_helpers();
+
+						HashSet<StringName> tess_eval_added;
+						_dump_function_deps(pnode, fnode->name, function_code, tess_eval_globals, tess_eval_added);
+						r_gen_code.code["tess_eval_globals"] = tess_eval_globals;
+					}
 				}
 
 				function = nullptr;
@@ -1219,11 +1401,25 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 						}
 
 						if (is_internal_func) {
-							code += vnode->name;
 							is_texture_func = texture_functions.has(vnode->name);
 							texture_func_no_uv = (vnode->name == "textureSize" || vnode->name == "textureQueryLevels");
 							texture_func_returns_data = texture_func_no_uv || vnode->name == "textureQueryLod";
 							texture_func_simple = vnode->name == "texture";
+
+							// Adaptive tessellation: displacement() runs in the evaluation stage, which must never
+							// reference the global SAMPLER_* objects - they live at set 1 (the shared scene set) and
+							// the uniform-set format key includes the stage mask, so touching them diverges from the
+							// set built by the non-tessellated default shader (measured: 276 mismatches/frame).
+							// Redirect its texture() to a samplerless helper that filters by hand over texelFetch,
+							// which needs no sampler and so only ever touches the material's own set-3 texture.
+							if (current_func_name == "displacement" && (texture_func_simple || vnode->name == "textureLod")) {
+								// textureLod is the important one here: the evaluation stage has no derivatives, so
+								// an explicit mip is the only correct way to filter, and it is what stops a fine
+								// height map from aliasing into spikes at tessellated-vertex spacing.
+								code += (texture_func_simple ? "tessTexture" : "tessTextureLod");
+							} else {
+								code += vnode->name;
+							}
 						} else if (p_default_actions.renames.has(vnode->name)) {
 							code += p_default_actions.renames[vnode->name];
 						} else {
@@ -1374,7 +1570,12 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 									data_type_name = ShaderLanguage::get_datatype_name(onode->arguments[i]->get_datatype());
 								}
 
-								code += data_type_name + "(" + node_code + ", " + sampler_name + ")";
+								if (current_func_name == "displacement") {
+									// Pass the bare texture; tessTexture() takes a samplerless texture2D/2DArray.
+									code += node_code;
+								} else {
+									code += data_type_name + "(" + node_code + ", " + sampler_name + ")";
+								}
 							} else if (correct_texture_uniform && RS::get_singleton()->is_low_end()) {
 								// Texture function on low end hardware (i.e. OpenGL).
 
@@ -1428,7 +1629,10 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 						code = "normal_roughness_compatibility(" + code + ")";
 					}
 
-					if (texture_func_simple && texture_uniform_name_for_vt != StringName() && shader->uniforms.has(texture_uniform_name_for_vt)) {
+					// The virtual-texture path is skipped inside displacement(): sampleVirtual() reads the VT
+					// page/indirection descriptors, which the evaluation stage must not touch for the same
+					// shared-set reason as the samplers. Geometry displacement wants the resident texture anyway.
+					if (texture_func_simple && current_func_name != "displacement" && texture_uniform_name_for_vt != StringName() && shader->uniforms.has(texture_uniform_name_for_vt)) {
 						const ShaderLanguage::ShaderNode::Uniform &u = shader->uniforms[texture_uniform_name_for_vt];
 						if (u.hint != ShaderLanguage::ShaderNode::Uniform::HINT_SCREEN_TEXTURE &&
 							u.hint != ShaderLanguage::ShaderNode::Uniform::HINT_DEPTH_TEXTURE &&
@@ -1566,6 +1770,16 @@ Error ShaderCompiler::compile(RSE::ShaderMode p_mode, const String &p_code, Iden
 	info.shader_types = ShaderTypes::get_singleton()->get_types();
 	info.global_shader_uniform_type_func = _get_global_shader_uniform_type;
 	info.base_varying_index = actions.base_varying_index;
+
+	{
+		static int dump_id = 0;
+		String file_name = "d:\\godot_RT_WIP\\.selftest_project\\shader_dump_" + itos(dump_id++) + ".txt";
+		Ref<FileAccess> f = FileAccess::open(file_name, FileAccess::WRITE);
+		if (f.is_valid()) {
+			f->store_string(p_code);
+			f->close();
+		}
+	}
 
 	Error err = parser.compile(p_code, info);
 

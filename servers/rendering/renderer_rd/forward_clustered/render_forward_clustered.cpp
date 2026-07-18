@@ -1313,7 +1313,20 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 					rl->add_element(surf);
 				}
 			} else {
-				if (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE)) {
+				// This branch covers the depth prepass and the SVOGI voxelization pass (PASS_MODE_SDF).
+				// For voxelization, inject STATIC geometry only: dynamic-GI / GI-disabled instances
+				// (moving objects - the player capsule, NPCs, physics props) must not bake their bounce
+				// into the octree, or their light "sticks" in the volume a frame behind where they are
+				// and pops when the octree rebuilds. Their local illumination comes from real-time
+				// lights + SSIL instead. This matches VoxelGI/SDFGI, which likewise only voxelize
+				// use_baked_light (gi_mode = STATIC) geometry. The depth prepass is unaffected - it still
+				// needs every instance.
+				// SVOGI voxelization (PASS_MODE_SDF): include GI-contributing geometry - baked-light (Static:
+			// level + flora) AND dynamic-GI (Dynamic: terraformable terrain, which the octree re-voxelizes
+			// each frame). Exclude only gi_mode=Disabled (moving animals/player), so their light doesn't
+			// stick in the volume / pop. (Matches the SVOGI region gather in renderer_scene_cull.)
+			bool skip_dynamic_for_svogi = (p_pass_mode == PASS_MODE_SDF && !inst->data->use_baked_light && !inst->data->use_dynamic_gi);
+				if (!skip_dynamic_for_svogi && (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
 					rl->add_element(surf);
 				}
 			}
@@ -1736,6 +1749,24 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 	if (render_gi) {
 		gi.process_gi(rb, p_normal_roughness_slices, p_voxel_gi_buffer, p_render_data->environment, p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform, *p_render_data->voxel_gi_instances);
+
+		// Screen-space SVOGI resolve (denoiser FA): cone-trace the octree off the just-prepared depth +
+		// normal-roughness gbuffer into a half-res buffer that the opaque pass samples, instead of the
+		// inline per-fragment trace in scene_forward_gi_inc.glsl. Runs after the gbuffer prepass, before
+		// opaque - alongside Godot's own GI resolve. No-op until the octree has data. (View 0 only for
+		// now; multiview GI denoise is a later concern.)
+		if (rb->has_custom_data(RB_SCOPE_SVOGI)) {
+			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
+			if (svogi.is_valid()) {
+				// Pass the CORRECTED projection (get_view_projection applies the reverse-Z/flip depth
+				// correction + TAA jitter that the depth buffer was rendered with) and the absolute
+				// cam_transform. scene_data.view_projection[] is only the projection (view is applied
+				// separately), so the resolve must fold cam_transform in to reach absolute world space -
+				// otherwise it reconstructs VIEW-space positions and traces the absolute octree near the
+				// world origin, pinning GI to one spot regardless of camera position.
+				svogi->resolve_screen_gi(rb->get_depth_texture(0), p_normal_roughness_slices[0], rb->get_internal_size(), p_render_data->scene_data->get_view_projection(0), p_render_data->scene_data->cam_transform);
+			}
+		}
 	}
 
 	if (render_shadows) {
@@ -2493,6 +2524,17 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 		return;
 	}
 
+	// --meshlet-svogi-gi-debug: diagnostics + raw half-res GI overlay. Prints (first few frames) which
+	// meshlet path is live and whether the octree/GI buffer are valid, so we can tell if the visbuffer
+	// GI trace is even on the active path.
+	static const bool svogi_gi_debug = OS::get_singleton()->get_cmdline_args().find("--meshlet-svogi-gi-debug") != nullptr;
+	static int svogi_gi_dbg_prints = 0;
+	bool svogi_gi_dbg_log = svogi_gi_debug && (svogi_gi_dbg_prints < 8);
+	if (svogi_gi_dbg_log) {
+		svogi_gi_dbg_prints++;
+		print_line("SVOGI-GI-DEBUG: _render_meshlet_late_pass reached (flag parsed OK)");
+	}
+
 	RID transforms_buffer = meshlet_scan_transforms_buffer();
 
 	Transform3D camera_transform = p_render_data->scene_data->cam_transform;
@@ -2633,34 +2675,65 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 		// resolve shades + composites color+depth into the scene framebuffer. Uses the same projection/
 		// camera/shading params the render() path uses just below.
 		MeshletSoftwareRasterizer *sw_rast = MeshletSoftwareRasterizer::get_singleton();
-		if (sw_rast && frustum_result.has_software()) {
-			// P5b: occlude BOTH lists against this frame's mid Hi-Z (built above from the current depth =
-			// non-meshlet scene geometry), so clusters fully hidden behind the scene aren't rastered.
-			// occlusion_result already holds the occluded HARDWARE list (computed above); occlude the
-			// SOFTWARE list into the culler's secondary buffer so it doesn't clobber it. (Meshlet-vs-
-			// meshlet occlusion would additionally need this frame's resolved depth fed back as temporal
-			// Hi-Z - a later refinement; this already culls meshlets behind terrain/other opaque geometry.)
-			RendererRD::MeshletCuller::CullResult sw_frustum;
-			sw_frustum.visible_buffer = frustum_result.sw_visible_buffer;
-			sw_frustum.max_visible = frustum_result.sw_max_visible;
-			RendererRD::MeshletCuller::CullResult sw_list = meshlet_culler->occlude(transforms_buffer, sw_frustum, mid_hiz.texture, mid_hiz.mip_count, camera_transform, projection, screen_size, MESHLET_LIVE_CAPACITY, /*secondary=*/true);
+		// The visbuffer path is normally engaged only when there ARE software (small/subpixel) clusters;
+		// otherwise the legacy hardware color path (else branch) renders everything. --meshlet-svogi-gi-debug
+		// FORCES the visbuffer path so the SVOGI GI trace + resolve composite (built on it) apply even to
+		// all-large-cluster scenes (has_software=0). Opt-in + reversible: without the flag, behavior is
+		// unchanged.
+		bool meshlet_have_sw = frustum_result.has_software();
+		if (sw_rast && (meshlet_have_sw || svogi_gi_debug)) {
+			// occlusion_result already holds the occluded HARDWARE list (computed above).
 			RendererRD::MeshletCuller::CullResult hw_list = occlusion_result;
-
-			// Software (small/subpixel) clusters via compute - this call clears the shared visbuffer.
-			sw_rast->rasterize(sw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, false);
-			// Hardware (large) clusters via a draw - accumulate into the SAME visbuffer (p_clear = false).
-			sw_rast->rasterize_hardware(hw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, false, false);
+			RendererRD::MeshletCuller::CullResult sw_list; // Invalid when no software clusters - trace/resolve bind a stand-in.
+			if (meshlet_have_sw) {
+				// P5b: occlude the SOFTWARE list against this frame's mid Hi-Z into the culler's secondary
+				// buffer so it doesn't clobber the hardware list, then raster software (this call clears the
+				// shared visbuffer) + hardware (accumulate, p_clear=false) into the SAME visbuffer.
+				RendererRD::MeshletCuller::CullResult sw_frustum;
+				sw_frustum.visible_buffer = frustum_result.sw_visible_buffer;
+				sw_frustum.max_visible = frustum_result.sw_max_visible;
+				sw_list = meshlet_culler->occlude(transforms_buffer, sw_frustum, mid_hiz.texture, mid_hiz.mip_count, camera_transform, projection, screen_size, MESHLET_LIVE_CAPACITY, /*secondary=*/true);
+				sw_rast->rasterize(sw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, false);
+				sw_rast->rasterize_hardware(hw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, false, false);
+			} else {
+				// Forced visbuffer path with zero software clusters: hardware-raster all meshlets into a
+				// freshly-cleared visbuffer (p_clear = true).
+				sw_rast->rasterize_hardware(hw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, true, false);
+			}
 
 			static bool swraster_covdiag = OS::get_singleton()->get_cmdline_args().find("--meshlet-swraster-diag") != nullptr;
 			if (swraster_covdiag) {
 				uint32_t covered = sw_rast->debug_visbuffer_coverage(screen_size);
 				print_line(vformat("MESHLET_VISBUFFER_COV: covered_px=%d of %d (%.1f%%)", (int)covered, (int)(screen_size.x * screen_size.y), 100.0 * covered / MAX(1, screen_size.x * screen_size.y)));
 			}
+			// Half-res SVOGI GI trace (denoiser Phase 1): cone-trace the octree into a screen-space GI
+			// buffer, reading the freshly-rastered visbuffer, BEFORE the resolve consumes it. Phase 1b
+			// makes the resolve bilaterally upsample this; Phases 2-3 add temporal + spatial filtering.
+			sw_rast->trace_svogi_gi(sw_list, hw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy);
+
+			if (svogi_gi_dbg_log) {
+				uint32_t cov = sw_rast->debug_visbuffer_coverage(screen_size);
+				uint32_t total_px = (uint32_t)MAX(1, screen_size.x * screen_size.y);
+				print_line(vformat("SVOGI-GI-DEBUG: visbuffer sw_rast path ACTIVE - octree valid=%d, half=%.2f, energy=%.2f, gi_color valid=%d, visbuffer_coverage=%d/%d (%.1f%%)", (int)svogi_octree_buffer.is_valid(), svogi_bounds_half_size, svogi_energy, (int)sw_rast->get_gi_color().is_valid(), (int)cov, (int)total_px, 100.0 * cov / total_px));
+			}
+
 			// Resolve: shade every covered pixel and composite color + gl_FragDepth into the scene's
 			// color-only framebuffer (p_clear = false - the opaque pass already filled it).
 			sw_rast->resolve_raster(p_color_only_framebuffer, sw_list, hw_list, transforms_buffer, material_ids_buffer, screen_size, projection, camera_transform, lights_buffer, (uint32_t)lights.size(), meshlet_ambient_color, meshlet_sky_ambient_mix, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_radiance_exposure, meshlet_max_roughness_lod, false);
+
+			// Debug: --meshlet-svogi-gi-overlay blits the raw half-res GI buffer over the frame (bilinear
+			// upscale) to eyeball the trace. Kept SEPARATE from --meshlet-svogi-gi-debug so the latter can
+			// show the actual (resolve-shaded) scene through the visbuffer path without the overlay hiding
+			// whether geometry even rendered.
+			static bool gi_overlay = OS::get_singleton()->get_cmdline_args().find("--meshlet-svogi-gi-overlay") != nullptr;
+			if (gi_overlay && sw_rast->get_gi_color().is_valid()) {
+				copy_effects->copy_to_fb_rect(sw_rast->get_gi_color(), p_color_only_framebuffer, Rect2i(Point2i(), screen_size), false, false, false, false, RID(), false, false, false);
+			}
 		}
 	} else {
+		if (svogi_gi_dbg_log) {
+			print_line(vformat("SVOGI-GI-DEBUG: HARDWARE meshlet color path active (has_software=%d) - visbuffer GI trace/blit BYPASSED. The inline per-pixel gather runs instead.", (int)frustum_result.has_software()));
+		}
 		// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
 		// color (and, if the early pass ran, its partial depth contribution too) - never true here,
 		// matching this pass's existing pre-restructuring behavior.
@@ -3170,27 +3243,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		bool finish_depth = using_ssao || using_ssil || using_svogi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
 
 		// When the early meshlet pass engaged this frame, it already cleared+wrote depth_framebuffer
-		// for meshlet-replaceable instances - skip them here (same meshlet_replace_skip_set filtering
-		// the opaque color pass already applies below) and don't clear what it just wrote.
-		GeometryInstanceSurfaceDataCache **depth_elements_ptr = render_list[RENDER_LIST_OPAQUE].elements.ptr();
-		RenderElementInfo *depth_element_info_ptr = render_list[RENDER_LIST_OPAQUE].element_info.ptr();
-		int depth_elements_count = render_list[RENDER_LIST_OPAQUE].elements.size();
-		LocalVector<GeometryInstanceSurfaceDataCache *> meshlet_depth_filtered_elements;
-		LocalVector<RenderElementInfo> meshlet_depth_filtered_element_info;
-		if (meshlet_early_pass_engaged && !meshlet_replace_skip_set.is_empty()) {
-			for (uint32_t i = 0; i < render_list[RENDER_LIST_OPAQUE].elements.size(); i++) {
-				if (meshlet_replace_skip_set.has(render_list[RENDER_LIST_OPAQUE].elements[i])) {
-					continue;
-				}
-				meshlet_depth_filtered_elements.push_back(render_list[RENDER_LIST_OPAQUE].elements[i]);
-				meshlet_depth_filtered_element_info.push_back(render_list[RENDER_LIST_OPAQUE].element_info[i]);
-			}
-			depth_elements_ptr = meshlet_depth_filtered_elements.ptr();
-			depth_element_info_ptr = meshlet_depth_filtered_element_info.ptr();
-			depth_elements_count = meshlet_depth_filtered_elements.size();
-		}
-
-		RenderListParameters render_list_params(depth_elements_ptr, depth_element_info_ptr, depth_elements_count, reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+		// for meshlet-replaceable INSTANCE_MESH instances. They're skipped here IN PLACE inside
+		// _render_list (see its PASS_MODE_DEPTH skip) - NOT by rebuilding the element list. The old
+		// rebuild dropped the skipped elements but copied the survivors' `repeat` group counts verbatim,
+		// desyncing the draw loop's `i += repeat - 1` group indexing so unrelated opaque geometry read
+		// the wrong elements and never got depth written - a terrain chunk vanished as a black hole
+		// whenever any meshlet-replaceable mesh (e.g. a StandardMaterial3D capsule) engaged the early
+		// pass. Pass the FULL list; the in-place skip keeps every survivor at its original index so the
+		// grouping stays valid (the opaque color pass below already does exactly this).
+		RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 		RD::DrawFlags depth_pre_pass_draw_flags = (needs_pre_resolve || meshlet_early_pass_engaged) ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL;
 		_render_list_with_draw_list(&render_list_params, depth_framebuffer, depth_pre_pass_draw_flags, depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
 
@@ -4175,9 +4236,25 @@ void RenderForwardClustered::_render_svogi(Ref<RenderSceneBuffersRD> p_render_bu
 
 	PassMode pass_mode = PASS_MODE_SDF;
 	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode);
-	
+
 	// Scan the instances and collect meshlets in the SVOGI bounds.
 	_meshlet_scan_render_list(&render_data, RENDER_LIST_SECONDARY);
+
+	// SVOGI-only: also voxelize the meshletized TERRAIN. Terrain is meshletized but diverted to its own
+	// stream at scan time (meshlet_terrain_scan_*) so the flora late pass doesn't draw it; the SVOGI
+	// voxelizer, however, MUST include it - the ground is the dominant GI bounce surface and without it
+	// the octree is empty wherever the player stands in the open. Append the terrain ranges/transforms
+	// into the scan set (offsetting instance indices past the flora ones); terrain has no MeshletMaterial
+	// (custom ShaderMaterial) so it gets material_id 0 as a stand-in albedo for now.
+	uint32_t terrain_instance_base = (uint32_t)meshlet_scan_instance_transforms.size();
+	for (const Transform3D &t : meshlet_terrain_scan_instance_transforms) {
+		meshlet_scan_instance_transforms.push_back(t);
+		meshlet_scan_material_ids.push_back(0u);
+	}
+	for (RendererRD::MeshletCuller::InstanceMeshletRange r : meshlet_terrain_scan_ranges) {
+		r.instance_index += terrain_instance_base;
+		meshlet_scan_ranges.push_back(r);
+	}
 
 	RendererRD::MeshletCuller *meshlet_culler = RendererRD::MeshletCuller::get_singleton();
 	if (meshlet_culler && meshlet_scan_ranges.size() > 0) {
@@ -4798,6 +4875,23 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		RID ssr_mip_level = (rb_data.is_valid() && !rb_data->ss_effects_data.ssr.half_size && rb->has_texture(RB_SCOPE_SSR, RB_MIP_LEVEL)) ? rb->get_texture(RB_SCOPE_SSR, RB_MIP_LEVEL) : RID();
 		RID texture = ssr_mip_level.is_valid() ? ssr_mip_level : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+	{
+		// Binding 37: screen-space SVOGI GI (denoiser FA), half-res 2D. Always a plain texture2D (view 0
+		// only for now) so the opaque shader's svogi_process() can sample the resolved/filtered indirect
+		// diffuse instead of cone-tracing inline. Black default when SVOGI is off / not yet resolved.
+		RD::Uniform u;
+		u.binding = 37;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID svogi_gi;
+		if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SVOGI)) {
+			Ref<RendererRD::GI::SVOGI> svogi = rb->get_custom_data(RB_SCOPE_SVOGI);
+			// Prefer the a-trous-filtered output (FC); fall back to the raw accumulated buffer if the
+			// spatial pass hasn't produced one yet (e.g. before the first resolve).
+			svogi_gi = svogi->screen_gi_filtered.is_valid() ? svogi->screen_gi_filtered : svogi->screen_gi_texture;
+		}
+		u.append_id(svogi_gi.is_valid() ? svogi_gi : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK));
 		uniforms.push_back(u);
 	}
 

@@ -44,6 +44,36 @@ uint32_t RenderingShaderContainerVulkan::_format_version() const {
 	return FORMAT_VERSION;
 }
 
+// Returns true if the SPIR-V declares the Tessellation or Geometry capability. smolv's opcode support is
+// vertex/fragment-oriented and it does not round-trip these stages: the decoded module still passes
+// vkCreateShaderModule but the driver produces degenerate geometry (or rejects the pipeline). Such stages
+// must be stored uncompressed.
+static bool _spirv_requires_uncompressed(Span<uint8_t> p_spirv) {
+	const uint32_t word_count = (uint32_t)(p_spirv.size() / sizeof(uint32_t));
+	if (word_count < 5 || ((const uint32_t *)p_spirv.ptr())[0] != 0x07230203u) { // SPIR-V magic.
+		return false;
+	}
+	const uint32_t *words = (const uint32_t *)p_spirv.ptr();
+	uint32_t i = 5;
+	while (i < word_count) {
+		const uint32_t instr_word_count = words[i] >> 16;
+		const uint32_t opcode = words[i] & 0xFFFFu;
+		if (instr_word_count == 0) {
+			break;
+		}
+		if (opcode == 17u /* OpCapability */ && (i + 1) < word_count) {
+			const uint32_t capability = words[i + 1];
+			if (capability == 2u /* Geometry */ || capability == 3u /* Tessellation */) {
+				return true;
+			}
+		} else if (opcode == 15u /* OpEntryPoint */) {
+			break; // Capabilities always precede entry points; nothing relevant follows.
+		}
+		i += instr_word_count;
+	}
+	return false;
+}
+
 bool RenderingShaderContainerVulkan::_set_code_from_spirv(const ReflectShader &p_shader) {
 	const LocalVector<ReflectShaderStage> &p_spirv = p_shader.shader_stages;
 
@@ -51,8 +81,10 @@ bool RenderingShaderContainerVulkan::_set_code_from_spirv(const ReflectShader &p
 	shaders.resize(p_spirv.size());
 	for (uint64_t i = 0; i < p_spirv.size(); i++) {
 		RenderingShaderContainer::Shader &shader = shaders.ptrw()[i];
-		if (debug_info_enabled) {
-			// Store SPIR-V as is when debug info is required.
+		const bool stage_needs_raw_spirv = _spirv_requires_uncompressed(p_spirv[i].spirv().reinterpret<uint8_t>());
+		if (debug_info_enabled || stage_needs_raw_spirv) {
+			// Store SPIR-V as is when debug info is required, or when smolv can't safely round-trip it
+			// (tessellation / geometry stages).
 			shader.code_compressed_bytes = p_spirv[i].spirv_data();
 			shader.code_compression_flags = 0;
 			shader.code_decompressed_size = 0;

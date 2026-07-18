@@ -9,6 +9,7 @@
 #include "servers/rendering/renderer_rd/shaders/meshlet_software_rasterize.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_dispatch_args.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_hw_raster.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/meshlet_svogi_gi_trace.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/meshlet_visbuffer_resolve_raster.glsl.gen.h"
 #include "servers/rendering/renderer_rd/meshlet_culler.h"
@@ -51,6 +52,20 @@ public:
 		uint32_t viewport_height;
 		uint32_t pad0;
 		uint32_t pad1;
+	};
+
+	// Must match meshlet_svogi_gi_trace.glsl's Params block (std430, 128 bytes): mat4 (64) +
+	// vec3 camera_position + full_width (16) + 2x vec4 (32) + full_height + 3 pads (16).
+	struct GiTracePushConstant {
+		float view_projection_matrix[16];
+		float camera_position[3];
+		uint32_t full_width;
+		float svogi_bounds[4]; // xyz = octree center, w = half-size (0 = SVOGI off).
+		float svogi_params[4]; // x = energy.
+		uint32_t full_height;
+		uint32_t pad0;
+		uint32_t pad1;
+		uint32_t pad2;
 	};
 
 	// Must match meshlet_visbuffer_resolve.glsl's Params block (std430, 128 bytes): mat4 (64) +
@@ -109,6 +124,18 @@ private:
 	RID resolve_raster_pipeline_fallback;
 	RD::FramebufferFormatID resolve_raster_pipeline_format = RD::INVALID_FORMAT_ID;
 
+	// Half-resolution SVOGI GI trace (denoiser Phase 1): cone-traces the octree at half res into a
+	// screen-space GI buffer + aux normal/depth, so the GI can be temporally/spatially filtered before
+	// the fragment resolve bilaterally upsamples it back. Variants mirror the visbuffer (0 int64, 1 fallback).
+	MeshletSvogiGiTraceShaderRD gi_trace_shader;
+	RID gi_trace_shader_version;
+	RID gi_trace_pipeline_int64;
+	RID gi_trace_pipeline_fallback;
+	RID gi_color; // rgba16f, half-res: raw traced radiance (a = coverage).
+	RID gi_normal; // rgba16f, half-res: world normal.
+	RID gi_depth; // r32f, half-res: winning reverse-Z NDC depth.
+	Size2i gi_dims; // Half-res dims (screen / 2, rounded up).
+
 	bool int64_supported = false;
 
 	// Visbuffer, grow-and-reuse, sized to the screen. Only the layout matching the last rasterize()
@@ -145,6 +172,7 @@ public:
 
 	void _ensure_hw_framebuffer(const Size2i &p_screen_size);
 	void _ensure_out_color(const Size2i &p_screen_size);
+	void _ensure_gi_buffers(const Size2i &p_half_size);
 	// Appends the alpha-scissor bindings (8: vertex attributes, 9: material ids, 10: materials,
 	// 11: material textures, 12: sampler) that both raster shaders declare - so a cutout material can be
 	// tested at raster time.
@@ -159,6 +187,17 @@ public:
 
 	RID get_out_color() const { return out_color; }
 	Size2i get_out_color_dims() const { return out_color_dims; }
+
+	// Half-res SVOGI GI trace: reads the current visbuffer (same layout the last rasterize wrote),
+	// reconstructs each half-res pixel's world pos/normal, cone-traces the octree, and writes the raw
+	// GI + aux normal/depth into gi_color/gi_normal/gi_depth (allocated here, half of p_screen_size).
+	// No-op if the octree is invalid / SVOGI off.
+	void trace_svogi_gi(const RendererRD::MeshletCuller::CullResult &p_sw_list, const RendererRD::MeshletCuller::CullResult &p_hw_list, RID p_transforms_buffer, RID p_material_ids_buffer, const Size2i &p_screen_size, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_svogi_octree, const Vector3 &p_svogi_center, float p_svogi_half, float p_svogi_energy);
+
+	RID get_gi_color() const { return gi_color; }
+	RID get_gi_normal() const { return gi_normal; }
+	RID get_gi_depth() const { return gi_depth; }
+	Size2i get_gi_dims() const { return gi_dims; }
 
 	// Debug: read back the current visbuffer and count non-zero (covered) pixels. GPU stall - debug only.
 	uint32_t debug_visbuffer_coverage(const Size2i &p_screen_size);

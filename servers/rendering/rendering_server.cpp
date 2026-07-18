@@ -2878,6 +2878,7 @@ void RenderingServer::_bind_methods() {
 	/* GI API (affects VoxelGI and SVOGI) */
 
 	ClassDB::bind_method(D_METHOD("gi_set_use_half_resolution", "half_resolution"), &RenderingServer::gi_set_use_half_resolution);
+	ClassDB::bind_method(D_METHOD("gi_set_svogi_terrain_voxels", "voxels"), &RenderingServer::gi_set_svogi_terrain_voxels);
 
 	/* VOXEL GI API */
 

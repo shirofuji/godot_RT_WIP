@@ -83,6 +83,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	uses_world_coordinates = false;
 	uses_particle_trails = false;
 	uses_z_clip_scale = false;
+	uses_tessellation = false;
 
 	int depth_drawi = DEPTH_DRAW_OPAQUE;
 
@@ -96,6 +97,9 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	actions.entry_point_stages["vertex"] = ShaderCompiler::STAGE_VERTEX;
 	actions.entry_point_stages["fragment"] = ShaderCompiler::STAGE_FRAGMENT;
 	actions.entry_point_stages["light"] = ShaderCompiler::STAGE_FRAGMENT;
+	// Adaptive tessellation displacement runs in the TES; for globals/time bookkeeping it shares the
+	// vertex stage. Its code lands in gen_code.code["displacement"] for the patch pipeline (P2+) to consume.
+	actions.entry_point_stages["displacement"] = ShaderCompiler::STAGE_VERTEX;
 
 	actions.render_mode_values["blend_add"] = Pair<int *, int>(&blend_mode, BLEND_MODE_ADD);
 	actions.render_mode_values["blend_mix"] = Pair<int *, int>(&blend_mode, BLEND_MODE_MIX);
@@ -121,6 +125,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	actions.render_mode_flags["wireframe"] = &wireframe;
 	actions.render_mode_flags["particle_trails"] = &uses_particle_trails;
 	actions.render_mode_flags["world_vertex_coords"] = &uses_world_coordinates;
+	actions.render_mode_flags["tessellation_adaptive"] = &uses_tessellation;
 
 	actions.usage_flag_pointers["ALPHA"] = &uses_alpha;
 	actions.usage_flag_pointers["ALPHA_SCISSOR_THRESHOLD"] = &uses_alpha_clip;
@@ -214,6 +219,16 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	stencil_compare = StencilCompare(stencil_comparei);
 	stencil_reference = stencil_referencei;
 
+	// Every displacement guard in scene_forward_clustered.glsl requires NORMAL_USED, since displacement is an
+	// offset along the normal and there is nothing to offset along without one. That define is only emitted
+	// when the shader touches the NORMAL built-in - NORMAL_MAP does NOT set it - so a displacement() material
+	// that only writes NORMAL_MAP compiles its entire displacement path out and renders dead flat with no
+	// diagnostic at all. Checking gen_code.defines rather than uses_normal is deliberate: uses_normal has
+	// already had uses_normal_map folded into it above, which is exactly the case that must still be caught.
+	if (gen_code.code.has("displacement") && !gen_code.defines.has("#define NORMAL_USED\n")) {
+		ERR_PRINT(vformat("Shader '%s' has a displacement() function but never uses the NORMAL built-in, so its displacement is silently ignored. Write NORMAL (in vertex() or fragment()) to enable it; writing only NORMAL_MAP is not enough.", path));
+	}
+
 #if 0
 	print_line("**compiling shader:");
 	print_line("**defines:\n");
@@ -231,6 +246,10 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	print_line("\n**vertex_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX]);
 	print_line("\n**fragment_globals:\n" + gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]);
 #endif
+	// Adaptive tessellation: flag this material version so its variants also compile the TCS/TES stages
+	// (declared as #[tesc]/#[tese] in scene_forward_clustered.glsl) and get drawn with a patch pipeline.
+	// Must precede version_set_code so the (re)compile picks it up.
+	SceneShaderForwardClustered::singleton->shader.version_set_tessellation_enabled(version, uses_tessellation);
 	SceneShaderForwardClustered::singleton->shader.version_set_code(version, gen_code.code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX], gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
 
 	ubo_size = gen_code.uniform_total_size;
@@ -430,6 +449,19 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 	RD::PipelineRasterizationState raster_state;
 	raster_state.cull_mode = p_pipeline_key.cull_mode;
 	raster_state.wireframe = wireframe || p_pipeline_key.wireframe;
+
+	// Adaptive tessellation: the version compiled TCS/TES stages, so this pipeline must consume triangle
+	// patches (3 control points) instead of triangles. Only meaningful for triangle-topology geometry.
+	if (uses_tessellation && primitive_rd == RD::RENDER_PRIMITIVE_TRIANGLES) {
+		primitive_rd = RD::RENDER_PRIMITIVE_TESSELATION_PATCH;
+		raster_state.patch_control_points = 3;
+	} else if (uses_tessellation) {
+		// The shader author opts into tessellation via a render_mode, but the mesh decides the primitive, and
+		// nothing connects the two. The TCS/TES are compiled into every variant of this version regardless, and
+		// Vulkan requires patch topology whenever tessellation stages are present, so this pipeline is rejected
+		// by the driver and the geometry silently vanishes. Say so, rather than leaving it invisible.
+		ERR_PRINT_ONCE("Materials using 'render_mode tessellation_adaptive' only support triangle geometry. This mesh uses another primitive type (points, lines, or triangle strips) and will not render.");
+	}
 
 	RD::PipelineMultisampleState multisample_state;
 	multisample_state.sample_count = RD::get_singleton()->framebuffer_format_get_texture_samples(p_pipeline_key.framebuffer_format_id, 0);
@@ -729,6 +761,10 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.renames["INSTANCE_ID"] = "INSTANCE_INDEX";
 		actions.renames["VERTEX_ID"] = "VERTEX_INDEX";
 		actions.renames["Z_CLIP_SCALE"] = "z_clip_scale";
+		actions.renames["DISPLACEMENT"] = "displacement_amount";
+		// Only referenceable from displacement() (the only place it is a registered built-in), which compiles
+		// solely into the evaluation stage, where this local is defined from the pre-displacement clip w.
+		actions.renames["VIEW_DEPTH"] = "view_depth";
 
 		actions.renames["ALPHA_SCISSOR_THRESHOLD"] = "alpha_scissor_threshold";
 		actions.renames["ALPHA_HASH_SCALE"] = "alpha_hash_scale";
@@ -905,7 +941,9 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.base_texture_binding_index = 1;
 		actions.texture_layout_set = RenderForwardClustered::MATERIAL_UNIFORM_SET;
 		actions.base_uniform_string = "material.";
-		actions.base_varying_index = 15;
+		// Locations 0-13 are the built-in varyings; 11 and 14 are borrowed for the adaptive-tessellation
+		// displacement helpers (tess_clip_normal / tess_displacement) since they don't overlap with patches.
+		actions.base_varying_index = 16;
 
 		actions.default_filter = ShaderLanguage::FILTER_LINEAR_MIPMAP;
 		actions.default_repeat = ShaderLanguage::REPEAT_ENABLE;

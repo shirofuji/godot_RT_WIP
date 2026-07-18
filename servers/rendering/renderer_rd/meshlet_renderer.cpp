@@ -242,7 +242,15 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	// attachment count must match the framebuffer's actual color attachment count.
 	RD::PipelineColorBlendState blend_state = p_depth_only ? RD::PipelineColorBlendState::create_disabled(0) : RD::PipelineColorBlendState::create_disabled();
 
-	cached = RD::get_singleton()->render_pipeline_create(shader_rid, p_framebuffer_format, vertex_format, RD::RENDER_PRIMITIVE_TRIANGLES, rs, RD::PipelineMultisampleState(), ds, blend_state);
+	// The pipeline's rasterization sample count MUST match the target framebuffer's sample count.
+	// Defaulting to PipelineMultisampleState() (TEXTURE_SAMPLES_1) while drawing into a project's
+	// MSAA color/depth framebuffer (e.g. msaa_3d=4x) is a pipeline/render-pass sample mismatch that,
+	// on the driver measured here, silently crushed all meshlet geometry into the top-left quadrant
+	// (NDC scaled 0.5 about the corner) instead of erroring - the "StandardMaterial3D capsule renders
+	// offset" bug. Derive the count from the framebuffer format so HW meshlet raster is MSAA-correct.
+	RD::PipelineMultisampleState multisample_state;
+	multisample_state.sample_count = RD::get_singleton()->framebuffer_format_get_texture_samples(p_framebuffer_format, 0);
+	cached = RD::get_singleton()->render_pipeline_create(shader_rid, p_framebuffer_format, vertex_format, RD::RENDER_PRIMITIVE_TRIANGLES, rs, multisample_state, ds, blend_state);
 	cached_format = p_framebuffer_format;
 }
 

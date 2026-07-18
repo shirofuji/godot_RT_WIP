@@ -263,8 +263,53 @@ void svogi_process(uint cascade, vec3 cascade_pos, vec3 cam_pos, vec3 cam_normal
 	float voxel_size = bounds_half / 32.0; // root half-size / 32 ~= leaf diameter.
 	float max_distance = bounds_half * 2.0;
 
-	// Indirect diffuse: cosine-weighted 6-cone hemisphere gather (matches the meshlet path).
-	diffuse_light = svogi_hemisphere_gather(cam_pos, cam_normal, voxel_size * 3.0, max_distance);
+	// Indirect diffuse: sample the pre-resolved half-res SVOGI buffer. The buffer is view-0 texture2D.
+#ifdef USE_MULTIVIEW
+	// Multiview: plain bilinear (the depth-aware path below uses the single-view depth_buffer type).
+	vec2 svogi_gi_full_size = vec2(textureSize(sampler2D(svogi_screen_gi_buffer, SAMPLER_LINEAR_CLAMP), 0)) * 4.0; // 4.0 must match GI_DOWNSCALE in gi.cpp (multiview/VR only; unused on desktop).
+	diffuse_light = texture(sampler2D(svogi_screen_gi_buffer, SAMPLER_LINEAR_CLAMP), gl_FragCoord.xy / svogi_gi_full_size).rgb;
+#else
+	// DEPTH-AWARE bilateral upsample (FC). Plain bilinear bleeds background GI across silhouette edges
+	// (the capsule-rim artifact); weight the 4 half-res taps by both bilinear position AND how close
+	// each tap's gbuffer depth is to this fragment's depth, so taps on a different surface are rejected.
+	// The resolve wrote each half-res texel from the full-res pixel at texel*2 - read gbuffer depth there.
+	ivec2 svogi_half_size = textureSize(sampler2D(svogi_screen_gi_buffer, SAMPLER_NEAREST_CLAMP), 0);
+	// Upsample ratio = full-res / GI-buffer size (2 at half-res, 4 at quarter-res). Derived from the
+	// full-res depth buffer so this tracks gi.cpp's GI_DOWNSCALE with no hardcoded factor.
+	ivec2 svogi_gi_R = max(textureSize(sampler2D(depth_buffer, SAMPLER_NEAREST_CLAMP), 0) / svogi_half_size, ivec2(1));
+	vec2 svogi_hcoord = gl_FragCoord.xy / vec2(svogi_gi_R) - 0.5; // full-res px -> GI-buffer texel grid.
+	ivec2 svogi_h0 = ivec2(floor(svogi_hcoord));
+	vec2 svogi_hf = fract(svogi_hcoord);
+	float svogi_ref_depth = gl_FragCoord.z; // window-space reverse-Z, matches the depth buffer.
+	// Reference normal from the gbuffer at THIS pixel (same encoding/space as the taps - avoids any
+	// cam_normal space mismatch). The capsule floats near the ground so depth alone can't separate them;
+	// the normal does (capsule surface vs flat ground).
+	vec3 svogi_ref_n = normalize(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec2(gl_FragCoord.xy), 0).xyz * 2.0 - 1.0);
+	vec3 svogi_gi_acc = vec3(0.0);
+	float svogi_w_acc = 0.0;
+	for (int svogi_dy = 0; svogi_dy < 2; svogi_dy++) {
+		for (int svogi_dx = 0; svogi_dx < 2; svogi_dx++) {
+			ivec2 svogi_ht = clamp(svogi_h0 + ivec2(svogi_dx, svogi_dy), ivec2(0), svogi_half_size - ivec2(1));
+			ivec2 svogi_fp = svogi_ht * svogi_gi_R;
+			float svogi_bw = (svogi_dx == 0 ? 1.0 - svogi_hf.x : svogi_hf.x) * (svogi_dy == 0 ? 1.0 - svogi_hf.y : svogi_hf.y);
+			float svogi_tap_depth = texelFetch(sampler2D(depth_buffer, SAMPLER_NEAREST_CLAMP), svogi_fp, 0).r;
+			float svogi_dd = abs(svogi_tap_depth - svogi_ref_depth) / max(svogi_ref_depth, 1e-5);
+			float svogi_dw = exp(-svogi_dd * 96.0);
+			vec3 svogi_tap_n = normalize(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), svogi_fp, 0).xyz * 2.0 - 1.0);
+			float svogi_nw = pow(max(dot(svogi_tap_n, svogi_ref_n), 0.0), 4.0); // gentle: gbuffer normal has bump detail, a peaky weight re-injects per-pixel speckle at full res (depth term still handles silhouettes).
+			// CRITICAL: the resolve writes rgb=0, ALPHA=0 for half-res texels with no valid static GI (sky,
+			// dynamic objects, foliage pixels it rejected), and the a-trous SKIPS those (leaves them zero).
+			// Fold the tap's alpha into its weight so those zero-holes are NOT averaged in - otherwise a
+			// terrain pixel whose 2x2 half-res neighbourhood clips one of them gets a 0 blended in = a dark
+			// dot, densest exactly where the scene is complex/foliage-heavy (the material-variation pattern).
+			vec4 svogi_tap = texelFetch(sampler2D(svogi_screen_gi_buffer, SAMPLER_NEAREST_CLAMP), svogi_ht, 0);
+			float svogi_w = svogi_bw * svogi_dw * svogi_nw * svogi_tap.a + 1e-6;
+			svogi_gi_acc += svogi_tap.rgb * svogi_w;
+			svogi_w_acc += svogi_w;
+		}
+	}
+	diffuse_light = svogi_gi_acc / svogi_w_acc;
+#endif
 
 	// Indirect specular: single roughness-widened cone along the reflection vector.
 	if (use_specular) {
