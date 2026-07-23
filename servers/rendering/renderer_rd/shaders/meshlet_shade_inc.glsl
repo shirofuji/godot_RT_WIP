@@ -196,6 +196,44 @@ vec3 perturb_normal_grad(vec3 N, vec3 dp1, vec3 dp2, vec2 duv1, vec2 duv2, vec3 
 // bilaterally upsampled it to this pixel). When false, meshlet_shade() cone-traces the octree inline
 // exactly as before - the direct-raster color path (meshlet_render.glsl) and the compute resolve
 // (used by tests) have no filtered-GI texture to sample, so they keep the inline gather.
+// Indirect (image-based) specular from the sky radiance octmap. Forward+ applies this to every
+// surface; the meshlet path had NO environment specular at all, which showed up as a blue-biased
+// deficit against the baseline - the sky is the bluest thing in the scene, so omitting its reflection
+// costs blue first. Mirrors scene_forward_clustered.glsl's indirect_specular_light block.
+//
+// p_border is the octmap UV padding (svogi_params.w), p_exposure the radiance exposure*energy scale
+// (svogi_params.y) and p_max_rough_lod the roughest array layer (svogi_params.z).
+//
+// Same unrotated-sky limitation as the ambient lookup above: Forward+ maps the direction through
+// radiance_inverse_xform, which will not fit in the push constant here.
+vec3 meshlet_sky_specular(vec3 N, vec3 V, vec3 f0, float roughness, float metallic, float p_border, float p_exposure, float p_max_rough_lod) {
+	// Bend the reflection toward the normal as roughness rises, exactly as Forward+ does, so rough
+	// surfaces sample a broad lobe instead of a mirror direction.
+	vec3 ref_vec = reflect(-V, N);
+	ref_vec = mix(ref_vec, N, roughness * roughness);
+	// Horizon occlusion: kills the reflection that would otherwise come from below the surface.
+	float horizon = min(1.0 + dot(ref_vec, N), 1.0);
+
+	vec2 ref_uv = vec3_to_oct_with_border(normalize(ref_vec), vec2(p_border, 1.0 - p_border * 2.0));
+	// Layer index into the prefiltered roughness array; sqrt() matches Forward+'s distribution.
+	float rough_lod = sqrt(clamp(roughness, 0.0, 1.0)) * p_max_rough_lod;
+	vec3 env = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(ref_uv, rough_lod), 0.0).rgb;
+	env *= p_exposure * horizon * horizon;
+
+	// Analytic environment BRDF (Karis' mobile approximation) rather than Godot's LUT: it needs no
+	// extra binding and is well within the error the unrotated-sky assumption already introduces.
+	float NdotV = clamp(dot(N, V), 0.0, 1.0);
+	const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+	const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+	vec4 r = roughness * c0 + c1;
+	float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+	vec2 ab = vec2(-1.04, 1.04) * a004 + r.zw;
+	// Karis' (scale, bias) convention: f0 * scale + bias. NOT Godot's
+	// ((f90 - f0) * x + f0 * y) form - that pairs with its own env_brdf_approx, whose components are
+	// ordered differently. Mixing the two inflated the term ~16x and blew the whole frame out.
+	return env * (f0 * ab.x + ab.y);
+}
+
 vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 uv, vec3 camera_position, vec4 ambient_color, vec4 svogi_bounds, vec4 svogi_params, uint light_count, vec3 dpdx, vec3 dpdy, vec2 duvdx, vec2 duvdy, bool p_gi_precomputed, vec3 p_gi_diffuse_in, out bool r_discard) {
 	r_discard = false;
 	MeshletMaterial mat = meshlet_materials.data[material_id];
@@ -279,6 +317,13 @@ vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 
 		vec2 sky_uv = vec3_to_oct_with_border(normalize(world_normal_in), vec2(svogi_params.w, 1.0 - svogi_params.w * 2.0));
 		vec3 sky_ambient = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(sky_uv, svogi_params.z), 0.0).rgb * svogi_params.y;
 		ambient = mix(ambient, sky_ambient, ambient_color.a);
+	}
+
+	if (ambient_color.a > 0.0) {
+		float f0_ior = pow((mat.ior - 1.0) / (mat.ior + 1.0), 2.0);
+		vec3 f0 = mix(vec3(f0_ior), albedo, mat.metallic);
+		// Occluded by the same AO term as the ambient: a crevice should not reflect open sky.
+		specular_light += meshlet_sky_specular(N, V, f0, mat.roughness, mat.metallic, svogi_params.w, svogi_params.y, svogi_params.z) * ao;
 	}
 
 	vec3 color = albedo * (1.0 - mat.metallic) * (diffuse_light + (ambient + gi_diffuse) * ao) + specular_light + mat.emission;

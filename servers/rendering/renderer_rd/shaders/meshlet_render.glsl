@@ -946,6 +946,14 @@ void main() {
 		vec3 sky_ambient = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(sky_uv, params.svogi_params.z), 0.0).rgb * params.svogi_params.y;
 		ambient = mix(ambient, sky_ambient, params.ambient_color.a);
 	}
+	// Sky specular, through the same shared helper the standard meshlet path uses (defined in
+	// meshlet_shade_inc.glsl) so terrain cannot drift from it. Terrain is non-metallic, so f0 is the
+	// dielectric IOR term only.
+	if (params.ambient_color.a > 0.0) {
+		float terr_f0_ior = pow((tmat.ior - 1.0) / (tmat.ior + 1.0), 2.0);
+		specular_light += meshlet_sky_specular(N, V, vec3(terr_f0_ior), tmat.roughness, 0.0, params.svogi_params.w, params.svogi_params.y, params.svogi_params.z) * orm.r;
+	}
+
 	// AO darkens only the ambient/indirect terms, never the direct light - occluding a surface from
 	// the sky should not also dim the sun hitting it.
 	frag_color = vec4(meshlet_apply_fog(alb * (diffuse_light + (ambient + gi_diffuse) * orm.r) + specular_light, wp, params.camera_position), 1.0);
