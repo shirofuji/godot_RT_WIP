@@ -392,7 +392,11 @@ MeshletCuller::CullResult MeshletCuller::cull(RID p_transforms_buffer, const Vec
 		push_constant.camera_position[0] = p_camera_position.x;
 		push_constant.camera_position[1] = p_camera_position.y;
 		push_constant.camera_position[2] = p_camera_position.z;
-		push_constant.sw_cluster_px = sw_split ? p_sw_cluster_px : 0.0f;
+		// A NEGATIVE p_sw_cluster_px is not a split threshold at all - it flags a vertex-displaced
+		// stream, which the shader reads to skip its normal-cone backface test (see meshlet_cull.glsl).
+		// It must therefore survive to the GPU even though it correctly leaves sw_split off; only a
+		// positive threshold we're declining to honour gets zeroed.
+		push_constant.sw_cluster_px = (sw_split || p_sw_cluster_px < 0.0f) ? p_sw_cluster_px : 0.0f;
 
 		// Indirect: dispatch ceil(work_items.count / 64) workgroups (the real expanded count from Pass A),
 		// not the fixed p_max_work_items capacity. work_item_count in the push constant is still the

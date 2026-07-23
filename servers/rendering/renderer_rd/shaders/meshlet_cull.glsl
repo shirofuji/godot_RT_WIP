@@ -152,7 +152,16 @@ void main() {
 	}
 
 	vec3 world_center = (transform * vec4(d.bounds_center, 1.0)).xyz;
-	float world_radius = d.bounds_radius * max_scale;
+	// A NEGATIVE sw_cluster_px marks a VERTEX-DISPLACED stream and carries how far the vertex stage can
+	// move a vertex off its baked position, encoded as -(pad + 1) so that any negative value is still
+	// unambiguously "displaced" even at pad 0. Baked bounds describe the UNDISPLACED surface, so every
+	// bounds-derived test below is wrong for such a stream unless the sphere is grown to cover the
+	// displacement. Growing it here - once, for the frustum test and the raster split alike - is what
+	// lets the caller run a REAL frustum cull instead of the previous workaround of dilating the
+	// frustum planes by 1e9 (i.e. disabling terrain frustum culling outright).
+	bool displaced_stream = params.sw_cluster_px < 0.0;
+	float displaced_pad = displaced_stream ? max(-params.sw_cluster_px - 1.0, 0.0) : 0.0;
+	float world_radius = d.bounds_radius * max_scale + displaced_pad;
 
 	// Normal-cone backface rejection (meshoptimizer's apex-free formula - see
 	// meshopt_computeMeshletBounds's docs): cull if facing away from the camera everywhere on
@@ -184,7 +193,21 @@ void main() {
 	vec3 world_cone_axis = -normalize(cone_normal_matrix * d.cone_axis) * cone_det_sign;
 	vec3 to_meshlet = world_center - params.camera_position;
 	float dist = length(to_meshlet);
-	if (dist > 0.0001) {
+	// A NEGATIVE sw_cluster_px flags a VERTEX-DISPLACED stream (the terrain variant). Its baked meshlet
+	// cones and bounds describe the UNDISPLACED source surface - for terrain, a flat y~0 plane - while
+	// the real geometry is lifted up to the full height span by the vertex shader. The normal-cone test
+	// is therefore meaningless there: standing on a dune tens of metres above a chunk's flat baked
+	// centre makes to_meshlet point steeply DOWN, and since a flat chunk's cone is tight (cutoff ~0)
+	// the test rejects every NEARBY chunk as backfacing while distant ones - whose to_meshlet is nearly
+	// horizontal - survive. Symptom: terrain reduced to a thin ribbon at the horizon with the whole
+	// foreground missing. Proven by A/B: disabling this test restores the exact baseline silhouette.
+	// The frustum test above handles the same mismatch by growing the bounding sphere (displaced_pad),
+	// but that cannot rescue the cone test: padding a sphere makes it more conservative, whereas a cone
+	// baked from a flat plane points the wrong way no matter how large the bounds are. So the cone test
+	// is skipped outright for displaced streams. (Negative also leaves the HW/SW split off, which tests
+	// for > 0.0 below, so this encoding costs no push-constant space - the block is already at the
+	// 128-byte Vulkan floor.)
+	if (!displaced_stream && dist > 0.0001) {
 		if (dot(to_meshlet, world_cone_axis) >= d.cone_cutoff * dist + world_radius) {
 			return; // Backfacing - culled.
 		}
