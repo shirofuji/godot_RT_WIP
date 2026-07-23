@@ -3990,6 +3990,24 @@ void RenderingServer::init() {
 	// Default off until the terrain draw pass is complete (collection alone is a visible no-op).
 	GLOBAL_DEF_RST("rendering/meshlet/terrain_lod", false);
 
+	// Actually DRAW the collected terrain through the meshlet terrain variant, and remove those
+	// surfaces from Forward+. Separate from terrain_lod because collection is a safe no-op while the
+	// draw replaces a whole render path: terrain_lod alone lets a project verify chunks are being
+	// recognized (--meshlet-terrain-diag) before handing the pixels over. The
+	// --meshlet-terrain-draw command-line flag forces it on for a session regardless of this setting.
+	GLOBAL_DEF_RST("rendering/meshlet/terrain_draw", false);
+
+	// Route the terrain draw through a tessellation PATCH pipeline. Currently pass-through at level
+	// 1.0 (renders identically); adaptive levels and detail displacement build on it. Default off
+	// because it changes the pipeline topology. --meshlet-terrain-tess forces it on for a session.
+	GLOBAL_DEF_RST("rendering/meshlet/terrain_tessellation", false);
+
+	// Terrain shading debug visualisation (0 = off). Drives the colour/geometry probes in the terrain
+	// variant of meshlet_render.glsl - see its dbg_mode switch for what each value draws. Settable at
+	// runtime (ProjectSettings.set_setting) so modes can be cycled at a paused camera pose without a
+	// restart; --meshlet-terrain-debug=N seeds it for a session.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/meshlet/terrain_debug", PROPERTY_HINT_RANGE, "0,20,1"), 0);
+
 	// Visibility-buffer software rasterizer (experimental, default OFF): routes qualifying meshlet
 	// geometry through a Nanite-style visbuffer pipeline (classify -> software compute + hardware draw
 	// into one visibility buffer -> fragment resolve compositing color+depth) instead of the meshlet
