@@ -881,6 +881,17 @@ private:
 	// Forward+ (not added to meshlet_replace_skip_set), so this is a no-op for the visible result.
 	Vector<Transform3D> meshlet_terrain_scan_instance_transforms;
 	Vector<RendererRD::MeshletCuller::InstanceMeshletRange> meshlet_terrain_scan_ranges;
+	// T2 terrain-spine draw: the shared terrain material (cached during the scan), persistent transform +
+	// material-id SSBOs for the terrain stream (mirroring the standard stream's grow-reuse buffers), and
+	// the draw entry point. Terrain rides the meshlet TERRAIN variant (heightmap vertex displacement).
+	RID meshlet_terrain_material;
+	RID meshlet_terrain_transforms_buffer_rid;
+	uint32_t meshlet_terrain_transforms_capacity = 0;
+	RID meshlet_terrain_material_ids_buffer_rid;
+	uint32_t meshlet_terrain_material_ids_capacity = 0;
+	RID meshlet_terrain_transforms_buffer();
+	RID meshlet_terrain_material_ids_buffer();
+	void _render_meshlet_terrain(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector<Plane> &p_planes, const Size2i &p_screen_size, RID p_lights_buffer, uint32_t p_light_count, const Color &p_ambient_color, float p_sky_ambient_mix, RID p_radiance_tex, float p_radiance_exposure, float p_max_roughness_lod, float p_radiance_border, RID p_fog_texture, const Vector2 &p_fog_params, RID p_svogi_octree_buffer, const Vector3 &p_svogi_bounds_center, float p_svogi_bounds_half_size, float p_svogi_energy);
 	// True when the resolved material is the project's terrain shader (probed by signature uniforms:
 	// texture_albedo_array + block_mapping). Cheap per-material check; terrain is opt-in via setting.
 	static bool _meshlet_material_is_terrain(const RID &p_material_rid);

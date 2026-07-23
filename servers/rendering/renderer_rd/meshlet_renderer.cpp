@@ -53,11 +53,20 @@ MeshletRenderer::MeshletRenderer() {
 	// allocation (from the rendering/virtual_texture/pool_size_mb setting) so the shader's virtual->
 	// physical UV mapping uses the correct pool geometry.
 	versions.push_back(vformat("\n#define MESHLET_USE_VIRTUAL_TEXTURES\n#define VT_POOL_TILES_X %d\n", (int)VirtualTextureStorage::get_pool_tiles_dim()));
+	versions.push_back("\n#define MESHLET_TERRAIN\n"); // Version 3: version-0 color path + heightmap vertex displacement.
 	render_shader.initialize(versions);
 	render_shader_version = render_shader.version_create();
 	render_shader_rid = render_shader.version_get_shader(render_shader_version, 0);
 	depth_only_shader_rid = render_shader.version_get_shader(render_shader_version, 1);
 	vt_shader_rid = render_shader.version_get_shader(render_shader_version, 2);
+	terrain_shader_rid = render_shader.version_get_shader(render_shader_version, 3);
+
+	// Tessellated terrain: its own version, with the tess stages switched on. version_set_tessellation_enabled
+	// must run BEFORE the version's code is built, and it folds into the shader's cache sha so this
+	// version never collides with the non-tess one on disk.
+	terrain_tess_version = render_shader.version_create();
+	render_shader.version_set_tessellation_enabled(terrain_tess_version, true);
+	terrain_tess_shader_rid = render_shader.version_get_shader(terrain_tess_version, 3);
 
 	// Vertex-pulling: no per-surface vertex buffer at all, every attribute is fetched manually
 	// in the vertex shader body via gl_VertexIndex/gl_InstanceIndex.
@@ -118,6 +127,15 @@ MeshletRenderer::MeshletRenderer() {
 	ind_ss.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
 	ind_ss.repeat_w = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
 	vt_indirection_sampler = RD::get_singleton()->sampler_create(ind_ss);
+
+	// Terrain variant params UBO (binding 21): 3 vec4 = tp0 (terrain_size, height_min, height_range,
+	// height_scale), tp_tiles (per-material tile scale 0..3), tp_extra (tile scale 4 + reserved).
+	// Refreshed per terrain draw. Persistent - buffer_update is cheap vs recreate.
+	terrain_params_ubo = RD::get_singleton()->uniform_buffer_create(sizeof(float) * TERRAIN_PARAM_FLOATS);
+	// Volumetric fog params (binding 25). Always allocated: the shader declares the block
+	// unconditionally, and Vulkan requires every declared binding to be backed even when fog is off
+	// (in which case fog1.w = 0 and the shader returns the colour untouched).
+	fog_params_ubo = RD::get_singleton()->uniform_buffer_create(sizeof(float) * 8);
 }
 
 MeshletRenderer::~MeshletRenderer() {
@@ -130,6 +148,15 @@ MeshletRenderer::~MeshletRenderer() {
 	if (cached_vt_pipeline.is_valid()) {
 		RD::get_singleton()->free_rid(cached_vt_pipeline);
 	}
+	if (cached_terrain_pipeline.is_valid()) {
+		RD::get_singleton()->free_rid(cached_terrain_pipeline);
+	}
+	if (terrain_params_ubo.is_valid()) {
+		RD::get_singleton()->free_rid(terrain_params_ubo);
+	}
+	if (fog_params_ubo.is_valid()) {
+		RD::get_singleton()->free_rid(fog_params_ubo);
+	}
 	RD::get_singleton()->free_rid(synthetic_index_buffer);
 	RD::get_singleton()->free_rid(empty_vertex_array);
 	RD::get_singleton()->free_rid(radiance_sampler);
@@ -141,10 +168,11 @@ MeshletRenderer::~MeshletRenderer() {
 	singleton = nullptr;
 }
 
-void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only, bool p_virtual_textures) {
-	// Three independently-cached pipelines: depth-only (temporal early pass), VT color (virtual-
-	// texture sampling variant), and normal color (direct material_textures[] sampling). VT only
-	// applies to the color path, so p_depth_only takes precedence over p_virtual_textures.
+void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only, bool p_virtual_textures, bool p_terrain, bool p_tessellated) {
+	// Independently-cached pipelines: depth-only (temporal early pass), terrain (heightmap-displaced
+	// vertex, version 3), VT color (virtual-texture sampling), and normal color (direct
+	// material_textures[]). Depth-only takes precedence; terrain and VT are mutually exclusive for our
+	// use (the terrain draw never samples via VT).
 	RID *cached_ptr;
 	RD::FramebufferFormatID *cached_format_ptr;
 	RID variant_shader_rid;
@@ -152,6 +180,14 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 		cached_ptr = &cached_depth_only_pipeline;
 		cached_format_ptr = &cached_depth_only_framebuffer_format;
 		variant_shader_rid = depth_only_shader_rid;
+	} else if (p_terrain && p_tessellated) {
+		cached_ptr = &cached_terrain_tess_pipeline;
+		cached_format_ptr = &cached_terrain_tess_framebuffer_format;
+		variant_shader_rid = terrain_tess_shader_rid;
+	} else if (p_terrain) {
+		cached_ptr = &cached_terrain_pipeline;
+		cached_format_ptr = &cached_terrain_framebuffer_format;
+		variant_shader_rid = terrain_shader_rid;
 	} else if (p_virtual_textures) {
 		cached_ptr = &cached_vt_pipeline;
 		cached_format_ptr = &cached_vt_framebuffer_format;
@@ -250,20 +286,55 @@ void MeshletRenderer::_ensure_pipeline(RD::FramebufferFormatID p_framebuffer_for
 	// offset" bug. Derive the count from the framebuffer format so HW meshlet raster is MSAA-correct.
 	RD::PipelineMultisampleState multisample_state;
 	multisample_state.sample_count = RD::get_singleton()->framebuffer_format_get_texture_samples(p_framebuffer_format, 0);
-	cached = RD::get_singleton()->render_pipeline_create(shader_rid, p_framebuffer_format, vertex_format, RD::RENDER_PRIMITIVE_TRIANGLES, rs, multisample_state, ds, blend_state);
+	// With tess stages present Vulkan REQUIRES patch topology; the indirect draw is unchanged, its
+	// index stream is simply reinterpreted as 3-control-point patches.
+	if (p_tessellated) {
+		rs.patch_control_points = 3;
+	}
+	cached = RD::get_singleton()->render_pipeline_create(shader_rid, p_framebuffer_format, vertex_format, p_tessellated ? RD::RENDER_PRIMITIVE_TESSELATION_PATCH : RD::RENDER_PRIMITIVE_TRIANGLES, rs, multisample_state, ds, blend_state);
 	cached_format = p_framebuffer_format;
 }
 
-void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only, const Color &p_ambient_color, RID p_svogi_octree_buffer, const Vector3 &p_svogi_bounds_center, float p_svogi_bounds_half_size, float p_svogi_energy, RID p_radiance_texture, float p_sky_ambient_mix, float p_radiance_exposure, float p_max_roughness_lod) {
+void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear, bool p_depth_only, const Color &p_ambient_color, RID p_svogi_octree_buffer, const Vector3 &p_svogi_bounds_center, float p_svogi_bounds_half_size, float p_svogi_energy, RID p_radiance_texture, float p_sky_ambient_mix, float p_radiance_exposure, float p_max_roughness_lod, float p_radiance_border, RID p_fog_texture, const Vector2 &p_fog_params, bool p_terrain, RID p_terrain_heightmap, const Vector<RID> &p_terrain_textures, const Vector<float> &p_terrain_params, bool p_terrain_tess) {
 	ERR_FAIL_NULL(MeshletStorage::get_singleton());
 
 	// VT sampling applies only to the color path (depth-only samples no material textures). The
 	// kill-switch lives in VirtualTextureStorage::is_enabled() (resolves --vt-enable/--vt-disable over
 	// the project setting); when off, the normal version-0 shader + direct material_textures[] binding
 	// run, byte-identical to a build without VT.
-	const bool use_virtual_textures = !p_depth_only && VirtualTextureStorage::is_enabled() && VirtualTextureStorage::get_singleton() != nullptr;
+	const bool use_virtual_textures = !p_depth_only && !p_terrain && VirtualTextureStorage::is_enabled() && VirtualTextureStorage::get_singleton() != nullptr;
 
-	_ensure_pipeline(p_framebuffer_format, p_depth_only, use_virtual_textures);
+	const bool terrain_tess = p_terrain && p_terrain_tess;
+	_ensure_pipeline(p_framebuffer_format, p_depth_only, use_virtual_textures, p_terrain, terrain_tess);
+
+	// Terrain variant: refresh the params UBO (binding 21) BEFORE the draw list opens - buffer_update
+	// can't run inside an active draw list. Layout: tp0 (size,min,range,scale), tp_tiles (0..3),
+	// tp_extra (tile4 + debug mode + splat weight cutoff + reserved). Missing entries default to sane values.
+	if (p_terrain) {
+		float tp[TERRAIN_PARAM_FLOATS] = { 1024.0f, 0.0f, 1.0f, 1.0f, 250.0f, 120.0f, 220.0f, 120.0f, 160.0f, 0.0f, 0.02f, 0.6f,
+			1.0f, 0.6f, -1e30f, 1.0f, // tp_mat
+			0.0f, 0.0f, 0.0f, 0.0f, // tp_var_str (de-tiling off unless the material asks)
+			0.012f, 0.012f, 0.012f, 0.012f, // tp_var_scale
+			0.0f, 0.0f, 0.0f, 0.0f, // tp_hex
+			0.0f, 0.012f, 0.0f, 0.15f, // tp_var4: str4, scale4, hex4, blend_width
+			2.4f, 37.3f, 23.1f, 17.9f, // tp_var_rot: rotation + offset
+			0.0f, 0.0f, 0.0f, 0.0f, // tp_det: detail depth 0..3 (0 = that material is not displaced)
+			0.0f, 600.0f, 200.0f, 5.0f }; // tp_det2: depth4, tess distance, fade, mip bias
+		for (int i = 0; i < TERRAIN_PARAM_FLOATS && i < p_terrain_params.size(); i++) {
+			tp[i] = p_terrain_params[i];
+		}
+		RD::get_singleton()->buffer_update(terrain_params_ubo, 0, sizeof(tp), tp);
+	}
+
+	// Fog params, refreshed every draw (also BEFORE the draw list opens - buffer_update cannot run
+	// inside one). p_fog_params = (inv_length, detail_spread); an invalid fog texture means fog is off,
+	// in which case the shader short-circuits and a neutral 3D texture is bound to satisfy the layout.
+	{
+		Vector3 cam_fwd = -p_camera_transform.basis.get_column(2).normalized();
+		float fp[8] = { p_fog_params.x, p_fog_params.y, (float)p_viewport.size.x, (float)p_viewport.size.y,
+			(float)cam_fwd.x, (float)cam_fwd.y, (float)cam_fwd.z, p_fog_texture.is_valid() ? 1.0f : 0.0f };
+		RD::get_singleton()->buffer_update(fog_params_ubo, 0, sizeof(fp), fp);
+	}
 
 	// S0b: the VT shader variant writes per-screen-tile page feedback to binding 18. Fetch + clear it
 	// before the draw list opens (texture_update can't run inside a draw list). The caller drains it
@@ -445,7 +516,35 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			usmat.append_id(material_sampler);
 			uniforms.push_back(usmat);
 		}
-		RID render_shader_rid_to_use = p_depth_only ? depth_only_shader_rid : (use_virtual_textures ? vt_shader_rid : render_shader_rid);
+		if (!p_depth_only) {
+			// Fog volume + its params. Bound for every colour variant, not just terrain: all meshlet
+			// geometry is drawn in the late pass and therefore misses Forward+'s fog. A white 3D
+			// texture is the neutral stand-in (alpha 1 = full transmittance, zero inscatter).
+			RID fog_tex = p_fog_texture.is_valid() ? p_fog_texture : TextureStorage::get_singleton()->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 23, fog_tex));
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 25, fog_params_ubo));
+		}
+		if (p_terrain) {
+			// Terrain variant (version 3) extra vertex-stage bindings: the heightmap (19), a clamp
+			// sampler (20, the radiance sampler is linear+clamp - fine, we textureLod mip 0), and the
+			// params UBO (21). Falls back to a white texture if no heightmap was supplied (draws flat).
+			RID default_white_t = TextureStorage::get_singleton()->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+			RID hm = p_terrain_heightmap.is_valid() ? p_terrain_heightmap : default_white_t;
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 19, hm));
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 20, radiance_sampler));
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 21, terrain_params_ubo));
+			// Binding 22: terrain_textures[7] = [splat0, splat1, mat0..4 albedo]. Pad/replace any missing
+			// entry with white so the fixed-size descriptor array is always fully valid (Vulkan requires it).
+			RD::Uniform uterr;
+			uterr.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+			uterr.binding = 22;
+			for (uint32_t i = 0; i < TERRAIN_TEXTURE_SLOTS; i++) {
+				RID t = (i < (uint32_t)p_terrain_textures.size() && p_terrain_textures[i].is_valid()) ? p_terrain_textures[i] : default_white_t;
+				uterr.append_id(t);
+			}
+			uniforms.push_back(uterr);
+		}
+		RID render_shader_rid_to_use = p_depth_only ? depth_only_shader_rid : (terrain_tess ? terrain_tess_shader_rid : (p_terrain ? terrain_shader_rid : (use_virtual_textures ? vt_shader_rid : render_shader_rid)));
 		// Cached across frames (keyed by the shader + bound resource RIDs) rather than created+freed every
 		// frame: the meshlet storage/visibility/transform buffers are persistent (grow-and-reuse), so
 		// this cache-hits in steady state, avoiding a ~15-binding descriptor-set allocation (including
@@ -504,9 +603,10 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 		// radiance octmap binding in meshlet_render.glsl). Zeroed for depth-only.
 		push_constant.svogi_params[1] = p_depth_only ? 0.0f : p_radiance_exposure;
 		push_constant.svogi_params[2] = p_depth_only ? 0.0f : p_max_roughness_lod;
-		push_constant.svogi_params[3] = 0.0f;
+		// Octmap UV border padding, consumed by vec3_to_oct_with_border() in the ambient lookup.
+		push_constant.svogi_params[3] = p_radiance_border;
 
-		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : (use_virtual_textures ? cached_vt_pipeline : cached_pipeline));
+		RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, p_depth_only ? cached_depth_only_pipeline : (terrain_tess ? cached_terrain_tess_pipeline : (p_terrain ? cached_terrain_pipeline : (use_virtual_textures ? cached_vt_pipeline : cached_pipeline))));
 		RD::get_singleton()->draw_list_bind_vertex_array(draw_list, empty_vertex_array);
 		RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set, 0);
 		RD::get_singleton()->draw_list_bind_index_array(draw_list, synthetic_index_array);

@@ -1874,6 +1874,17 @@ bool RenderForwardClustered::_meshlet_material_is_terrain(const RID &p_material_
 	if (!material_storage) {
 		return false;
 	}
+	// Cohesive opt-in (preferred, general): a material joins the meshlet spine as terrain if it carries
+	// the dedicated `meshlet_terrain` marker uniform set true. One uniform + one set_shader_parameter is
+	// the whole contract - so terrain, water, and any future custom shader opt in the SAME way, instead
+	// of the engine hardcoding each project's distinctive uniform names (which is how this recognizer
+	// ended up bound to a single project's block-terrain shader and blind to every other).
+	Variant marker_v = material_storage->material_get_param(p_material_rid, "meshlet_terrain");
+	if (marker_v.get_type() == Variant::BOOL && bool(marker_v)) {
+		return true;
+	}
+	// Legacy fallback: the original block-terrain signature, so projects that predate the marker keep
+	// working untouched. New shaders should use the marker above, not add signatures here.
 	Variant albedo_array_v = material_storage->material_get_param(p_material_rid, "texture_albedo_array");
 	Variant block_mapping_v = material_storage->material_get_param(p_material_rid, "block_mapping");
 	return albedo_array_v.get_type() != Variant::NIL && block_mapping_v.get_type() != Variant::NIL;
@@ -2092,6 +2103,7 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 	meshlet_replace_default_active = false;
 	meshlet_terrain_scan_instance_transforms.clear();
 	meshlet_terrain_scan_ranges.clear();
+	meshlet_terrain_material = RID();
 
 	// B6 (rollout milestone): rendering/meshlet/enabled is the real per-project kill-switch
 	// (default true - meshlet replacement is the unconditional default for qualifying meshes once
@@ -2121,13 +2133,26 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 	// _meshlet_material_is_terrain) is diverted into the separate terrain scan stream instead of being
 	// rejected as a non-qualifying custom shader. Default off until the terrain draw pass ships - see
 	// the header note; collecting alone changes nothing visible (terrain stays on Forward+).
-	bool terrain_lod_enabled = replace_enabled && bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/terrain_lod"));
+	// Gated by PROJECT SETTINGS; the command-line flags are session overrides for A/B testing only, so
+	// a shipped project configures this the same way it configures the rest of the renderer.
+	// rendering/meshlet/terrain_draw implies terrain_lod - drawing the stream requires collecting it,
+	// and requiring both to be set would just be a way to get a silently-empty draw.
+	static const bool terrain_draw_flag = OS::get_singleton()->get_cmdline_args().find("--meshlet-terrain-draw") != nullptr;
+	const bool terrain_draw_enabled = terrain_draw_flag || bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/terrain_draw"));
+	bool terrain_lod_enabled = replace_enabled && (terrain_draw_enabled || bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/terrain_lod")));
 
 	// T2 verification instrumentation (only active with --meshlet-terrain-diag): breaks down why terrain
 	// is/isn't captured so a missing diag line is unambiguous - scanned meshes, how many carry the
 	// terrain shader signature, and how many of those lack a meshlet range (i.e. weren't meshletized).
 	static bool terrain_diag = OS::get_singleton()->get_cmdline_args().find("--meshlet-terrain-diag") != nullptr;
 	uint32_t diag_mesh_scanned = 0, diag_terrain_shaped = 0, diag_terrain_no_range = 0;
+
+	// T2.1 (spine step 1, first slice): --meshlet-terrain-draw (parsed above as terrain_draw_flag)
+	// pushes the collected terrain stream through the SAME meshlet cull->raster the standard stream
+	// uses, with a PLACEHOLDER material, to prove the plumbing end to end (terrain geometry culls +
+	// rasterizes via the meshlet spine and drops off Forward+). It renders flat + default-shaded on
+	// purpose - real terrain shading (heightmap displacement, splat/triplanar, tessellation) is the
+	// dedicated terrain variant built in T2.2+.
 
 	// Real per-frame instance/meshlet-range list, built from the real opaque render list - each
 	// element is one already-CPU-frustum-visible (instance, surface) pair (see
@@ -2205,12 +2230,20 @@ void RenderForwardClustered::_meshlet_scan_render_list(RenderDataRD *p_render_da
 		// stream is culled/drawn by the dedicated terrain shader variant; until that draw pass lands
 		// nothing consumes it and terrain keeps rendering via Forward+ (no skip_set insert here).
 		if (is_terrain_shaped) {
+			// Collect into the SEPARATE terrain stream, drawn by the meshlet TERRAIN variant (heightmap
+			// displacement now; splat/triplanar shading in later phases) - NOT the standard stream, whose
+			// flat PBR can't express terrain. All terrain chunks share one material, cached for the draw.
 			RendererRD::MeshletCuller::InstanceMeshletRange r;
 			r.instance_index = (uint32_t)meshlet_terrain_scan_instance_transforms.size();
 			r.meshlet_offset = range.offset;
 			r.meshlet_count = range.count;
 			meshlet_terrain_scan_instance_transforms.push_back(inst->transform);
 			meshlet_terrain_scan_ranges.push_back(r);
+			if (terrain_draw_enabled) {
+				// T2.2: the terrain variant draws it this frame, so drop it from Forward+ (no double-draw).
+				meshlet_replace_skip_set.insert(sdcache);
+				meshlet_terrain_material = surface_material_rid; // shared across chunks; last write wins.
+			}
 			continue;
 		}
 
@@ -2510,7 +2543,37 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	if (p_render_buffers.is_null() || !p_color_only_framebuffer.is_valid()) {
 		return;
 	}
-	if (meshlet_scan_ranges.is_empty()) {
+	// The terrain stream (meshlet_terrain_scan_ranges) is INDEPENDENT of the standard stream: terrain
+	// chunks are collected separately by the scan and, when --meshlet-terrain-draw is on, removed from
+	// Forward+ via meshlet_replace_skip_set because "the terrain variant draws it this frame". Bailing
+	// out here whenever the STANDARD stream was empty therefore dropped the terrain on the floor -
+	// Forward+ had already skipped it, and this pass returned long before the terrain draw at the end
+	// of the function, so nobody drew it. Symptom: terrain vanishing for whole stretches of a
+	// fly-through, exactly whenever no StandardMaterial3D/ORMMaterial3D mesh happened to be in frame
+	// (heading-dependent, not position-dependent), and immune to disabling frustum/cone/LOD/occlusion
+	// culling because every one of those lives *after* this line. Confirmed from a RenderDoc capture of
+	// a vanished frame: zero vkCmdDrawIndexedIndirectCount in the whole frame (this early return), and
+	// the terrain's 6144-index chunk draws present in the shadow cascades but absent from the colour
+	// pass (the skip_set). Only bail when BOTH streams are empty; from here on each stream's work is
+	// guarded by its own emptiness check so either can draw alone.
+	const bool has_standard = !meshlet_scan_ranges.is_empty();
+	// --meshlet-terrain-diag: state of both streams as the late pass ENTERS, printed on change. The scan
+	// clears and refills these per render list, so what the scan reported is not necessarily what this
+	// pass sees; without this probe an absent MESHLET_TERRAIN_DRAW line is ambiguous between "the draw
+	// ran and printed nothing" and "the stream was empty by the time we got here".
+	{
+		static const bool late_diag = OS::get_singleton()->get_cmdline_args().find("--meshlet-terrain-diag") != nullptr;
+		if (late_diag) {
+			static uint32_t last_late_key = 0xFFFFFFFFu;
+			uint32_t late_key = (uint32_t)meshlet_scan_ranges.size() ^ ((uint32_t)meshlet_terrain_scan_ranges.size() << 12) ^ (meshlet_terrain_material.is_valid() ? 1u << 24 : 0u);
+			if (late_key != last_late_key) {
+				last_late_key = late_key;
+				print_line(vformat("MESHLET_LATE_ENTER: standard_ranges=%d terrain_ranges=%d terrain_material_valid=%d",
+						(int)meshlet_scan_ranges.size(), (int)meshlet_terrain_scan_ranges.size(), (int)meshlet_terrain_material.is_valid()));
+			}
+		}
+	}
+	if (!has_standard && meshlet_terrain_scan_ranges.is_empty()) {
 		meshlet_hiz_history_valid = false;
 		return;
 	}
@@ -2550,11 +2613,28 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	Projection projection = p_render_data->scene_data->get_cam_projection();
 	Vector<Plane> planes = projection.get_projection_planes(camera_transform);
 
+	// Shared by both streams (and by the end-of-function Hi-Z rebuild), so these stay outside the
+	// standard-stream guard below.
+	Size2i screen_size = p_render_buffers->get_internal_size();
+	const StringName &write_hiz_name = meshlet_hiz_a_is_current ? RB_MESHLET_HIZ_B : RB_MESHLET_HIZ_A;
+	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_color_only_framebuffer);
+
+	// Standard-stream cull results. Declared here (default-constructed = invalid) so the render block
+	// further down can be guarded by has_standard without reordering the shared light/ambient/SVOGI
+	// setup that sits between the two.
+	RendererRD::MeshletCuller::CullResult frustum_result;
+	RendererRD::MeshletCuller::CullResult occlusion_result;
+	RendererRD::MeshletCuller::IndirectDrawResult draws;
+	RendererRD::HiZBuilder::HiZResult mid_hiz;
+	RID material_ids_buffer;
+	float sw_cluster_px = 0.0f;
+
+	if (has_standard) {
 	// Continuous-LOD cut projection scale (see the early pass for the derivation).
 	float lod_projection_scale = Math::abs((float)projection.columns[1].y) * (float)p_render_buffers->get_internal_size().y * 0.5f;
 	// P1: HW/SW raster split threshold (0 = off = today's hardware-only path; see _meshlet_sw_cluster_px()).
-	float sw_cluster_px = _meshlet_sw_cluster_px();
-	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY, lod_projection_scale, _meshlet_lod_threshold_px(), sw_cluster_px);
+	sw_cluster_px = _meshlet_sw_cluster_px();
+	frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_scan_ranges, planes, camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY, lod_projection_scale, _meshlet_lod_threshold_px(), sw_cluster_px);
 
 	// Occlude against a Hi-Z rebuilt from *this* frame's current real depth (whatever's in the
 	// depth buffer right now: real depth pre-pass output for non-meshlet instances, plus the early
@@ -2565,12 +2645,10 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	// Redundant re-draws of what the early pass already correctly drew are harmless (depth-test-
 	// discarded as ties, not wrong) - not worth an early-pass-diff skip-list unless profiling shows
 	// the redundant draws cost more than that bookkeeping would save.
-	Size2i screen_size = p_render_buffers->get_internal_size();
 	RID depth_tex = p_render_buffers->get_depth_texture(0);
-	const StringName &write_hiz_name = meshlet_hiz_a_is_current ? RB_MESHLET_HIZ_B : RB_MESHLET_HIZ_A;
-	RendererRD::HiZBuilder::HiZResult mid_hiz = hiz_builder->build_into(p_render_buffers, write_hiz_name, depth_tex, screen_size);
+	mid_hiz = hiz_builder->build_into(p_render_buffers, write_hiz_name, depth_tex, screen_size);
 
-	RendererRD::MeshletCuller::CullResult occlusion_result = meshlet_culler->occlude(transforms_buffer, frustum_result, mid_hiz.texture, mid_hiz.mip_count, camera_transform, projection, screen_size, MESHLET_LIVE_CAPACITY);
+	occlusion_result = meshlet_culler->occlude(transforms_buffer, frustum_result, mid_hiz.texture, mid_hiz.mip_count, camera_transform, projection, screen_size, MESHLET_LIVE_CAPACITY);
 
 	// --meshlet-lod-diag: flag-gated CLOD diagnostic (a GPU-readback stall, debug only). Shows the
 	// per-cluster LOD cut at work - instances= (scanned (instance,surface) ranges, including every
@@ -2592,10 +2670,10 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 		print_line(vformat("MESHLET_SWRASTER_DIAG: threshold_px=%.1f hw=%d sw=%d (total=%d)", sw_cluster_px, (int)hw_count, (int)sw_count, (int)(hw_count + sw_count)));
 	}
 
-	RendererRD::MeshletCuller::IndirectDrawResult draws = meshlet_culler->emit_indirect_draws(occlusion_result, MESHLET_LIVE_CAPACITY);
+	draws = meshlet_culler->emit_indirect_draws(occlusion_result, MESHLET_LIVE_CAPACITY);
 
-	RID material_ids_buffer = meshlet_scan_material_ids_buffer();
-	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_color_only_framebuffer);
+	material_ids_buffer = meshlet_scan_material_ids_buffer();
+	} // has_standard
 
 	// B3 (full per-fragment PBR milestone): real scene lights (directional + omni + spot, capped
 	// at MESHLET_MAX_LIGHTS, no spatial culling) - see _meshlet_collect_lights()'s comment for why
@@ -2610,6 +2688,31 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	float meshlet_sky_ambient_mix = 0.0f; // > 0 => blend in the sky radiance octmap over the flat color.
 	float meshlet_radiance_exposure = 1.0f;
 	float meshlet_max_roughness_lod = (float)(get_roughness_layers() - 1); // Roughest octmap layer = ambient.
+	// UV padding baked into the radiance octmap. vec3_to_oct_with_border() needs it to land inside the
+	// padded region; without it a normal-directed sample reads across the octahedron seam at the edges.
+	// Volumetric fog volume for the late pass. Same froxel texture Forward+ samples; without it every
+	// meshlet-drawn surface silently skips fog (see meshlet_apply_fog in meshlet_render.glsl).
+	RID meshlet_fog_texture;
+	Vector2 meshlet_fog_params(1.0f, 1.0f); // (inv_length, detail_spread)
+	if (p_render_buffers->has_custom_data(RB_SCOPE_FOG)) {
+		Ref<RendererRD::Fog::VolumetricFog> mfog = p_render_buffers->get_custom_data(RB_SCOPE_FOG);
+		if (mfog.is_valid() && mfog->fog_map.is_valid()) {
+			meshlet_fog_texture = mfog->fog_map;
+			meshlet_fog_params.x = (mfog->length > 0.0) ? (1.0 / mfog->length) : 1.0;
+			float spread = environment_get_volumetric_fog_detail_spread(p_render_data->environment);
+			meshlet_fog_params.y = (spread > 0.0) ? (1.0 / spread) : 1.0;
+		}
+	}
+	float meshlet_radiance_border = 0.0f;
+	{
+		RID border_env = p_render_data->environment;
+		if (border_env.is_valid()) {
+			RID sky_rid = environment_get_sky(border_env);
+			if (sky_rid.is_valid()) {
+				meshlet_radiance_border = sky.sky_get_uv_border_size(sky_rid);
+			}
+		}
+	}
 	// The meshlet shader declares the radiance binding as a texture2DArray, so only feed it a real
 	// radiance texture when the project actually uses array reflections (the default on desktop). On a
 	// non-array config the radiance is a plain 2D texture - binding it here would be a layout mismatch,
@@ -2669,7 +2772,11 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 		}
 	}
 
-	if (_meshlet_software_raster_enabled()) {
+	// Standard-stream draw. Skipped when nothing qualifying is in view; the terrain draw below is
+	// independent of it (see the has_standard comment at the top of this function).
+	if (!has_standard) {
+		// Nothing to render for the standard stream this frame.
+	} else if (_meshlet_software_raster_enabled()) {
 		// P5 debug path: visibility-buffer software rasterizer instead of the color render(). Rasterize
 		// the small (software) and large (hardware) clusters into one shared visbuffer, then a fragment
 		// resolve shades + composites color+depth into the scene framebuffer. Uses the same projection/
@@ -2737,7 +2844,15 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 		// p_clear=false: draws additively on top of the real opaque pass's already-resolved depth+
 		// color (and, if the early pass ran, its partial depth contribution too) - never true here,
 		// matching this pass's existing pre-restructuring behavior.
-		meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_sky_ambient_mix, meshlet_radiance_exposure, meshlet_max_roughness_lod);
+		meshlet_renderer->render(occlusion_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), screen_size), projection, camera_transform, lights_buffer, (uint32_t)lights.size(), false, false, meshlet_ambient_color, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy, meshlet_radiance_tex, meshlet_sky_ambient_mix, meshlet_radiance_exposure, meshlet_max_roughness_lod, meshlet_radiance_border, meshlet_fog_texture, meshlet_fog_params);
+	}
+
+	// T2.2: draw the terrain stream through the meshlet TERRAIN variant (heightmap vertex displacement),
+	// reusing this pass's camera/lights/ambient/SVOGI/radiance. Gated by --meshlet-terrain-draw (the scan
+	// only populates the terrain stream + caches the material when that flag is on), so this is a no-op
+	// otherwise. Runs after the standard color render so it composites onto the same depth+color.
+	if (!meshlet_terrain_scan_ranges.is_empty() && meshlet_terrain_material.is_valid()) {
+		_render_meshlet_terrain(p_render_data, p_render_buffers, p_color_only_framebuffer, projection, camera_transform, planes, screen_size, lights_buffer, (uint32_t)lights.size(), meshlet_ambient_color, meshlet_sky_ambient_mix, meshlet_radiance_tex, meshlet_radiance_exposure, meshlet_max_roughness_lod, meshlet_radiance_border, meshlet_fog_texture, meshlet_fog_params, svogi_octree_buffer, svogi_bounds_center, svogi_bounds_half_size, svogi_energy);
 	}
 
 	// S0c: page-feedback drain, now STALL-FREE. poll_pending_streams() applies whatever async feedback
@@ -2761,6 +2876,521 @@ void RenderForwardClustered::_render_meshlet_late_pass(RenderDataRD *p_render_da
 	hiz_builder->build_into(p_render_buffers, write_hiz_name, final_depth_tex, screen_size);
 	meshlet_hiz_a_is_current = !meshlet_hiz_a_is_current;
 	meshlet_hiz_history_valid = true;
+}
+
+RID RenderForwardClustered::meshlet_terrain_transforms_buffer() {
+	const Vector<Transform3D> &instance_transforms = meshlet_terrain_scan_instance_transforms;
+	LocalVector<float> transforms_data;
+	transforms_data.resize(instance_transforms.size() * 16);
+	for (int i = 0; i < instance_transforms.size(); i++) {
+		_meshlet_debug_transform_to_mat4_columns(instance_transforms[i], &transforms_data[i * 16]);
+	}
+	uint32_t needed_capacity = (uint32_t)instance_transforms.size();
+	if (needed_capacity > meshlet_terrain_transforms_capacity) {
+		if (meshlet_terrain_transforms_buffer_rid.is_valid()) {
+			RD::get_singleton()->free_rid(meshlet_terrain_transforms_buffer_rid);
+		}
+		meshlet_terrain_transforms_buffer_rid = RD::get_singleton()->storage_buffer_create(needed_capacity * 16 * sizeof(float));
+		meshlet_terrain_transforms_capacity = needed_capacity;
+	}
+	if (!transforms_data.is_empty()) {
+		RD::get_singleton()->buffer_update(meshlet_terrain_transforms_buffer_rid, 0, transforms_data.size() * sizeof(float), transforms_data.ptr());
+	}
+	return meshlet_terrain_transforms_buffer_rid;
+}
+
+RID RenderForwardClustered::meshlet_terrain_material_ids_buffer() {
+	// Placeholder per-instance material ids for the terrain stream: slot 0 (default) with bit 31 =
+	// owns-its-own-depth set (terrain is skipped from Forward+'s depth pre-pass, so the terrain variant
+	// writes its own depth - no bias needed). Real per-material terrain data comes with the shading phases.
+	uint32_t count = (uint32_t)meshlet_terrain_scan_instance_transforms.size();
+	if (count > meshlet_terrain_material_ids_capacity) {
+		if (meshlet_terrain_material_ids_buffer_rid.is_valid()) {
+			RD::get_singleton()->free_rid(meshlet_terrain_material_ids_buffer_rid);
+		}
+		meshlet_terrain_material_ids_buffer_rid = RD::get_singleton()->storage_buffer_create(count * sizeof(uint32_t));
+		meshlet_terrain_material_ids_capacity = count;
+	}
+	if (count > 0) {
+		LocalVector<uint32_t> ids;
+		ids.resize(count);
+		for (uint32_t i = 0; i < count; i++) {
+			ids[i] = 0u | 0x80000000u;
+		}
+		RD::get_singleton()->buffer_update(meshlet_terrain_material_ids_buffer_rid, 0, count * sizeof(uint32_t), ids.ptr());
+	}
+	return meshlet_terrain_material_ids_buffer_rid;
+}
+
+void RenderForwardClustered::_render_meshlet_terrain(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, RID p_color_only_framebuffer, const Projection &p_projection, const Transform3D &p_camera_transform, const Vector<Plane> &p_planes, const Size2i &p_screen_size, RID p_lights_buffer, uint32_t p_light_count, const Color &p_ambient_color, float p_sky_ambient_mix, RID p_radiance_tex, float p_radiance_exposure, float p_max_roughness_lod, float p_radiance_border, RID p_fog_texture, const Vector2 &p_fog_params, RID p_svogi_octree_buffer, const Vector3 &p_svogi_bounds_center, float p_svogi_bounds_half_size, float p_svogi_energy) {
+	RendererRD::MeshletCuller *meshlet_culler = RendererRD::MeshletCuller::get_singleton();
+	RendererRD::MeshletRenderer *meshlet_renderer = RendererRD::MeshletRenderer::get_singleton();
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+	if (!meshlet_culler || !meshlet_renderer || !material_storage || !texture_storage) {
+		return;
+	}
+
+	// Pull the terrain material's heightmap (vertex displacement), splat + per-material albedo maps
+	// (fragment splat blend), and the scalar params. Missing entries stay invalid -> the renderer pads
+	// with white and the shader falls back to sane defaults.
+	// p_srgb selects the texture's sRGB VIEW. It matters: terrain_viewer.gdshader declares the albedo
+	// maps `source_color` (sRGB, decoded to linear on sample) while splat/ORM/normal/macro maps carry
+	// raw linear data. Taking the default linear view for an sRGB albedo reads mid-tones ~2.4x too
+	// bright in linear space, which lands at ~1.4x after tonemapping - exactly the measured brightness
+	// gap between this path and the Forward+ baseline.
+	auto get_tex = [&](const StringName &p_name, bool p_srgb = false) -> RID {
+		Variant v = material_storage->material_get_param(meshlet_terrain_material, p_name);
+		return (v.get_type() == Variant::RID) ? texture_storage->texture_get_rd_texture((RID)v, p_srgb) : RID();
+	};
+	auto get_f = [&](const StringName &p_name, float p_default) -> float {
+		Variant v = material_storage->material_get_param(meshlet_terrain_material, p_name);
+		return (v.get_type() == Variant::FLOAT || v.get_type() == Variant::INT) ? (float)v : p_default;
+	};
+	RID heightmap_rd = get_tex("displacement_map");
+	// Order MUST match MeshletRenderer::TERRAIN_TEXTURE_SLOTS' documented layout and the v3 fragment's
+	// TERRAIN_TRI indices: splat0/1, then mat0..4 albedo, ORM, normal, then macro_variation.
+	Vector<RID> terrain_textures;
+	terrain_textures.push_back(get_tex("splat0"));
+	terrain_textures.push_back(get_tex("splat1"));
+	const char *terrain_map_suffix[3] = { "_albedo", "_orm", "_normal" };
+	for (int m = 0; m < 3; m++) {
+		const bool srgb = (m == 0); // albedo only - ORM and normal are raw linear data.
+		for (int i = 0; i < 5; i++) {
+			terrain_textures.push_back(get_tex(String("mat") + itos(i) + terrain_map_suffix[m], srgb));
+		}
+	}
+	terrain_textures.push_back(get_tex("macro_variation"));
+	// Detail height maps, read by the tessellation evaluation stage (slots 18..22).
+	for (int i = 0; i < 5; i++) {
+		terrain_textures.push_back(get_tex(String("mat") + itos(i) + "_height"));
+	}
+
+	Variant tiles_v = material_storage->material_get_param(meshlet_terrain_material, "tiles_0123");
+	Vector4 tiles = (tiles_v.get_type() == Variant::VECTOR4) ? (Vector4)tiles_v : Vector4(250.0, 120.0, 220.0, 120.0);
+	Vector<float> terrain_params;
+	terrain_params.push_back(get_f("terrain_size", 1024.0f));
+	terrain_params.push_back(get_f("height_min", 0.0f));
+	terrain_params.push_back(get_f("height_range", 1.0f));
+	terrain_params.push_back(get_f("height_scale", 1.0f));
+	terrain_params.push_back((float)tiles.x);
+	terrain_params.push_back((float)tiles.y);
+	terrain_params.push_back((float)tiles.z);
+	terrain_params.push_back((float)tiles.w);
+	terrain_params.push_back(get_f("tiles_4", 160.0f));
+
+	// tp_extra.y = terrain debug visualisation mode (0 = off; see meshlet_render.glsl's vertex stage
+	// for what each mode draws). Seeded from --meshlet-terrain-debug=N, then overridable live via
+	// ProjectSettings.set_setting("rendering/meshlet/terrain_debug", N) from GDScript, so modes can be
+	// cycled at a paused camera pose without restarting and losing the pose.
+	static int terrain_debug_mode = -1;
+	if (terrain_debug_mode < 0) {
+		terrain_debug_mode = 0;
+		for (const String &arg : OS::get_singleton()->get_cmdline_args()) {
+			if (arg.begins_with("--meshlet-terrain-debug=")) {
+				terrain_debug_mode = arg.get_slice("=", 1).to_int();
+			}
+		}
+	}
+	// The setting wins when set; the command-line value seeds it. Read uncached on purpose: this is
+	// meant to be flipped at runtime from GDScript to cycle modes at a paused pose.
+	int terrain_debug = terrain_debug_mode;
+	{
+		Variant v = ProjectSettings::get_singleton()->get("rendering/meshlet/terrain_debug");
+		if (v.get_type() == Variant::INT && (int)v != 0) {
+			terrain_debug = (int)v;
+		}
+	}
+	terrain_params.push_back((float)terrain_debug);
+	// tp_extra.z: splat weight below which a material is skipped entirely in the fragment (T2.3b).
+	// Same uniform, same default as terrain_viewer.gdshader, so the meshlet path drops the same
+	// materials the Forward+ path does and the two stay visually comparable.
+	terrain_params.push_back(get_f("detail_weight_cutoff", 0.02f));
+	// tp_extra.w + tp_mat: the T2.3c material scalars, same names/defaults as terrain_viewer.gdshader.
+	// water_level defaults far below any terrain so the shoreline term is inert when unset.
+	terrain_params.push_back(get_f("roughness_min", 0.6f));
+	terrain_params.push_back(get_f("normal_strength", 1.0f));
+	terrain_params.push_back(get_f("macro_variation_strength", 0.6f));
+	terrain_params.push_back(get_f("water_level", -1.0e30f));
+	terrain_params.push_back(get_f("shore_band", 1.0f));
+
+	// T2.3d de-tiling params. Both schemes default OFF (strength 0), so a terrain material that never
+	// set them renders exactly as it did before this slice.
+	auto get_v4 = [&](const StringName &p_name, const Vector4 &p_default) -> Vector4 {
+		Variant v = material_storage->material_get_param(meshlet_terrain_material, p_name);
+		return (v.get_type() == Variant::VECTOR4) ? (Vector4)v : p_default;
+	};
+	Vector4 var_str = get_v4("variant_strength_0123", Vector4(0, 0, 0, 0));
+	Vector4 var_scale = get_v4("variant_scale_0123", Vector4(0.012, 0.12, 0.02, 0.012));
+	Vector4 hex_str = get_v4("hex_strength_0123", Vector4(0, 0, 0, 0));
+	const Vector4 *packed[3] = { &var_str, &var_scale, &hex_str };
+	for (int b = 0; b < 3; b++) {
+		terrain_params.push_back((float)packed[b]->x);
+		terrain_params.push_back((float)packed[b]->y);
+		terrain_params.push_back((float)packed[b]->z);
+		terrain_params.push_back((float)packed[b]->w);
+	}
+	terrain_params.push_back(get_f("variant_strength_4", 0.0f));
+	terrain_params.push_back(get_f("variant_scale_4", 0.012f));
+	terrain_params.push_back(get_f("hex_strength_4", 0.0f));
+	terrain_params.push_back(get_f("variant_blend_width", 0.15f));
+	terrain_params.push_back(get_f("variant_rotation", 2.4f));
+	Variant voff_v = material_storage->material_get_param(meshlet_terrain_material, "variant_offset");
+	Vector3 voff = (voff_v.get_type() == Variant::VECTOR3) ? (Vector3)voff_v : Vector3(37.3, 23.1, 17.9);
+	terrain_params.push_back((float)voff.x);
+	terrain_params.push_back((float)voff.y);
+	terrain_params.push_back((float)voff.z);
+
+	// T2.4c detail displacement, same uniforms/defaults as terrain_viewer.gdshader. detail_depth
+	// defaults to 0 per material = "not displaced", so a terrain material that never set these is
+	// tessellated but geometrically unchanged.
+	// Fallbacks are the SHADER's declared defaults, not zero: material_get_param returns an empty
+	// Variant for a uniform the material never explicitly set, and defaulting those to 0 would
+	// silently disable displacement for exactly the materials that rely on the shader default.
+	Vector4 det = get_v4("detail_depth_0123", Vector4(0.5, 1.0, 1.0, 1.0));
+	terrain_params.push_back((float)det.x);
+	terrain_params.push_back((float)det.y);
+	terrain_params.push_back((float)det.z);
+	terrain_params.push_back((float)det.w);
+	terrain_params.push_back(get_f("detail_depth_4", 1.0f));
+	terrain_params.push_back(get_f("tessellation_distance", 600.0f));
+	terrain_params.push_back(get_f("tessellation_fade", 200.0f));
+	terrain_params.push_back(get_f("detail_mip_bias", 5.0f));
+
+	// One-shot dump of what actually got resolved off the terrain material. Every one of these feeds
+	// the vertex displacement or the splat blend, and a single wrong value (a zero terrain_size, a
+	// missing heightmap) flattens the whole terrain without any error being raised - material_get_param
+	// returns an empty Variant for a uniform the material never explicitly set, which silently takes
+	// the default branch of get_f/get_tex.
+	static bool terrain_param_dump = OS::get_singleton()->get_cmdline_args().find("--meshlet-terrain-lod-dump") != nullptr;
+	if (terrain_param_dump) {
+		terrain_param_dump = false;
+		print_line(vformat("MESHLET_TERRAIN_PARAMS: terrain_size=%f height_min=%f height_range=%f height_scale=%f heightmap_valid=%d",
+				terrain_params[0], terrain_params[1], terrain_params[2], terrain_params[3], (int)heightmap_rd.is_valid()));
+		print_line(vformat("  tiles=%.1f,%.1f,%.1f,%.1f,%.1f cutoff=%.3f roughness_min=%.3f normal_strength=%.3f macro_var=%.3f water_level=%.2f shore_band=%.2f",
+				terrain_params[4], terrain_params[5], terrain_params[6], terrain_params[7], terrain_params[8],
+				terrain_params[10], terrain_params[11], terrain_params[12], terrain_params[13], terrain_params[14], terrain_params[15]));
+		// The last unverified link in the displacement chain: the CONTENT of the texture bound at
+		// binding 19. Everything else feeding the vertex stage has been measured correct, so if this
+		// texture is 1x1, or the renderer's white padding stand-in, or otherwise constant, that alone
+		// flattens every chunk to one height while leaving all the diagnostics above looking healthy.
+		if (heightmap_rd.is_valid()) {
+			RD::TextureFormat tf = RD::get_singleton()->texture_get_format(heightmap_rd);
+			print_line(vformat("  heightmap: %dx%d fmt=%d mipmaps=%d layers=%d",
+					(int)tf.width, (int)tf.height, (int)tf.format, (int)tf.mipmaps, (int)tf.array_layers));
+			Vector<uint8_t> tex = RD::get_singleton()->texture_get_data(heightmap_rd, 0);
+			uint32_t px = tf.width * tf.height;
+			if (px > 0 && (uint32_t)tex.size() >= px) {
+				uint32_t bpp = (uint32_t)tex.size() / px;
+				const uint8_t *tp = tex.ptr();
+				// Min/max over a coarse stride, plus a short scanline: a constant texture shows up as
+				// min == max, and a real heightmap as a wide spread.
+				double lo = 1e30, hi = -1e30;
+				for (uint32_t y = 0; y < tf.height; y += 16) {
+					for (uint32_t x = 0; x < tf.width; x += 16) {
+						const uint8_t *t = tp + (uint64_t)(y * tf.width + x) * bpp;
+						double v = (bpp >= 4) ? (double)(*(const float *)t) : (double)t[0] / 255.0;
+						lo = MIN(lo, v);
+						hi = MAX(hi, v);
+					}
+				}
+				String scan;
+				for (uint32_t i = 0; i < 8; i++) {
+					uint32_t x = (tf.width / 8) * i;
+					const uint8_t *t = tp + (uint64_t)((tf.height / 2) * tf.width + x) * bpp;
+					double v = (bpp >= 4) ? (double)(*(const float *)t) : (double)t[0] / 255.0;
+					scan += vformat("%.3f ", v);
+				}
+				print_line(vformat("  heightmap bytes=%d bpp=%d value range [%.4f .. %.4f]  mid-row scan: %s",
+						(int)tex.size(), (int)bpp, lo, hi, scan));
+			}
+		}
+		// Every slot, not just the first few: an unresolved slot is padded WHITE by the renderer, which
+		// is not visually obvious but is far from neutral - a white macro_variation multiplies albedo by
+		// ~1.6, and a white ORM forces roughness and METALLIC to 1.
+		const char *names[18] = { "splat0", "splat1",
+			"mat0_albedo", "mat1_albedo", "mat2_albedo", "mat3_albedo", "mat4_albedo",
+			"mat0_orm", "mat1_orm", "mat2_orm", "mat3_orm", "mat4_orm",
+			"mat0_normal", "mat1_normal", "mat2_normal", "mat3_normal", "mat4_normal",
+			"macro_variation" };
+		String missing;
+		for (int i = 0; i < 18 && i < terrain_textures.size(); i++) {
+			if (!terrain_textures[i].is_valid()) {
+				missing += String(names[i]) + " ";
+			}
+		}
+		print_line(vformat("  terrain textures: %d/%d resolved; MISSING (white-padded): %s",
+				(int)terrain_textures.size() - (int)missing.split(" ", false).size(), (int)terrain_textures.size(),
+				missing.is_empty() ? String("none") : missing));
+	}
+
+	// T2.4a: --meshlet-terrain-tess routes the terrain draw through the patch pipeline (pass-through
+	// TCS/TES at level 1.0, so it must render identically until adaptive levels + detail displacement
+	// land). OFF by default - tessellation changes the pipeline topology, so it stays opt-in until it
+	// has been verified at parity, exactly how the Forward+ tessellation feature was staged.
+	static const bool terrain_tess_flag = OS::get_singleton()->get_cmdline_args().find("--meshlet-terrain-tess") != nullptr;
+	const bool terrain_tess = terrain_tess_flag || bool(GLOBAL_GET_CACHED(bool, "rendering/meshlet/terrain_tessellation"));
+
+	RID transforms_buffer = meshlet_terrain_transforms_buffer();
+	RID material_ids_buffer = meshlet_terrain_material_ids_buffer();
+
+	// Terrain meshlets carry FLAT (pre-displacement, y~0) baked bounds while the vertex stage lifts the
+	// surface across the whole height span, so a frustum test on the raw bounds wrongly culls terrain
+	// whose DISPLACED geometry is on screen - at some pitches all of it at once (the "terrain vanishes"
+	// bug). This used to be worked around by dilating every frustum plane by 1e9, which is simply
+	// "terrain is never frustum-culled": correct-looking, but it ships every scanned meshlet in the
+	// world to the rasteriser every frame.
+	// Instead, tell the cull shader how far a vertex can move and let it grow each bounding sphere by
+	// that much (see displaced_pad in meshlet_cull.glsl). The span is the largest |displaced Y| the
+	// vertex stage can produce: heights run [height_min, height_min + height_range] scaled by
+	// height_scale, and the baked bounds sit at y~0, so the sphere must reach whichever end is farther
+	// from zero. Conservative (a sphere cannot be padded in Y only) but FINITE, so real frustum culling
+	// comes back. The proper fix remains baking displaced bounds per meshlet - that would also let the
+	// cone test return, which no amount of sphere padding can rescue.
+	const float terr_h_lo = terrain_params[1] * terrain_params[3];
+	const float terr_h_hi = (terrain_params[1] + terrain_params[2]) * terrain_params[3];
+	const float terr_displace_pad = MAX(Math::abs(terr_h_lo), Math::abs(terr_h_hi));
+	const Vector<Plane> &terr_planes = p_planes;
+
+	// Frustum-cull the terrain stream against this frame's (dilated) camera frustum. No Hi-Z occlusion
+	// pass yet - the terrain variant just composites after the standard color render. LOD cut disabled
+	// for non-DAG terrain (all-zero LOD records -> leaf-only) as elsewhere.
+	// LOD cut FORCED OFF for terrain (projection_scale 0 => the shader keeps leaves only).
+	// The DAG's simplification error is measured on the UNDISPLACED source mesh - a perfectly FLAT plane -
+	// so simplifying it is nearly free and the recorded errors are real but minute. Measured on a terrain
+	// chunk: five levels at 0 / 0.0013 / 0.0018 / 0.0033 / 0.019 (object-space metres). Project those
+	// through the cut and every one of them lands far below the pixel threshold: at proj_scale ~422 px
+	// per unit at unit distance, a leaf's parent error of 0.0013 m at ~100 m is ~0.005 px against an 8 px
+	// threshold. The cut keeps a cluster only when its parent is too coarse (parent_px > threshold), so
+	// with every parent "acceptable" the test rejects every non-root and selects ONLY the 3 root clusters
+	// per chunk - the coarsest level, a handful of giant triangles displaced against the heightmap, which
+	// slice through the real surface as enormous flat facets with straight chunk-boundary edges.
+	// projection_scale 0 takes the shader's other branch (self_error != 0 -> reject), which selects the
+	// 22 LOD-0 leaves per chunk and is what terrain wants until the DAG is baked against the DISPLACED
+	// surface (the proper fix - see the T2 roadmap), at which point the errors become meaningful and the
+	// real cut can be turned on.
+	float lod_projection_scale = 0.0f;
+
+	// --meshlet-terrain-lod-dump: one-shot dump of the per-meshlet records the cull shader actually
+	// tests, plus the raw vertex data of one cluster, for the first terrain chunk in the stream (every
+	// chunk is the same source plane, so one is representative). MEASURED, not assumed: the terrain DAG
+	// has 5 real levels with distinct errors (0 / 0.0013 / 0.0018 / 0.0033 / 0.019), so the leaf filter
+	// above works exactly as intended and keeps 22 of 47 clusters - the flat plane does NOT collapse to
+	// zero error at every level, and coarse levels are NOT being drawn. Anything that still looks like
+	// giant facets is therefore coming from the vertex data or the vertex stage, which is what the
+	// second half of this dump reads. Runs once, before any draw, so no per-frame stall.
+	// Fires a few terrain frames in, not on the first: the camera has to have reached the --cam-pose
+	// (and the chunk streaming to have settled) before "nearest chunk" means anything. Kept low
+	// because a --pose-shot run only renders a couple of dozen frames before it saves and quits.
+	static bool terrain_lod_dump = OS::get_singleton()->get_cmdline_args().find("--meshlet-terrain-lod-dump") != nullptr;
+	static uint64_t terrain_lod_dump_first_ms = 0;
+	static int terrain_lod_dump_frames = 0;
+	bool terrain_dump_now = false;
+	if (terrain_lod_dump && !meshlet_terrain_scan_ranges.is_empty()) {
+		terrain_lod_dump_frames++;
+		uint64_t now = OS::get_singleton()->get_ticks_msec();
+		if (terrain_lod_dump_first_ms == 0) {
+			terrain_lod_dump_first_ms = now;
+		}
+		// Wall-clock, not a frame count: a --pose-shot run renders an unpredictable number of terrain
+		// frames (measured: fewer than 8 before it saves and quits), while the camera reaches the
+		// requested pose on a fixed ~3 s timer.
+		terrain_dump_now = (now - terrain_lod_dump_first_ms) >= 2500;
+	}
+	if (terrain_dump_now) {
+		terrain_lod_dump = false; // one shot
+		print_line(vformat("MESHLET_TERRAIN_LOD_DUMP: camera at (%.2f,%.2f,%.2f) after %d terrain frames",
+				p_camera_transform.origin.x, p_camera_transform.origin.y, p_camera_transform.origin.z, terrain_lod_dump_frames));
+		RendererRD::MeshletStorage *meshlet_storage = RendererRD::MeshletStorage::get_singleton();
+		// Pick the chunk NEAREST the camera, not scan_ranges[0] - the bug is a near-field one, and
+		// entry 0 is whatever the render list happened to emit first (measured: 2.3 km away, and
+		// perfectly healthy). Also list the closest few chunks' cluster counts: terrain chunks are
+		// swapped between mesh resolutions by the game's LOD manager, so a near chunk carrying far
+		// fewer clusters than a far one means this path is drawing a coarse chunk mesh up close.
+		int nearest_idx = 0;
+		float nearest_d2 = 1e30f;
+		Vector<Vector2> by_dist; // x = distance, y = meshlet_count, per instance.
+		for (int i = 0; i < meshlet_terrain_scan_ranges.size(); i++) {
+			int ii = (int)meshlet_terrain_scan_ranges[i].instance_index;
+			if (ii >= meshlet_terrain_scan_instance_transforms.size()) {
+				continue;
+			}
+			float d2 = (float)meshlet_terrain_scan_instance_transforms[ii].origin.distance_squared_to(p_camera_transform.origin);
+			by_dist.push_back(Vector2(Math::sqrt(d2), (float)meshlet_terrain_scan_ranges[i].meshlet_count));
+			if (d2 < nearest_d2) {
+				nearest_d2 = d2;
+				nearest_idx = i;
+			}
+		}
+		by_dist.sort();
+		String near_list;
+		for (int i = 0; i < MIN(8, by_dist.size()); i++) {
+			near_list += vformat("%.0fm:%dcl  ", by_dist[i].x, (int)by_dist[i].y);
+		}
+		print_line(vformat("MESHLET_TERRAIN_NEAR: closest chunks (dist:clusters) %s", near_list));
+		const RendererRD::MeshletCuller::InstanceMeshletRange &r = meshlet_terrain_scan_ranges[nearest_idx];
+		RID lod_buf = meshlet_storage ? meshlet_storage->get_meshlet_lod_buffer_rid() : RID();
+		RID desc_buf = meshlet_storage ? meshlet_storage->get_meshlet_descriptor_buffer_rid() : RID();
+		if (lod_buf.is_valid() && desc_buf.is_valid() && r.meshlet_count > 0) {
+			const uint32_t rec = 48; // sizeof(MeshletLODGPU) == sizeof(MeshletDescriptorGPU) == 48.
+			Vector<uint8_t> lod_bytes = RD::get_singleton()->buffer_get_data(lod_buf, r.meshlet_offset * rec, r.meshlet_count * rec);
+			Vector<uint8_t> desc_bytes = RD::get_singleton()->buffer_get_data(desc_buf, r.meshlet_offset * rec, r.meshlet_count * rec);
+			const float *lf = (const float *)lod_bytes.ptr();
+			const float *df = (const float *)desc_bytes.ptr();
+			const uint32_t *du = (const uint32_t *)desc_bytes.ptr();
+			uint32_t zero_err = 0, roots = 0, total_tris = 0;
+			print_line(vformat("MESHLET_TERRAIN_LOD_DUMP: instance=%d meshlet_offset=%d meshlet_count=%d",
+					(int)r.instance_index, (int)r.meshlet_offset, (int)r.meshlet_count));
+			for (uint32_t i = 0; i < r.meshlet_count; i++) {
+				float self_error = lf[i * 12 + 3];
+				float parent_error = lf[i * 12 + 7];
+				float self_radius = lf[i * 12 + 8];
+				float bounds_radius = df[i * 12 + 3];
+				uint32_t tri_count = du[i * 12 + 11];
+				uint32_t vtx_count = du[i * 12 + 10];
+				zero_err += (self_error == 0.0f) ? 1 : 0;
+				roots += (parent_error >= 1e30f) ? 1 : 0;
+				total_tris += tri_count;
+				print_line(vformat("  [%d] tris=%d verts=%d bounds_r=%.2f self_err=%.6f parent_err=%.6f self_r=%.2f",
+						(int)i, (int)tri_count, (int)vtx_count, bounds_radius, self_error, parent_error, self_radius));
+			}
+			print_line(vformat("MESHLET_TERRAIN_LOD_DUMP: total_tris=%d self_error==0 -> %d/%d kept by the leaf filter, roots=%d",
+					(int)total_tris, (int)zero_err, (int)r.meshlet_count, (int)roots));
+
+			// The vertex data for cluster 0, resolved exactly the way the vertex stage resolves it:
+			// remap[vertex_remap_offset + i] -> global vertex id -> vertex_positions[id]. Printing the
+			// object-space extent settles whether a cluster's geometry is the ~25 m patch its
+			// bounds_radius claims, or something degenerate/stretched. Paired with the instance
+			// transform, it also gives the world XZ the heightmap would be sampled at.
+			RID remap_buf = meshlet_storage->get_meshlet_vertex_buffer_rid();
+			RID pos_buf = meshlet_storage->get_vertex_position_buffer_rid();
+			uint32_t remap_off = du[8];
+			uint32_t vtx_count = du[10];
+			if (remap_buf.is_valid() && pos_buf.is_valid() && vtx_count > 0) {
+				Vector<uint8_t> remap_bytes = RD::get_singleton()->buffer_get_data(remap_buf, remap_off * sizeof(uint32_t), vtx_count * sizeof(uint32_t));
+				const uint32_t *remap = (const uint32_t *)remap_bytes.ptr();
+				Vector3 vmin(1e30f, 1e30f, 1e30f), vmax(-1e30f, -1e30f, -1e30f);
+				String first_few;
+				Vector<Vector3> vpos; // object-space positions, shared by the checks below.
+				for (uint32_t i = 0; i < vtx_count; i++) {
+					Vector<uint8_t> pos_bytes = RD::get_singleton()->buffer_get_data(pos_buf, remap[i] * 16, 16);
+					const float *p = (const float *)pos_bytes.ptr();
+					Vector3 v(p[0], p[1], p[2]);
+					vpos.push_back(v);
+					vmin = vmin.min(v);
+					vmax = vmax.max(v);
+					if (i < 6) {
+						first_few += vformat("(%.2f,%.2f,%.2f) ", v.x, v.y, v.z);
+					}
+				}
+				Transform3D xf = ((int)r.instance_index < meshlet_terrain_scan_instance_transforms.size()) ? meshlet_terrain_scan_instance_transforms[r.instance_index] : Transform3D();
+				print_line(vformat("MESHLET_TERRAIN_VTX: cluster0 verts=%d remap_off=%d obj_min=(%.2f,%.2f,%.2f) obj_max=(%.2f,%.2f,%.2f) span=(%.2f,%.2f,%.2f)",
+						(int)vtx_count, (int)remap_off, vmin.x, vmin.y, vmin.z, vmax.x, vmax.y, vmax.z,
+						vmax.x - vmin.x, vmax.y - vmin.y, vmax.z - vmin.z));
+				print_line(vformat("  first verts: %s", first_few));
+				print_line(vformat("  instance xf origin=(%.2f,%.2f,%.2f) basis_scale=(%.3f,%.3f,%.3f)",
+						xf.origin.x, xf.origin.y, xf.origin.z,
+						xf.basis.get_column(0).length(), xf.basis.get_column(1).length(), xf.basis.get_column(2).length()));
+				// Triangle CONNECTIVITY, resolved exactly as the vertex stage does it
+				// (fetch_triangle_local_vertex: byte-indexed into the packed triangle buffer, then
+				// through the same remap). Correct 4 m-grid clusters give edges of 4.0-5.7 m; scrambled
+				// indices give edges spanning the whole cluster, which is what a blurry, giant-triangle
+				// render looks like. This is the last link between "the vertices are right" (proven
+				// above) and "the picture is wrong".
+				RID tri_buf = meshlet_storage->get_meshlet_triangle_buffer_rid();
+				uint32_t tri_off = du[9];
+				uint32_t tri_count = du[11];
+				if (tri_buf.is_valid() && tri_count > 0) {
+					Vector<uint8_t> tri_bytes = RD::get_singleton()->buffer_get_data(tri_buf, tri_off, tri_count * 3);
+					float emin = 1e30f, emax = 0.0f;
+					double esum = 0.0;
+					int ecount = 0, oob = 0;
+					String first_tris;
+					for (uint32_t t = 0; t < tri_count; t++) {
+						uint32_t a = tri_bytes[t * 3 + 0], b = tri_bytes[t * 3 + 1], c = tri_bytes[t * 3 + 2];
+						if (a >= vtx_count || b >= vtx_count || c >= vtx_count) {
+							oob++;
+							continue;
+						}
+						if (t < 4) {
+							first_tris += vformat("(%d,%d,%d) ", (int)a, (int)b, (int)c);
+						}
+						const float el[3] = { (float)vpos[a].distance_to(vpos[b]), (float)vpos[b].distance_to(vpos[c]), (float)vpos[c].distance_to(vpos[a]) };
+						for (int k = 0; k < 3; k++) {
+							emin = MIN(emin, el[k]);
+							emax = MAX(emax, el[k]);
+							esum += el[k];
+							ecount++;
+						}
+					}
+					print_line(vformat("  triangles=%d tri_off=%d edge_len min=%.2f max=%.2f avg=%.2f out_of_range_idx=%d  first: %s",
+							(int)tri_count, (int)tri_off, emin, emax, ecount ? esum / ecount : 0.0, oob, first_tris));
+				}
+
+				// GROUND TRUTH: run the vertex stage's displacement on the CPU for this cluster's 64
+				// vertices, reading the same heightmap texels the shader samples. This is what the
+				// surface is SUPPOSED to look like. If the spread here is tens of metres while the
+				// render shows one flat facet, the shader is not doing this; if the spread is small,
+				// the render is right and the "flat slab" reading was wrong.
+				if (heightmap_rd.is_valid()) {
+					RD::TextureFormat htf = RD::get_singleton()->texture_get_format(heightmap_rd);
+					Vector<uint8_t> hdata = RD::get_singleton()->texture_get_data(heightmap_rd, 0);
+					uint32_t hpx = htf.width * htf.height;
+					if (hpx > 0 && (uint32_t)hdata.size() >= hpx * 4) {
+						const float *hf = (const float *)hdata.ptr();
+						float ymin = 1e30f, ymax = -1e30f;
+						String samples;
+						for (uint32_t i = 0; i < vtx_count; i++) {
+							Vector3 wp = xf.xform(vpos[i]);
+							float u = wp.x / terrain_params[0] + 0.5f;
+							float v = wp.z / terrain_params[0] + 0.5f;
+							int tx = CLAMP((int)(u * htf.width), 0, (int)htf.width - 1);
+							int ty = CLAMP((int)(v * htf.height), 0, (int)htf.height - 1);
+							float raw = hf[ty * htf.width + tx];
+							float y = raw * terrain_params[2] + terrain_params[1];
+							ymin = MIN(ymin, y);
+							ymax = MAX(ymax, y);
+							if (i < 6) {
+								samples += vformat("%.1f ", y);
+							}
+						}
+						print_line(vformat("  EXPECTED displaced Y across cluster0: min=%.2f max=%.2f spread=%.2f m  first: %s",
+								ymin, ymax, ymax - ymin, samples));
+					}
+				}
+
+				Vector3 wmin = xf.xform(vmin), wmax = xf.xform(vmax);
+				print_line(vformat("  world XZ range: x[%.1f..%.1f] z[%.1f..%.1f] -> heightmap uv x[%.4f..%.4f] z[%.4f..%.4f]",
+						wmin.x, wmax.x, wmin.z, wmax.z,
+						wmin.x / terrain_params[0] + 0.5, wmax.x / terrain_params[0] + 0.5,
+						wmin.z / terrain_params[0] + 0.5, wmax.z / terrain_params[0] + 0.5));
+			}
+		}
+	}
+	// A NEGATIVE p_sw_cluster_px marks a VERTEX-DISPLACED stream, encoded as -(pad + 1) so it carries
+	// the displacement span too: the cull shader grows each bounding sphere by that pad (making the
+	// frustum test valid on flat baked bounds) and skips the normal-cone test, whose baked flat-plane
+	// cones would otherwise reject every chunk near the camera. Negative also leaves the HW/SW raster
+	// split off, exactly as the 0.0 default did, so this costs no push-constant space.
+	RendererRD::MeshletCuller::CullResult frustum_result = meshlet_culler->cull(transforms_buffer, meshlet_terrain_scan_ranges, terr_planes, p_camera_transform.origin, MESHLET_LIVE_CAPACITY, MESHLET_LIVE_CAPACITY, lod_projection_scale, _meshlet_lod_threshold_px(), /*p_sw_cluster_px=*/-(terr_displace_pad + 1.0f));
+	RendererRD::MeshletCuller::IndirectDrawResult draws = meshlet_culler->emit_indirect_draws(frustum_result, MESHLET_LIVE_CAPACITY);
+
+	// --meshlet-terrain-diag: how many of the scanned terrain meshlets actually survive the GPU cull.
+	// Bisects "the cull dropped them" from "the draw failed to put them on screen" - a GPU readback
+	// stall, debug only.
+	static bool terrain_draw_diag = OS::get_singleton()->get_cmdline_args().find("--meshlet-terrain-diag") != nullptr;
+	if (terrain_draw_diag) {
+		uint32_t meshlets_in = 0;
+		for (int i = 0; i < meshlet_terrain_scan_ranges.size(); i++) {
+			meshlets_in += meshlet_terrain_scan_ranges[i].meshlet_count;
+		}
+		uint32_t visible = meshlet_culler->debug_read_visible_count(frustum_result.visible_buffer);
+		print_line(vformat("MESHLET_TERRAIN_DRAW: instances=%d meshlets_in=%d visible_after_cull=%d dropped=%d",
+				(int)meshlet_terrain_scan_ranges.size(), (int)meshlets_in, (int)visible, (int)(meshlets_in - visible)));
+	}
+
+	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_color_only_framebuffer);
+	meshlet_renderer->render(frustum_result, draws, transforms_buffer, material_ids_buffer, p_color_only_framebuffer, fb_format, Rect2i(Point2i(), p_screen_size), p_projection, p_camera_transform, p_lights_buffer, p_light_count, false, false, p_ambient_color, p_svogi_octree_buffer, p_svogi_bounds_center, p_svogi_bounds_half_size, p_svogi_energy, p_radiance_tex, p_sky_ambient_mix, p_radiance_exposure, p_max_roughness_lod, p_radiance_border, p_fog_texture, p_fog_params, /*p_terrain=*/true, heightmap_rd, terrain_textures, terrain_params, terrain_tess);
 }
 
 void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera) {

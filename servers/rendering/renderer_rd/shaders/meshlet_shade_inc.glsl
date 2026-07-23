@@ -17,6 +17,12 @@
 // currently FRAGMENT-STAGE ONLY. The material-resolve compute pass (P4) must supply analytic
 // triangle gradients instead - see the design doc (meshlet_software_raster_design.md).
 
+// Engine-shared octahedral mapping (vec3_to_oct_with_border), used by the sky-ambient lookup below.
+// Deliberately the SAME helper Forward+ and the sky bake use, so the meshlet path cannot drift into
+// its own convention. No include guards in this file, but nothing else that includes this one pulls
+// oct_inc.glsl in, so it resolves exactly once per shader.
+#include "oct_inc.glsl"
+
 // Material-texture sampling indirection. Default: a direct sample from the bound material_textures[]
 // descriptor array (identical to the code this replaced). The virtual-texturing render variant
 // (meshlet_render.glsl, MESHLET_USE_VIRTUAL_TEXTURES) #defines these BEFORE including this file to
@@ -260,7 +266,18 @@ vec4 meshlet_shade(uint material_id, vec3 world_normal_in, vec3 world_pos, vec2 
 	// Environment ambient (flat color, plus optional sky-radiance blend).
 	vec3 ambient = ambient_color.rgb;
 	if (ambient_color.a > 0.0) {
-		vec3 sky_ambient = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(0.5, 0.5, svogi_params.z), 0.0).rgb * svogi_params.y;
+		// Sky ambient, sampled in the direction of the surface NORMAL (diffuse irradiance) rather than
+		// from one fixed texel. This mirrors scene_forward_clustered.glsl's ambient_dir block, using the
+		// same shared vec3_to_oct_with_border() so the octahedral convention matches the sky bake
+		// exactly. The old fixed (0.5,0.5) fetch gave every surface the same colour regardless of
+		// orientation, so upward-facing geometry never picked up the blue of the sky - measured as a
+		// consistent blue deficit against Forward+.
+		// LIMITATION: Forward+ first maps the direction through radiance_inverse_xform (view -> sky
+		// space). Here the normal is already WORLD space, so this is exact whenever sky space == world
+		// space (an unrotated sky) and only drifts if the sky is rotated. The meshlet push constant is
+		// at the 128-byte Vulkan floor, so there is no room to pass that basis without restructuring.
+		vec2 sky_uv = vec3_to_oct_with_border(normalize(world_normal_in), vec2(svogi_params.w, 1.0 - svogi_params.w * 2.0));
+		vec3 sky_ambient = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(sky_uv, svogi_params.z), 0.0).rgb * svogi_params.y;
 		ambient = mix(ambient, sky_ambient, ambient_color.a);
 	}
 

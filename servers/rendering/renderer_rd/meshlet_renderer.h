@@ -49,6 +49,16 @@ namespace RendererRD {
 class MeshletRenderer {
 public:
 	static constexpr uint32_t MAX_TRIANGLES_PER_MESHLET = 124; // Matches Phase 2's meshlet cap.
+	// Size of the terrain variant's texture descriptor array (binding 22) - MUST equal the
+	// `terrain_textures[N]` declaration in meshlet_render.glsl. Layout: [0]=splat0, [1]=splat1,
+	// [2..6]=mat0..4 albedo, [7..11]=mat0..4 ORM, [12..16]=mat0..4 normal, [17]=macro_variation,
+	// [18..22]=mat0..4 height.
+	// Vulkan requires every declared element to be a valid binding, so unused slots are padded white.
+	static constexpr uint32_t TERRAIN_TEXTURE_SLOTS = 23;
+	// Float count of the terrain params UBO (binding 21) - MUST equal the TerrainParams block in
+	// meshlet_render.glsl: 9 vec4 = tp0, tp_tiles, tp_extra, tp_mat, tp_var_str, tp_var_scale,
+	// tp_hex, tp_var4, tp_var_rot, tp_det, tp_det2.
+	static constexpr uint32_t TERRAIN_PARAM_FLOATS = 44;
 
 private:
 	static MeshletRenderer *singleton;
@@ -63,6 +73,16 @@ private:
 			// textures through VirtualTextureStorage's page pool + indirection instead of the direct
 			// material_textures[] array. Selected when VirtualTextureStorage::is_enabled() and not
 			// depth-only; otherwise version 0 runs, byte-identical to a no-VT build.
+	RID terrain_tess_version; // SECOND ShaderRD version, tessellation ENABLED. Tess stages are a
+			// per-VERSION property, and all four variants share one version - so enabling tess on the
+			// main version would force patch topology on the standard/VT/depth-only draws too. A
+			// separate version confines it to the terrain variant.
+	RID terrain_tess_shader_rid; // Variant 3 of terrain_tess_version - the patch-pipeline terrain shader.
+	RD::FramebufferFormatID cached_terrain_tess_framebuffer_format = RD::INVALID_FORMAT_ID;
+	RID cached_terrain_tess_pipeline;
+	RID terrain_shader_rid; // Version 3 (MESHLET_TERRAIN): version-0 fragment + a vertex stage that
+			// displaces the flat terrain meshlet vertices by a heightmap (bindings 19 tex / 20 sampler /
+			// 21 params UBO). Selected via render()'s p_terrain flag for the terrain-spine draw (T2).
 
 	RD::VertexFormatID vertex_format = 0; // Empty - all attribute fetch is manual (vertex-pulling).
 	RID empty_vertex_array; // Zero attributes/buffers, but RD still requires *some* vertex array
@@ -88,8 +108,12 @@ private:
 	RID cached_depth_only_pipeline;
 	RD::FramebufferFormatID cached_vt_framebuffer_format = RD::INVALID_FORMAT_ID;
 	RID cached_vt_pipeline; // VT color variant (version 2).
+	RD::FramebufferFormatID cached_terrain_framebuffer_format = RD::INVALID_FORMAT_ID;
+	RID cached_terrain_pipeline; // Terrain displacement variant (version 3).
+	RID terrain_params_ubo; // 1x vec4 (terrain_size, height_min, height_range, height_scale); updated per terrain draw.
+	RID fog_params_ubo; // 2x vec4 (inv_length, detail_spread, viewport wh | camera forward, enabled).
 
-	void _ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only, bool p_virtual_textures);
+	void _ensure_pipeline(RD::FramebufferFormatID p_framebuffer_format, bool p_depth_only, bool p_virtual_textures, bool p_terrain = false, bool p_tessellated = false);
 
 public:
 	static MeshletRenderer *get_singleton();
@@ -128,7 +152,7 @@ public:
 	// source (the flat ambient_light_color is near-black there). p_radiance_texture must be a valid
 	// texture2DArray when p_depth_only is false; pass an invalid RID (a black fallback is bound) when
 	// there's no sky, and leave p_sky_ambient_mix at 0. All ignored when p_depth_only is true.
-	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear = true, bool p_depth_only = false, const Color &p_ambient_color = Color(0, 0, 0, 0), RID p_svogi_octree_buffer = RID(), const Vector3 &p_svogi_bounds_center = Vector3(), float p_svogi_bounds_half_size = 0.0f, float p_svogi_energy = 1.0f, RID p_radiance_texture = RID(), float p_sky_ambient_mix = 0.0f, float p_radiance_exposure = 1.0f, float p_max_roughness_lod = 0.0f);
+	void render(const MeshletCuller::CullResult &p_visible, const MeshletCuller::IndirectDrawResult &p_draws, RID p_transforms_buffer, RID p_material_ids_buffer, RID p_framebuffer, RD::FramebufferFormatID p_framebuffer_format, const Rect2i &p_viewport, const Projection &p_projection, const Transform3D &p_camera_transform, RID p_lights_buffer, uint32_t p_light_count, bool p_clear = true, bool p_depth_only = false, const Color &p_ambient_color = Color(0, 0, 0, 0), RID p_svogi_octree_buffer = RID(), const Vector3 &p_svogi_bounds_center = Vector3(), float p_svogi_bounds_half_size = 0.0f, float p_svogi_energy = 1.0f, RID p_radiance_texture = RID(), float p_sky_ambient_mix = 0.0f, float p_radiance_exposure = 1.0f, float p_max_roughness_lod = 0.0f, float p_radiance_border = 0.0f, RID p_fog_texture = RID(), const Vector2 &p_fog_params = Vector2(), bool p_terrain = false, RID p_terrain_heightmap = RID(), const Vector<RID> &p_terrain_textures = Vector<RID>(), const Vector<float> &p_terrain_params = Vector<float>(), bool p_terrain_tess = false);
 
 	MeshletRenderer();
 	~MeshletRenderer();
