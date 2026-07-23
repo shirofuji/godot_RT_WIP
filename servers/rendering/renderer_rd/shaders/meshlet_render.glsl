@@ -165,20 +165,6 @@ void main() {
 	int terr_dbg = int(terrain_params.tp_extra.y + 0.5);
 	if (terr_dbg == 10) {
 		terr_h = 30.0 * sin(world_pos.x * 0.1) + 30.0 * sin(world_pos.z * 0.1);
-	} else if (terr_dbg == 15) {
-		// Amplify whatever the real fetch returns about its own local mean. Any variation at all, however
-		// small, becomes visible relief; a dead-flat result means the fetch is genuinely returning one
-		// value regardless of UV. Distinguishes "the sample is constant" from "the sample varies but is
-		// being scaled to nothing".
-		float raw = textureLod(sampler2D(terrain_heightmap, terrain_hm_sampler), terr_uv, 0.0).r;
-		terr_h = (raw - 0.8) * 2000.0;
-	} else if (terr_dbg == 11) {
-		// Same heightmap, fetched WITHOUT the sampler's filtering (texelFetch ignores sampler state).
-		// If the relief comes back, the texture and the UV are fine and the filtered fetch is what
-		// fails - e.g. a format the device can't linearly filter, whose result is then undefined.
-		ivec2 hsz = textureSize(sampler2D(terrain_heightmap, terrain_hm_sampler), 0);
-		ivec2 tc = clamp(ivec2(terr_uv * vec2(hsz)), ivec2(0), hsz - 1);
-		terr_h = texelFetch(sampler2D(terrain_heightmap, terrain_hm_sampler), tc, 0).r * terrain_params.tp0.z + terrain_params.tp0.y;
 	}
 	world_pos.y += terr_h * terrain_params.tp0.w;
 #endif
@@ -242,99 +228,73 @@ void main() {
 	float terr_hU = textureLod(sampler2D(terrain_heightmap, terrain_hm_sampler), terr_uv + vec2(0.0, terr_tx), 0.0).r * terrain_params.tp0.z;
 	world_normal = normalize(vec3(terr_hL - terr_hR, 2.0, terr_hD - terr_hU));
 
-	// --- Terrain debug visualisation (terrain_params.tp_extra.y; 0 = off, set by
-	// --meshlet-terrain-debug=N). Each mode isolates one link of the chain that turns a flat baked
-	// plane into displaced, shaded terrain, so a screenshot localizes the failure instead of a theory:
-	//   1 cluster id      - per-meshlet hash. Shows the actual cluster mosaic: if a near "slab" is one
-	//                       flat colour spanning a whole chunk, coarse DAG levels are being drawn.
-	//   2 cluster radius  - baked bounds_radius ramp (blue = tight/LOD0 -> red = coarse). Direct read
-	//                       of which LOD level each pixel came from, independent of the hash's noise.
-	//   3 displaced height- the heightmap value actually applied at this vertex, normalised. Flat grey
-	//                       over a chunk = the displacement is not varying (bad sample / bad UV).
-	//   4 heightmap UV    - rg = fract(uv). Catches out-of-range / wrapped / mis-scaled sampling.
-	//   5 instance id     - per-chunk hash, to line the above up with chunk boundaries.
+	// --- Terrain debug probes (terrain_params.tp_extra.y; 0 = off). Set via
+	// --meshlet-terrain-debug=N or ProjectSettings "rendering/meshlet/terrain_debug".
+	//
+	// Each probe isolates ONE link of the chain that turns a flat baked plane into displaced, shaded
+	// terrain, so a capture localizes a failure instead of a theory. Sample the resulting PNG
+	// numerically - never judge one by eye.
+	//
+	// DESIGN RULE, learned the hard way: a probe must be QUANTISED INTO SATURATED PRIMARIES. The debug
+	// colour is written pre-tonemap, and the tonemapper compresses a smooth 0..1 ramp into a narrow
+	// bright band that reads as "constant". Every ramp-valued probe this path once had (cluster radius,
+	// height, UV, UBO readback) produced a confident wrong answer at least once and has been removed;
+	// the numbering below is deliberately non-contiguous because of it. Likewise a probe must be able
+	// to DISTINGUISH the thing it claims to measure - visualising gl_TessCoord to read tessellation
+	// level was removed for that reason (it is continuous across a patch, so it looks the same at any
+	// level; mode 22 reads gl_TessLevelInner directly instead).
+	//
+	//   GEOMETRY / CLUSTERING
+	//    1 cluster id        per-meshlet hash - the cluster mosaic
+	//    5 instance id       per-chunk hash, to line probes up with chunk boundaries
+	//    6 base position     UNDISPLACED world xz in 128 m bands - separates "vertices are wrong" from
+	//                        "the heightmap lookup is wrong"
+	//   HEIGHTMAP PLUMBING
+	//   13 bound texture     is the real displacement map bound? red 1x1 stand-in / green 1024 / blue other
+	//   14 terrain_size      quantised, as the GPU sees it (a huge value collapses UV to a constant)
+	//   16 UV response       does the fetch respond to UV at all? two fixed far-apart UVs compared
+	//   12 raw fetch         quantised heightmap value; all-white means the white stand-in is bound
+	//   17 UV bands          terr_uv in cycling bands - does UV vary at the scale that matters?
+	//   18 height bands      terr_h in 5 m bands - does the displacement vary as the CPU dump says?
+	//   GEOMETRY OVERRIDES (these change the surface, and shade normally)
+	//   10 procedural        replaces the heightmap with a sine egg-carton of known amplitude: proves
+	//                        whether displacement reaches the rasteriser at all
+	//   SHADING (fragment stage)
+	//   19 no normal map     geometric normal only
+	//   20 unlit albedo      the albedo blend on its own
+	//   22 tess level        gl_TessLevelInner, quantised (red 1 / green 2 / blue 3 / white >=4)
+	//
+	// -1 marks "no probe wrote a colour", so the fragment stage knows to shade normally. Interpolation
+	// preserves it, and every real probe writes >= 0.
 	int dbg_mode = int(terrain_params.tp_extra.y + 0.5);
-	debug_color_interp = vec3(0.0);
+	debug_color_interp = vec3(-1.0);
 	if (dbg_mode == 1) {
 		uint h = item.meshlet_index * 2654435761u;
 		debug_color_interp = vec3(float((h >> 16) & 255u), float((h >> 8) & 255u), float(h & 255u)) / 255.0;
-	} else if (dbg_mode == 2) {
-		// Object-space radius; terrain chunks are unscaled, so metres. 0..64 m covers LOD0 (a few m)
-		// through the coarsest cluster of a 128 m chunk.
-		float t = clamp(d.bounds_radius / 64.0, 0.0, 1.0);
-		debug_color_interp = vec3(t, 1.0 - abs(t * 2.0 - 1.0), 1.0 - t);
-	} else if (dbg_mode == 3) {
-		float t = clamp(terr_h / max(terrain_params.tp0.z, 1e-6), 0.0, 1.0);
-		debug_color_interp = vec3(t);
-	} else if (dbg_mode == 4) {
-		debug_color_interp = vec3(fract(terr_uv), 0.0);
 	} else if (dbg_mode == 5) {
 		uint h = item.instance_index * 2246822519u;
 		debug_color_interp = vec3(float((h >> 16) & 255u), float((h >> 8) & 255u), float(h & 255u)) / 255.0;
 	} else if (dbg_mode == 6) {
-		// UNDISPLACED world position, 128 m bands. Separates "the vertices are wrong" from "the
-		// heightmap lookup is wrong": if this is constant too, the failure is upstream of the terrain
-		// code entirely (transform / vertex fetch); if it varies normally, only the sampling is broken.
 		debug_color_interp = vec3(fract(terr_base_pos.xz / 128.0), 0.0);
-	} else if (dbg_mode == 8) {
-		// Contour bands on the height this vertex actually got: 5 m bands in red, 25 m in green. Bands
-		// are high-contrast edges, so they survive tonemapping - the smooth ramps of modes 2/3 did not,
-		// and reading them as "constant" was a mistake. Many bands = real relief; one flat field = the
-		// displacement is constant and the flatness is in the sample, not the geometry.
-		debug_color_interp = vec3(fract(terr_h / 5.0), fract(terr_h / 25.0), 0.0);
-	} else if (dbg_mode == 9) {
-		// Same, but on the RAW texture sample (0..1), 0.05 bands - isolates the texture fetch from the
-		// height_min/height_range scaling applied to it.
+	} else if (dbg_mode == 12) {
 		float raw = textureLod(sampler2D(terrain_heightmap, terrain_hm_sampler), terr_uv, 0.0).r;
-		debug_color_interp = vec3(fract(raw / 0.05), fract(raw), 0.0);
-	} else if (dbg_mode == 18) {
-		// terr_h in saturated 5 m bands. This is mode 8 redone properly: mode 8 used fract() RAMPS,
-		// which the tonemapper compressed into a narrow bright range that read as "constant" and led me
-		// to the wrong conclusion. Bands of pure primaries cannot be washed out. The near cluster's
-		// height is known from the CPU dump to span 23.67 m, so a correct render must show ~5 bands.
-		int band = int(mod(floor(terr_h / 5.0), 3.0));
-		debug_color_interp = (band == 0) ? vec3(1.0, 0.0, 0.0) : ((band == 1) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
-	} else if (dbg_mode == 17) {
-		// terr_uv itself, in saturated cycling bands (one cycle per 0.01 uv = ~41 m of world). Stripes
-		// mean the UV varies at the scale that matters; a flat field means it does not. Saturated
-		// primaries, because the smooth ramp of mode 4 was unreadable through the tonemapper.
-		int band = int(fract(terr_uv.x * 100.0) * 3.0);
-		debug_color_interp = (band == 0) ? vec3(1.0, 0.0, 0.0) : ((band == 1) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
+		debug_color_interp = (raw < 0.25) ? vec3(0.0, 0.0, 1.0) : ((raw < 0.5) ? vec3(0.0, 1.0, 0.0) : ((raw < 0.75) ? vec3(1.0, 0.0, 0.0) : vec3(1.0)));
+	} else if (dbg_mode == 13) {
+		ivec2 hsz = textureSize(sampler2D(terrain_heightmap, terrain_hm_sampler), 0);
+		debug_color_interp = (hsz.x <= 1) ? vec3(1.0, 0.0, 0.0) : ((hsz.x == 1024) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
+	} else if (dbg_mode == 14) {
+		float ts = terrain_params.tp0.x;
+		debug_color_interp = (ts != ts) ? vec3(1.0, 0.0, 1.0) : ((ts < 2048.0) ? vec3(1.0, 0.0, 0.0) : ((ts <= 8192.0) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0)));
 	} else if (dbg_mode == 16) {
-		// The crux: sample binding 19 at two FIXED, far-apart UVs that have nothing to do with this
-		// vertex. green = the two differ (the texture read works, so a constant result must mean a
-		// constant terr_uv), red = identical (the read itself is degenerate and ignores UV). Removes
-		// the geometry from the question entirely.
 		float a = textureLod(sampler2D(terrain_heightmap, terrain_hm_sampler), vec2(0.2, 0.2), 0.0).r;
 		float b = textureLod(sampler2D(terrain_heightmap, terrain_hm_sampler), vec2(0.8, 0.8), 0.0).r;
 		debug_color_interp = (abs(a - b) > 0.02) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-	} else if (dbg_mode == 14) {
-		// Quantised terrain_size (tp0.x) as the GPU sees it. Mode 7 encoded it as a ramp CLAMPED at
-		// 2048, so it could not tell 4096 from a garbage value - and a huge terrain_size collapses
-		// terr_uv to a constant, which is exactly the measured symptom (constant height over terrain
-		// whose world position provably varies). red <2048, green 2048..8192 (the expected 4096),
-		// blue >8192 i.e. garbage, magenta if non-finite.
-		float ts = terrain_params.tp0.x;
-		debug_color_interp = (ts != ts) ? vec3(1.0, 0.0, 1.0) : ((ts < 2048.0) ? vec3(1.0, 0.0, 0.0) : ((ts <= 8192.0) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0)));
-	} else if (dbg_mode == 13) {
-		// Identify the texture actually bound at binding 19 by its dimensions: red = 1x1 (the renderer's
-		// default white stand-in), green = 1024x1024 (the real displacement map), blue = anything else.
-		// Settles "is the fetch reading the heightmap at all" without depending on its contents.
-		ivec2 hsz = textureSize(sampler2D(terrain_heightmap, terrain_hm_sampler), 0);
-		debug_color_interp = (hsz.x <= 1) ? vec3(1.0, 0.0, 0.0) : ((hsz.x == 1024) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
-	} else if (dbg_mode == 12) {
-		// Quantised readout of the RAW heightmap fetch, in saturated primaries so tonemapping cannot
-		// blur the distinction (the smooth ramps of modes 2/3 were unreadable for exactly that reason).
-		// blue <0.25, green <0.5, red <0.75, white >=0.75. An all-white terrain means the fetch is
-		// returning ~1.0, i.e. the renderer's default white stand-in rather than the heightmap.
-		float raw = textureLod(sampler2D(terrain_heightmap, terrain_hm_sampler), terr_uv, 0.0).r;
-		debug_color_interp = (raw < 0.25) ? vec3(0.0, 0.0, 1.0) : ((raw < 0.5) ? vec3(0.0, 1.0, 0.0) : ((raw < 0.75) ? vec3(1.0, 0.0, 0.0) : vec3(1.0)));
-	} else if (dbg_mode == 7) {
-		// Read the TerrainParams UBO back through the framebuffer, to catch a CPU->GPU upload that
-		// silently delivered zeros/garbage: r = terrain_size/2048, g = height_range/512, b = height_scale/2.
-		debug_color_interp = vec3(clamp(terrain_params.tp0.x / 2048.0, 0.0, 1.0),
-				clamp(terrain_params.tp0.z / 512.0, 0.0, 1.0),
-				clamp(terrain_params.tp0.w / 2.0, 0.0, 1.0));
+	} else if (dbg_mode == 17) {
+		int band = int(fract(terr_uv.x * 100.0) * 3.0);
+		debug_color_interp = (band == 0) ? vec3(1.0, 0.0, 0.0) : ((band == 1) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
+	} else if (dbg_mode == 18) {
+		int band = int(mod(floor(terr_h / 5.0), 3.0));
+		debug_color_interp = (band == 0) ? vec3(1.0, 0.0, 0.0) : ((band == 1) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
 	}
 #endif
 
@@ -787,9 +747,10 @@ void main() {
 	// screen is exactly the value being probed, with no lighting or GI folded in.
 	// Modes 1-9 are colour probes and short-circuit shading; modes 10+ change geometry instead and must
 	// render normally so the surface shape is what's being read.
-	// Vertex-stage colour probes: 1-9 and 12-18. 10/11/15 alter geometry and 19/20 are fragment-stage
-	// probes handled below, so all of those must fall through to real shading.
-	if ((terrain_params.tp_extra.y >= 0.5 && terrain_params.tp_extra.y < 9.5) || (terrain_params.tp_extra.y > 11.5 && terrain_params.tp_extra.y < 18.5) || terrain_params.tp_extra.y > 20.5) {
+	// A vertex/eval-stage probe wrote a colour (>= 0); blit it unlit so what is on screen is exactly
+	// the value being probed. -1 means no probe matched, so shade normally - that also covers the
+	// geometry-override modes, which change the surface and are meant to be shaded.
+	if (terrain_params.tp_extra.y >= 0.5 && debug_color_interp.r >= 0.0) {
 		frag_color = vec4(debug_color_interp, 1.0);
 		return;
 	}
@@ -1275,11 +1236,10 @@ void main() {
 	// patch renders as a SMOOTHER gradient, not as discrete cells, and looks essentially identical at
 	// level 1 and level 4. Read the level with mode 22 instead; I misread this view as "no
 	// subdivision" once already.
-	if (int(terrain_params.tp_extra.y + 0.5) == 21) {
-		debug_color_interp = gl_TessCoord;
-	} else if (int(terrain_params.tp_extra.y + 0.5) == 22) {
-		// Read the level the control stage actually chose, quantised into saturated bands so it can
-		// be sampled from a capture: level 1 = red, 2 = green, 3 = blue, >=4 = white.
+	// Mode 22: the level the control stage actually chose, quantised (red 1 / green 2 / blue 3 /
+	// white >=4). Read from gl_TessLevelInner directly - visualising gl_TessCoord CANNOT show this,
+	// because it is continuous across the patch and so looks identical at every level.
+	if (int(terrain_params.tp_extra.y + 0.5) == 22) {
 		float lvl = gl_TessLevelInner[0];
 		debug_color_interp = (lvl < 1.5) ? vec3(1.0, 0.0, 0.0) : ((lvl < 2.5) ? vec3(0.0, 1.0, 0.0) : ((lvl < 3.5) ? vec3(0.0, 0.0, 1.0) : vec3(1.0)));
 	}
