@@ -41,6 +41,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
+#include "servers/rendering/renderer_rd/meshlet_terrain_contract.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
@@ -2939,50 +2940,71 @@ void RenderForwardClustered::_render_meshlet_terrain(RenderDataRD *p_render_data
 	// raw linear data. Taking the default linear view for an sRGB albedo reads mid-tones ~2.4x too
 	// bright in linear space, which lands at ~1.4x after tonemapping - exactly the measured brightness
 	// gap between this path and the Forward+ baseline.
-	auto get_tex = [&](const StringName &p_name, bool p_srgb = false) -> RID {
+	// Everything read off the terrain material comes from ONE table - see
+	// meshlet_terrain_contract.h, which also documents what a shader must declare to join this path.
+	// Walking the table instead of hand-writing a call per uniform is what keeps the C++, the params
+	// UBO layout and the shader's slot indices from drifting apart.
+	namespace Contract = RendererRD::MeshletTerrainContract;
+
+	auto get_tex = [&](const StringName &p_name, bool p_srgb) -> RID {
 		Variant v = material_storage->material_get_param(meshlet_terrain_material, p_name);
 		return (v.get_type() == Variant::RID) ? texture_storage->texture_get_rd_texture((RID)v, p_srgb) : RID();
 	};
-	auto get_f = [&](const StringName &p_name, float p_default) -> float {
-		Variant v = material_storage->material_get_param(meshlet_terrain_material, p_name);
-		return (v.get_type() == Variant::FLOAT || v.get_type() == Variant::INT) ? (float)v : p_default;
-	};
-	RID heightmap_rd = get_tex("displacement_map");
-	// Order MUST match MeshletRenderer::TERRAIN_TEXTURE_SLOTS' documented layout and the v3 fragment's
-	// TERRAIN_TRI indices: splat0/1, then mat0..4 albedo, ORM, normal, then macro_variation.
+
+	RID heightmap_rd = get_tex(Contract::heightmap_uniform(), false);
+
 	Vector<RID> terrain_textures;
-	terrain_textures.push_back(get_tex("splat0"));
-	terrain_textures.push_back(get_tex("splat1"));
-	const char *terrain_map_suffix[3] = { "_albedo", "_orm", "_normal" };
-	for (int m = 0; m < 3; m++) {
-		const bool srgb = (m == 0); // albedo only - ORM and normal are raw linear data.
-		for (int i = 0; i < 5; i++) {
-			terrain_textures.push_back(get_tex(String("mat") + itos(i) + terrain_map_suffix[m], srgb));
+	terrain_textures.resize(Contract::SLOT_COUNT);
+	for (uint32_t i = 0; i < Contract::SLOT_COUNT; i++) {
+		const Contract::TextureEntry &e = Contract::TEXTURES[i];
+		terrain_textures.write[i] = get_tex(StringName(e.name), e.srgb);
+	}
+
+	// Seed every slot with its contract default, then overwrite whatever the material actually
+	// declares. Doing it in that order means an undeclared uniform lands on the reference shader's
+	// default rather than on zero - material_get_param cannot tell "unset" from "set to zero".
+	Vector<float> terrain_params;
+	terrain_params.resize(Contract::PARAM_FLOAT_COUNT);
+	for (int i = 0; i < terrain_params.size(); i++) {
+		terrain_params.write[i] = 0.0f;
+	}
+	for (uint32_t i = 0; i < Contract::PARAM_COUNT; i++) {
+		const Contract::ParamEntry &e = Contract::PARAMS[i];
+		const int n = (e.kind == Contract::PARAM_VEC4) ? 4 : ((e.kind == Contract::PARAM_VEC3) ? 3 : 1);
+		for (int c = 0; c < n; c++) {
+			terrain_params.write[e.index + c] = e.def[c];
+		}
+		Variant v = material_storage->material_get_param(meshlet_terrain_material, StringName(e.name));
+		switch (e.kind) {
+			case Contract::PARAM_FLOAT: {
+				if (v.get_type() == Variant::FLOAT || v.get_type() == Variant::INT) {
+					terrain_params.write[e.index] = (float)v;
+				}
+			} break;
+			case Contract::PARAM_VEC3: {
+				if (v.get_type() == Variant::VECTOR3) {
+					Vector3 val = (Vector3)v;
+					terrain_params.write[e.index + 0] = (float)val.x;
+					terrain_params.write[e.index + 1] = (float)val.y;
+					terrain_params.write[e.index + 2] = (float)val.z;
+				}
+			} break;
+			case Contract::PARAM_VEC4: {
+				if (v.get_type() == Variant::VECTOR4) {
+					Vector4 val = (Vector4)v;
+					terrain_params.write[e.index + 0] = (float)val.x;
+					terrain_params.write[e.index + 1] = (float)val.y;
+					terrain_params.write[e.index + 2] = (float)val.z;
+					terrain_params.write[e.index + 3] = (float)val.w;
+				}
+			} break;
 		}
 	}
-	terrain_textures.push_back(get_tex("macro_variation"));
-	// Detail height maps, read by the tessellation evaluation stage (slots 18..22).
-	for (int i = 0; i < 5; i++) {
-		terrain_textures.push_back(get_tex(String("mat") + itos(i) + "_height"));
-	}
 
-	Variant tiles_v = material_storage->material_get_param(meshlet_terrain_material, "tiles_0123");
-	Vector4 tiles = (tiles_v.get_type() == Variant::VECTOR4) ? (Vector4)tiles_v : Vector4(250.0, 120.0, 220.0, 120.0);
-	Vector<float> terrain_params;
-	terrain_params.push_back(get_f("terrain_size", 1024.0f));
-	terrain_params.push_back(get_f("height_min", 0.0f));
-	terrain_params.push_back(get_f("height_range", 1.0f));
-	terrain_params.push_back(get_f("height_scale", 1.0f));
-	terrain_params.push_back((float)tiles.x);
-	terrain_params.push_back((float)tiles.y);
-	terrain_params.push_back((float)tiles.z);
-	terrain_params.push_back((float)tiles.w);
-	terrain_params.push_back(get_f("tiles_4", 160.0f));
-
-	// tp_extra.y = terrain debug visualisation mode (0 = off; see meshlet_render.glsl's vertex stage
-	// for what each mode draws). Seeded from --meshlet-terrain-debug=N, then overridable live via
-	// ProjectSettings.set_setting("rendering/meshlet/terrain_debug", N) from GDScript, so modes can be
-	// cycled at a paused camera pose without restarting and losing the pose.
+	// The one engine-provided slot: terrain debug visualisation mode (0 = off; see
+	// meshlet_render.glsl for what each mode draws). Seeded from --meshlet-terrain-debug=N, then
+	// overridable live via ProjectSettings.set_setting("rendering/meshlet/terrain_debug", N), so modes
+	// can be cycled at a paused camera pose without restarting and losing the pose.
 	static int terrain_debug_mode = -1;
 	if (terrain_debug_mode < 0) {
 		terrain_debug_mode = 0;
@@ -2992,70 +3014,11 @@ void RenderForwardClustered::_render_meshlet_terrain(RenderDataRD *p_render_data
 			}
 		}
 	}
-	// The setting wins when set; the command-line value seeds it. Read uncached on purpose: this is
-	// meant to be flipped at runtime from GDScript to cycle modes at a paused pose.
-	int terrain_debug = terrain_debug_mode;
 	{
+		// Read uncached on purpose - this is meant to be flipped at runtime from GDScript.
 		Variant v = ProjectSettings::get_singleton()->get("rendering/meshlet/terrain_debug");
-		if (v.get_type() == Variant::INT && (int)v != 0) {
-			terrain_debug = (int)v;
-		}
+		terrain_params.write[Contract::P_DEBUG_MODE] = (float)((v.get_type() == Variant::INT && (int)v != 0) ? (int)v : terrain_debug_mode);
 	}
-	terrain_params.push_back((float)terrain_debug);
-	// tp_extra.z: splat weight below which a material is skipped entirely in the fragment (T2.3b).
-	// Same uniform, same default as terrain_viewer.gdshader, so the meshlet path drops the same
-	// materials the Forward+ path does and the two stay visually comparable.
-	terrain_params.push_back(get_f("detail_weight_cutoff", 0.02f));
-	// tp_extra.w + tp_mat: the T2.3c material scalars, same names/defaults as terrain_viewer.gdshader.
-	// water_level defaults far below any terrain so the shoreline term is inert when unset.
-	terrain_params.push_back(get_f("roughness_min", 0.6f));
-	terrain_params.push_back(get_f("normal_strength", 1.0f));
-	terrain_params.push_back(get_f("macro_variation_strength", 0.6f));
-	terrain_params.push_back(get_f("water_level", -1.0e30f));
-	terrain_params.push_back(get_f("shore_band", 1.0f));
-
-	// T2.3d de-tiling params. Both schemes default OFF (strength 0), so a terrain material that never
-	// set them renders exactly as it did before this slice.
-	auto get_v4 = [&](const StringName &p_name, const Vector4 &p_default) -> Vector4 {
-		Variant v = material_storage->material_get_param(meshlet_terrain_material, p_name);
-		return (v.get_type() == Variant::VECTOR4) ? (Vector4)v : p_default;
-	};
-	Vector4 var_str = get_v4("variant_strength_0123", Vector4(0, 0, 0, 0));
-	Vector4 var_scale = get_v4("variant_scale_0123", Vector4(0.012, 0.12, 0.02, 0.012));
-	Vector4 hex_str = get_v4("hex_strength_0123", Vector4(0, 0, 0, 0));
-	const Vector4 *packed[3] = { &var_str, &var_scale, &hex_str };
-	for (int b = 0; b < 3; b++) {
-		terrain_params.push_back((float)packed[b]->x);
-		terrain_params.push_back((float)packed[b]->y);
-		terrain_params.push_back((float)packed[b]->z);
-		terrain_params.push_back((float)packed[b]->w);
-	}
-	terrain_params.push_back(get_f("variant_strength_4", 0.0f));
-	terrain_params.push_back(get_f("variant_scale_4", 0.012f));
-	terrain_params.push_back(get_f("hex_strength_4", 0.0f));
-	terrain_params.push_back(get_f("variant_blend_width", 0.15f));
-	terrain_params.push_back(get_f("variant_rotation", 2.4f));
-	Variant voff_v = material_storage->material_get_param(meshlet_terrain_material, "variant_offset");
-	Vector3 voff = (voff_v.get_type() == Variant::VECTOR3) ? (Vector3)voff_v : Vector3(37.3, 23.1, 17.9);
-	terrain_params.push_back((float)voff.x);
-	terrain_params.push_back((float)voff.y);
-	terrain_params.push_back((float)voff.z);
-
-	// T2.4c detail displacement, same uniforms/defaults as terrain_viewer.gdshader. detail_depth
-	// defaults to 0 per material = "not displaced", so a terrain material that never set these is
-	// tessellated but geometrically unchanged.
-	// Fallbacks are the SHADER's declared defaults, not zero: material_get_param returns an empty
-	// Variant for a uniform the material never explicitly set, and defaulting those to 0 would
-	// silently disable displacement for exactly the materials that rely on the shader default.
-	Vector4 det = get_v4("detail_depth_0123", Vector4(0.5, 1.0, 1.0, 1.0));
-	terrain_params.push_back((float)det.x);
-	terrain_params.push_back((float)det.y);
-	terrain_params.push_back((float)det.z);
-	terrain_params.push_back((float)det.w);
-	terrain_params.push_back(get_f("detail_depth_4", 1.0f));
-	terrain_params.push_back(get_f("tessellation_distance", 600.0f));
-	terrain_params.push_back(get_f("tessellation_fade", 200.0f));
-	terrain_params.push_back(get_f("detail_mip_bias", 5.0f));
 
 	// One-shot dump of what actually got resolved off the terrain material. Every one of these feeds
 	// the vertex displacement or the splat blend, and a single wrong value (a zero terrain_size, a

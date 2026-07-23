@@ -30,6 +30,7 @@
 
 #include "meshlet_renderer.h"
 
+#include "servers/rendering/renderer_rd/meshlet_terrain_contract.h"
 #include "servers/rendering/renderer_rd/storage_rd/meshlet_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/virtual_texture_storage.h"
@@ -53,7 +54,19 @@ MeshletRenderer::MeshletRenderer() {
 	// allocation (from the rendering/virtual_texture/pool_size_mb setting) so the shader's virtual->
 	// physical UV mapping uses the correct pool geometry.
 	versions.push_back(vformat("\n#define MESHLET_USE_VIRTUAL_TEXTURES\n#define VT_POOL_TILES_X %d\n", (int)VirtualTextureStorage::get_pool_tiles_dim()));
-	versions.push_back("\n#define MESHLET_TERRAIN\n"); // Version 3: version-0 color path + heightmap vertex displacement.
+	// Version 3: version-0 color path + heightmap vertex displacement. The terrain texture-array slot
+	// layout is injected from the C++ contract (meshlet_terrain_contract.h) rather than duplicated as
+	// magic numbers in the GLSL, so the two cannot disagree.
+	versions.push_back(vformat("\n#define MESHLET_TERRAIN\n"
+							   "\n#define TERRAIN_SLOT_SPLAT0 %d\n"
+							   "\n#define TERRAIN_SLOT_SPLAT1 %d\n"
+							   "\n#define TERRAIN_SLOT_ALBEDO %d\n"
+							   "\n#define TERRAIN_SLOT_ORM %d\n"
+							   "\n#define TERRAIN_SLOT_NORMAL %d\n"
+							   "\n#define TERRAIN_SLOT_MACRO_VARIATION %d\n"
+							   "\n#define TERRAIN_SLOT_HEIGHT %d\n"
+							   "\n#define TERRAIN_SLOT_COUNT %d\n",
+			(int)MeshletTerrainContract::SLOT_SPLAT0, (int)MeshletTerrainContract::SLOT_SPLAT1, (int)MeshletTerrainContract::SLOT_ALBEDO, (int)MeshletTerrainContract::SLOT_ORM, (int)MeshletTerrainContract::SLOT_NORMAL, (int)MeshletTerrainContract::SLOT_MACRO_VARIATION, (int)MeshletTerrainContract::SLOT_HEIGHT, (int)MeshletTerrainContract::SLOT_COUNT));
 	render_shader.initialize(versions);
 	render_shader_version = render_shader.version_create();
 	render_shader_rid = render_shader.version_get_shader(render_shader_version, 0);
@@ -538,7 +551,7 @@ void MeshletRenderer::render(const MeshletCuller::CullResult &p_visible, const M
 			RD::Uniform uterr;
 			uterr.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 			uterr.binding = 22;
-			for (uint32_t i = 0; i < TERRAIN_TEXTURE_SLOTS; i++) {
+			for (uint32_t i = 0; i < MeshletTerrainContract::SLOT_COUNT; i++) {
 				RID t = (i < (uint32_t)p_terrain_textures.size() && p_terrain_textures[i].is_valid()) ? p_terrain_textures[i] : default_white_t;
 				uterr.append_id(t);
 			}

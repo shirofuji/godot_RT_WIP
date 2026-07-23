@@ -615,7 +615,7 @@ terrain_params;
 // [0]=splat0, [1]=splat1, [2..6]=mat0..4 albedo, [7..11]=mat0..4 ORM, [12..16]=mat0..4 normal,
 // [17]=macro_variation, [18..22]=mat0..4 height (read by the tessellation evaluation stage).
 // Fixed size - the renderer binds exactly this many, padding gaps with white.
-layout(set = 0, binding = 22) uniform texture2D terrain_textures[23];
+layout(set = 0, binding = 22) uniform texture2D terrain_textures[TERRAIN_SLOT_COUNT];
 
 // T2.3b triplanar sample, mirroring terrain_viewer.gdshader's tri(): project the material from the
 // three world planes and blend by the tri-weights. A macro rather than a function so the descriptor
@@ -797,8 +797,8 @@ void main() {
 	// The splat lookup stays TOP-DOWN - it is a map of the terrain seen from above, exactly as in the
 	// gdshader's fragment (and as the vertex stage's displacement lookup).
 	vec2 suv = wp.xz / terrain_params.tp0.x + 0.5;
-	vec4 w0 = texture(sampler2D(terrain_textures[0], material_sampler), suv);
-	float w4 = texture(sampler2D(terrain_textures[1], material_sampler), suv).r;
+	vec4 w0 = texture(sampler2D(terrain_textures[TERRAIN_SLOT_SPLAT0], material_sampler), suv);
+	float w4 = texture(sampler2D(terrain_textures[TERRAIN_SLOT_SPLAT1], material_sampler), suv).r;
 
 	// T2.3b: triplanar blend weights, sharpened (^4) so flat ground stays a clean top projection and
 	// only real slopes pull in the side planes. The gdshader recomputes this normal per-pixel from the
@@ -831,33 +831,33 @@ void main() {
 	vec3 wpv = terr_variant_pos(wp);
 	if (w0.r > cutoff) {
 		float vm = terr_variant_mix(wp, bw, terrain_params.tp_var_scale.x);
-		alb += terr_sample_mat(TERRAIN_TEX(2), wp, wpv, bw, ts0, vm, terrain_params.tp_var_str.x, terrain_params.tp_hex.x) * w0.r;
-		orm += terr_sample_mat(TERRAIN_TEX(7), wp, wpv, bw, ts0, vm, terrain_params.tp_var_str.x, terrain_params.tp_hex.x) * w0.r;
-		nrm += terr_sample_mat_n(TERRAIN_TEX(12), wp, wpv, bw, ts0, vm, terrain_params.tp_var_str.x, terrain_params.tp_hex.x) * w0.r;
+		alb += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ALBEDO + 0), wp, wpv, bw, ts0, vm, terrain_params.tp_var_str.x, terrain_params.tp_hex.x) * w0.r;
+		orm += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ORM + 0), wp, wpv, bw, ts0, vm, terrain_params.tp_var_str.x, terrain_params.tp_hex.x) * w0.r;
+		nrm += terr_sample_mat_n(TERRAIN_TEX(TERRAIN_SLOT_NORMAL + 0), wp, wpv, bw, ts0, vm, terrain_params.tp_var_str.x, terrain_params.tp_hex.x) * w0.r;
 	}
 	if (w0.g > cutoff) {
 		float vm = terr_variant_mix(wp, bw, terrain_params.tp_var_scale.y);
-		alb += terr_sample_mat(TERRAIN_TEX(3), wp, wpv, bw, ts1, vm, terrain_params.tp_var_str.y, terrain_params.tp_hex.y) * w0.g;
-		orm += terr_sample_mat(TERRAIN_TEX(8), wp, wpv, bw, ts1, vm, terrain_params.tp_var_str.y, terrain_params.tp_hex.y) * w0.g;
-		nrm += terr_sample_mat_n(TERRAIN_TEX(13), wp, wpv, bw, ts1, vm, terrain_params.tp_var_str.y, terrain_params.tp_hex.y) * w0.g;
+		alb += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ALBEDO + 1), wp, wpv, bw, ts1, vm, terrain_params.tp_var_str.y, terrain_params.tp_hex.y) * w0.g;
+		orm += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ORM + 1), wp, wpv, bw, ts1, vm, terrain_params.tp_var_str.y, terrain_params.tp_hex.y) * w0.g;
+		nrm += terr_sample_mat_n(TERRAIN_TEX(TERRAIN_SLOT_NORMAL + 1), wp, wpv, bw, ts1, vm, terrain_params.tp_var_str.y, terrain_params.tp_hex.y) * w0.g;
 	}
 	if (w0.b > cutoff) {
 		float vm = terr_variant_mix(wp, bw, terrain_params.tp_var_scale.z);
-		alb += terr_sample_mat(TERRAIN_TEX(4), wp, wpv, bw, ts2, vm, terrain_params.tp_var_str.z, terrain_params.tp_hex.z) * w0.b;
-		orm += terr_sample_mat(TERRAIN_TEX(9), wp, wpv, bw, ts2, vm, terrain_params.tp_var_str.z, terrain_params.tp_hex.z) * w0.b;
-		nrm += terr_sample_mat_n(TERRAIN_TEX(14), wp, wpv, bw, ts2, vm, terrain_params.tp_var_str.z, terrain_params.tp_hex.z) * w0.b;
+		alb += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ALBEDO + 2), wp, wpv, bw, ts2, vm, terrain_params.tp_var_str.z, terrain_params.tp_hex.z) * w0.b;
+		orm += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ORM + 2), wp, wpv, bw, ts2, vm, terrain_params.tp_var_str.z, terrain_params.tp_hex.z) * w0.b;
+		nrm += terr_sample_mat_n(TERRAIN_TEX(TERRAIN_SLOT_NORMAL + 2), wp, wpv, bw, ts2, vm, terrain_params.tp_var_str.z, terrain_params.tp_hex.z) * w0.b;
 	}
 	if (w0.a > cutoff) {
 		float vm = terr_variant_mix(wp, bw, terrain_params.tp_var_scale.w);
-		alb += terr_sample_mat(TERRAIN_TEX(5), wp, wpv, bw, ts3, vm, terrain_params.tp_var_str.w, terrain_params.tp_hex.w) * w0.a;
-		orm += terr_sample_mat(TERRAIN_TEX(10), wp, wpv, bw, ts3, vm, terrain_params.tp_var_str.w, terrain_params.tp_hex.w) * w0.a;
-		nrm += terr_sample_mat_n(TERRAIN_TEX(15), wp, wpv, bw, ts3, vm, terrain_params.tp_var_str.w, terrain_params.tp_hex.w) * w0.a;
+		alb += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ALBEDO + 3), wp, wpv, bw, ts3, vm, terrain_params.tp_var_str.w, terrain_params.tp_hex.w) * w0.a;
+		orm += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ORM + 3), wp, wpv, bw, ts3, vm, terrain_params.tp_var_str.w, terrain_params.tp_hex.w) * w0.a;
+		nrm += terr_sample_mat_n(TERRAIN_TEX(TERRAIN_SLOT_NORMAL + 3), wp, wpv, bw, ts3, vm, terrain_params.tp_var_str.w, terrain_params.tp_hex.w) * w0.a;
 	}
 	if (w4 > cutoff) {
 		float vm = terr_variant_mix(wp, bw, terrain_params.tp_var4.y);
-		alb += terr_sample_mat(TERRAIN_TEX(6), wp, wpv, bw, ts4, vm, terrain_params.tp_var4.x, terrain_params.tp_var4.z) * w4;
-		orm += terr_sample_mat(TERRAIN_TEX(11), wp, wpv, bw, ts4, vm, terrain_params.tp_var4.x, terrain_params.tp_var4.z) * w4;
-		nrm += terr_sample_mat_n(TERRAIN_TEX(16), wp, wpv, bw, ts4, vm, terrain_params.tp_var4.x, terrain_params.tp_var4.z) * w4;
+		alb += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ALBEDO + 4), wp, wpv, bw, ts4, vm, terrain_params.tp_var4.x, terrain_params.tp_var4.z) * w4;
+		orm += terr_sample_mat(TERRAIN_TEX(TERRAIN_SLOT_ORM + 4), wp, wpv, bw, ts4, vm, terrain_params.tp_var4.x, terrain_params.tp_var4.z) * w4;
+		nrm += terr_sample_mat_n(TERRAIN_TEX(TERRAIN_SLOT_NORMAL + 4), wp, wpv, bw, ts4, vm, terrain_params.tp_var4.x, terrain_params.tp_var4.z) * w4;
 	}
 	float wsum = w0.r + w0.g + w0.b + w0.a + w4;
 	if (wsum > 0.0001) {
@@ -871,7 +871,7 @@ void main() {
 
 	// Large-scale brightness variation, baked unique across the whole map (never tiles), to break up
 	// the repeat of the tiled materials. mv*2 recentres the stored 0.5-neutral field on 1.0.
-	vec3 mv = texture(sampler2D(terrain_textures[17], material_sampler), suv).rgb;
+	vec3 mv = texture(sampler2D(terrain_textures[TERRAIN_SLOT_MACRO_VARIATION], material_sampler), suv).rgb;
 	alb *= mix(vec3(1.0), mv * 2.0, terrain_params.tp_mat.y);
 
 	// Shoreline wetness: darken and smooth the ground from the waterline up to shore_band metres
@@ -1199,7 +1199,7 @@ terrain_params;
 // built from this shader's own reflection - the Forward+ feature had to route around the shared-set
 // wall with samplerless texelFetch and a hand-written bilinear filter.
 layout(set = 0, binding = 14) uniform sampler material_sampler;
-layout(set = 0, binding = 22) uniform texture2D terrain_textures[23];
+layout(set = 0, binding = 22) uniform texture2D terrain_textures[TERRAIN_SLOT_COUNT];
 
 // Triplanar height tap, mirroring terrain_viewer.gdshader's DETAIL_H. textureLod, never texture():
 // a tessellation stage has NO derivatives, so the mip must be explicit or the result is undefined.
@@ -1237,18 +1237,18 @@ void main() {
 			vec3 bw = pow(abs(n), vec3(4.0));
 			bw /= (bw.x + bw.y + bw.z);
 			vec2 suv = wp.xz / terrain_params.tp0.x + 0.5;
-			vec4 w0 = texture(sampler2D(terrain_textures[0], material_sampler), suv);
-			float w4 = texture(sampler2D(terrain_textures[1], material_sampler), suv).r;
+			vec4 w0 = texture(sampler2D(terrain_textures[TERRAIN_SLOT_SPLAT0], material_sampler), suv);
+			float w4 = texture(sampler2D(terrain_textures[TERRAIN_SLOT_SPLAT1], material_sampler), suv).r;
 
 			float inv_size = 1.0 / terrain_params.tp0.x;
 			float cutoff = terrain_params.tp_extra.z;
 			float mip = terrain_params.tp_det2.w;
 			float h = 0.0;
-			TERRAIN_DETAIL_H(18, wp, bw, terrain_params.tp_tiles.x * inv_size, w0.r, terrain_params.tp_det.x, mip)
-			TERRAIN_DETAIL_H(19, wp, bw, terrain_params.tp_tiles.y * inv_size, w0.g, terrain_params.tp_det.y, mip)
-			TERRAIN_DETAIL_H(20, wp, bw, terrain_params.tp_tiles.z * inv_size, w0.b, terrain_params.tp_det.z, mip)
-			TERRAIN_DETAIL_H(21, wp, bw, terrain_params.tp_tiles.w * inv_size, w0.a, terrain_params.tp_det.w, mip)
-			TERRAIN_DETAIL_H(22, wp, bw, terrain_params.tp_extra.x * inv_size, w4, terrain_params.tp_det2.x, mip)
+			TERRAIN_DETAIL_H(TERRAIN_SLOT_HEIGHT + 0, wp, bw, terrain_params.tp_tiles.x * inv_size, w0.r, terrain_params.tp_det.x, mip)
+			TERRAIN_DETAIL_H(TERRAIN_SLOT_HEIGHT + 1, wp, bw, terrain_params.tp_tiles.y * inv_size, w0.g, terrain_params.tp_det.y, mip)
+			TERRAIN_DETAIL_H(TERRAIN_SLOT_HEIGHT + 2, wp, bw, terrain_params.tp_tiles.z * inv_size, w0.b, terrain_params.tp_det.z, mip)
+			TERRAIN_DETAIL_H(TERRAIN_SLOT_HEIGHT + 3, wp, bw, terrain_params.tp_tiles.w * inv_size, w0.a, terrain_params.tp_det.w, mip)
+			TERRAIN_DETAIL_H(TERRAIN_SLOT_HEIGHT + 4, wp, bw, terrain_params.tp_extra.x * inv_size, w4, terrain_params.tp_det2.x, mip)
 			float wsum = w0.r + w0.g + w0.b + w0.a + w4;
 			if (wsum > 0.0001) {
 				h /= wsum;
